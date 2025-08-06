@@ -1,4 +1,4 @@
-# ✅ Adaptive GPT Tutor – Fully Working Multi-Question Streamlit App
+# ✅ Adaptive GPT Tutor – Streamlit App with Fixed Question Flow (Single Click)
 # Requires: openai==0.28.1, streamlit
 
 import openai
@@ -19,7 +19,10 @@ def init_session():
         "current_question": None,
         "current_difficulty": "easy",
         "submitted": False,
-        "selected_answer": None
+        "selected_answer": None,
+        "student_id": "",
+        "topic": "",
+        "advance_to_next": False
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -83,10 +86,10 @@ def evaluate_answer(question, student_answer):
 st.set_page_config(page_title="Adaptive Cell Bio Tutor", layout="centered")
 st.title("🧬 Adaptive Cell Biology Tutor")
 
-student_id = st.text_input("Enter your name or ID:")
-topic = st.text_input("Enter a topic (e.g., protein sorting):")
+student_id = st.text_input("Enter your name or ID:", value=st.session_state["student_id"])
+topic = st.text_input("Enter a topic (e.g., protein sorting):", value=st.session_state["topic"])
 
-if student_id and topic and not st.session_state["awaiting_answer"] and st.session_state["question_count"] == 0:
+if student_id and topic and st.session_state["question_count"] == 0 and not st.session_state["awaiting_answer"]:
     if st.button("Start Session"):
         st.session_state["score"] = 0
         st.session_state["last_result"] = None
@@ -97,23 +100,25 @@ if student_id and topic and not st.session_state["awaiting_answer"] and st.sessi
         st.session_state["current_question"] = get_question(topic, st.session_state["current_difficulty"])
         st.session_state["awaiting_answer"] = True
         st.session_state["submitted"] = False
+        st.session_state["advance_to_next"] = False
 
 if st.session_state["awaiting_answer"] and st.session_state["current_question"]:
     st.subheader(f"❓ Question {st.session_state['question_count'] + 1} of {st.session_state['max_questions']}")
     st.markdown(st.session_state["current_question"])
     st.session_state["selected_answer"] = st.radio("Select your answer:", ["A", "B", "C", "D"], key=st.session_state["question_count"])
 
-    if st.button("Submit Answer") and not st.session_state["submitted"]:
-        correct = evaluate_answer(st.session_state["current_question"], st.session_state["selected_answer"])
-        update_student_record(student_id, correct)
-        st.session_state["score"] += int(correct)
-        st.session_state["question_count"] += 1
-        st.session_state["last_result"] = (
-            "✅ Great job! That’s correct. You’re doing well."
-            if correct else
-            "❌ That’s not quite right. Don’t worry—review the concept and try again!"
-        )
-        st.session_state["submitted"] = True
+    if not st.session_state["submitted"]:
+        if st.button("Submit Answer"):
+            correct = evaluate_answer(st.session_state["current_question"], st.session_state["selected_answer"])
+            update_student_record(student_id, correct)
+            st.session_state["score"] += int(correct)
+            st.session_state["question_count"] += 1
+            st.session_state["last_result"] = (
+                "✅ Great job! That’s correct. You’re doing well."
+                if correct else
+                "❌ That’s not quite right. Don’t worry—review the concept and try again!"
+            )
+            st.session_state["submitted"] = True
 
     if st.session_state["submitted"]:
         st.info(st.session_state["last_result"])
@@ -122,6 +127,7 @@ if st.session_state["awaiting_answer"] and st.session_state["current_question"]:
                 st.session_state["current_difficulty"] = get_student_level(student_id)
                 st.session_state["current_question"] = get_question(topic, st.session_state["current_difficulty"])
                 st.session_state["submitted"] = False
+                st.session_state["advance_to_next"] = True
         else:
             st.session_state["awaiting_answer"] = False
             st.success(f"🎉 Session complete! You got {st.session_state['score']} out of {st.session_state['max_questions']} correct.")
