@@ -1,4 +1,4 @@
-# ✅ Adaptive GPT Tutor – Streamlit App with Working Review + Single-Click Flow
+# ✅ Adaptive GPT Tutor – Streamlit App with Fixed Review + Single-Click Flow
 # Requires: openai==0.28.1, streamlit
 
 import openai
@@ -24,7 +24,8 @@ def init_session():
         "topic": "",
         "review": [],
         "review_mode": False,
-        "awaiting_next": False
+        "awaiting_next": False,
+        "session_complete": False
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -102,17 +103,21 @@ topic = st.text_input("Enter a topic (e.g., protein sorting):", value=st.session
 
 if student_id and topic and st.session_state["question_count"] == 0 and not st.session_state["awaiting_answer"]:
     if st.button("Start Session"):
-        st.session_state["score"] = 0
-        st.session_state["last_result"] = None
-        st.session_state["student_id"] = student_id
-        st.session_state["topic"] = topic
-        st.session_state["question_count"] = 0
-        st.session_state["review"] = []
-        st.session_state["current_difficulty"] = get_student_level(student_id)
-        st.session_state["current_question"] = get_question(topic, st.session_state["current_difficulty"])
-        st.session_state["awaiting_answer"] = True
-        st.session_state["submitted"] = False
-        st.session_state["awaiting_next"] = False
+        st.session_state.update({
+            "score": 0,
+            "last_result": None,
+            "student_id": student_id,
+            "topic": topic,
+            "question_count": 0,
+            "review": [],
+            "submitted": False,
+            "awaiting_next": False,
+            "session_complete": False,
+            "review_mode": False,
+            "current_difficulty": get_student_level(student_id),
+            "current_question": get_question(topic, get_student_level(student_id)),
+            "awaiting_answer": True
+        })
 
 if st.session_state["awaiting_answer"] and st.session_state["current_question"]:
     st.subheader(f"❓ Question {st.session_state['question_count'] + 1} of {st.session_state['max_questions']}")
@@ -136,19 +141,20 @@ if st.session_state["awaiting_answer"] and st.session_state["current_question"]:
                 "correct": correct
             })
             st.session_state["submitted"] = True
-            st.session_state["awaiting_next"] = True
 
-    if st.session_state["submitted"] and st.session_state["awaiting_next"]:
+    elif st.session_state["submitted"]:
         st.info(st.session_state["last_result"])
         if st.button("Next Question"):
             st.session_state["question_count"] += 1
-            st.session_state["awaiting_next"] = False
             if st.session_state["question_count"] >= st.session_state["max_questions"]:
                 st.session_state["awaiting_answer"] = False
-                st.success(f"🎉 Session complete! You got {st.session_state['score']} out of {st.session_state['max_questions']} correct.")
-                if st.button("Review Your Answers"):
-                    st.session_state["review_mode"] = True
+                st.session_state["session_complete"] = True
             else:
+                st.session_state["submitted"] = False
                 st.session_state["current_difficulty"] = get_student_level(student_id)
                 st.session_state["current_question"] = get_question(topic, st.session_state["current_difficulty"])
-                st.session_state["submitted"] = False
+
+if st.session_state["session_complete"]:
+    st.success(f"🎉 Session complete! You got {st.session_state['score']} out of {st.session_state['max_questions']} correct.")
+    if st.button("Review Your Answers"):
+        st.session_state["review_mode"] = True
