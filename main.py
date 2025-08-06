@@ -1,17 +1,25 @@
-# ✅ Adaptive GPT Tutor – Streamlit Version (with error handling and gpt-3.5-turbo)
+# ✅ Adaptive GPT Tutor – Streamlit Version with multiple questions and supportive feedback
 # Requires: openai==0.28.1, streamlit
 
 import openai
-import json
 import streamlit as st
 
 # --- Configuration ---
 openai.api_key = st.secrets["OPENAI_API_KEY"]  # Secure key management
 
-# --- In-memory student data (since file writes aren't supported on Streamlit Cloud) ---
+# --- In-memory session data ---
 if "student_data" not in st.session_state:
     st.session_state["student_data"] = {}
+if "question_count" not in st.session_state:
+    st.session_state["question_count"] = 0
+if "max_questions" not in st.session_state:
+    st.session_state["max_questions"] = 5
+if "score" not in st.session_state:
+    st.session_state["score"] = 0
+if "last_result" not in st.session_state:
+    st.session_state["last_result"] = None
 
+# --- Student performance tracking ---
 def get_student_level(student_id):
     record = st.session_state["student_data"].get(student_id, {"attempts": 0, "correct": 0})
     if record["attempts"] == 0:
@@ -72,20 +80,36 @@ topic = st.text_input("Enter a topic (e.g., protein sorting):")
 
 if student_id and topic:
     difficulty = get_student_level(student_id)
-    if st.button("Get Question"):
+    if st.button("Start Session"):
+        st.session_state["question_count"] = 0
+        st.session_state["score"] = 0
         question = get_question(topic, difficulty)
         st.session_state["question"] = question
         st.session_state["difficulty"] = difficulty
+        st.session_state["last_result"] = None
 
-if "question" in st.session_state:
-    st.subheader("❓ Question")
+if "question" in st.session_state and st.session_state["question_count"] < st.session_state["max_questions"]:
+    st.subheader(f"❓ Question {st.session_state['question_count'] + 1} of {st.session_state['max_questions']}")
     st.markdown(st.session_state["question"])
-    student_answer = st.radio("Select your answer:", ["A", "B", "C", "D"])
+    student_answer = st.radio("Select your answer:", ["A", "B", "C", "D"], key=st.session_state["question_count"])
 
     if st.button("Submit Answer"):
         correct = evaluate_answer(st.session_state["question"], student_answer)
         update_student_record(student_id, correct)
+        st.session_state["question_count"] += 1
+
         if correct:
-            st.success("✅ Correct!")
+            st.session_state["score"] += 1
+            st.session_state["last_result"] = "✅ Great job! That’s correct. You’re doing well."
         else:
-            st.error("❌ Incorrect. Review the concept and try again.")
+            st.session_state["last_result"] = "❌ That’s not quite right. Don’t worry—review the concept and try again!"
+
+        # Prepare next question
+        next_difficulty = get_student_level(student_id)
+        st.session_state["question"] = get_question(topic, next_difficulty)
+
+if st.session_state.get("last_result"):
+    st.info(st.session_state["last_result"])
+
+if st.session_state["question_count"] >= st.session_state["max_questions"]:
+    st.success(f"🎉 Session complete! You got {st.session_state['score']} out of {st.session_state['max_questions']} correct.")
