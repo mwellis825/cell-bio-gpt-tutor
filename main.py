@@ -60,7 +60,18 @@ def get_question(topic, difficulty):
 # --- GPT evaluator ---
 def evaluate_answer(question, student_answer):
     response = openai.ChatCompletion.create(
+        try:
+    response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a cell biology tutor. Only ask questions based on the lecture slides."},
+            {"role": "user", "content": prompt},
+        ]
+    )
+except Exception as e:
+    st.error(f"OpenAI Error: {e}")
+    return "Error generating question."
+model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "Evaluate a student's answer. Reply only with 'Correct' or 'Incorrect'."},
             {"role": "user", "content": f"Question: {question}\nAnswer: {student_answer}"}
