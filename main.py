@@ -1,4 +1,4 @@
-# ✅ Adaptive GPT Tutor – Streamlit Version with multiple questions and supportive feedback
+# ✅ Adaptive GPT Tutor – Streamlit Version with multi-question loop fix and feedback
 # Requires: openai==0.28.1, streamlit
 
 import openai
@@ -18,6 +18,12 @@ if "score" not in st.session_state:
     st.session_state["score"] = 0
 if "last_result" not in st.session_state:
     st.session_state["last_result"] = None
+if "current_question" not in st.session_state:
+    st.session_state["current_question"] = None
+if "current_difficulty" not in st.session_state:
+    st.session_state["current_difficulty"] = "easy"
+if "awaiting_answer" not in st.session_state:
+    st.session_state["awaiting_answer"] = False
 
 # --- Student performance tracking ---
 def get_student_level(student_id):
@@ -78,35 +84,35 @@ st.title("🧬 Adaptive Cell Biology Tutor")
 student_id = st.text_input("Enter your name or ID:")
 topic = st.text_input("Enter a topic (e.g., protein sorting):")
 
-if student_id and topic:
-    difficulty = get_student_level(student_id)
+if student_id and topic and st.session_state["question_count"] == 0:
     if st.button("Start Session"):
-        st.session_state["question_count"] = 0
         st.session_state["score"] = 0
-        question = get_question(topic, difficulty)
-        st.session_state["question"] = question
-        st.session_state["difficulty"] = difficulty
         st.session_state["last_result"] = None
+        st.session_state["question_count"] = 0
+        st.session_state["current_difficulty"] = get_student_level(student_id)
+        st.session_state["current_question"] = get_question(topic, st.session_state["current_difficulty"])
+        st.session_state["awaiting_answer"] = True
 
-if "question" in st.session_state and st.session_state["question_count"] < st.session_state["max_questions"]:
+if st.session_state["awaiting_answer"] and st.session_state["current_question"]:
     st.subheader(f"❓ Question {st.session_state['question_count'] + 1} of {st.session_state['max_questions']}")
-    st.markdown(st.session_state["question"])
-    student_answer = st.radio("Select your answer:", ["A", "B", "C", "D"], key=st.session_state["question_count"])
+    st.markdown(st.session_state["current_question"])
+    selected_answer = st.radio("Select your answer:", ["A", "B", "C", "D"], key=f"answer_{st.session_state['question_count']}")
 
     if st.button("Submit Answer"):
-        correct = evaluate_answer(st.session_state["question"], student_answer)
-        update_student_record(student_id, correct)
+        is_correct = evaluate_answer(st.session_state["current_question"], selected_answer)
+        update_student_record(student_id, is_correct)
+        st.session_state["score"] += int(is_correct)
         st.session_state["question_count"] += 1
-
-        if correct:
-            st.session_state["score"] += 1
-            st.session_state["last_result"] = "✅ Great job! That’s correct. You’re doing well."
-        else:
-            st.session_state["last_result"] = "❌ That’s not quite right. Don’t worry—review the concept and try again!"
-
-        # Prepare next question
-        next_difficulty = get_student_level(student_id)
-        st.session_state["question"] = get_question(topic, next_difficulty)
+        st.session_state["last_result"] = (
+            "✅ Great job! That’s correct. You’re doing well."
+            if is_correct else
+            "❌ That’s not quite right. Don’t worry—review the concept and try again!"
+        )
+        st.session_state["current_difficulty"] = get_student_level(student_id)
+        st.session_state["current_question"] = get_question(topic, st.session_state["current_difficulty"])
+        st.session_state["awaiting_answer"] = (
+            st.session_state["question_count"] < st.session_state["max_questions"]
+        )
 
 if st.session_state.get("last_result"):
     st.info(st.session_state["last_result"])
