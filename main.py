@@ -1,4 +1,4 @@
-# ✅ Adaptive GPT Tutor – Streamlit App with Review Screen and Reliable Question Loop
+# ✅ Adaptive GPT Tutor – Streamlit App with Working Review + Single-Click Flow
 # Requires: openai==0.28.1, streamlit
 
 import openai
@@ -23,7 +23,8 @@ def init_session():
         "student_id": "",
         "topic": "",
         "review": [],
-        "review_mode": False
+        "review_mode": False,
+        "awaiting_next": False
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -111,6 +112,7 @@ if student_id and topic and st.session_state["question_count"] == 0 and not st.s
         st.session_state["current_question"] = get_question(topic, st.session_state["current_difficulty"])
         st.session_state["awaiting_answer"] = True
         st.session_state["submitted"] = False
+        st.session_state["awaiting_next"] = False
 
 if st.session_state["awaiting_answer"] and st.session_state["current_question"]:
     st.subheader(f"❓ Question {st.session_state['question_count'] + 1} of {st.session_state['max_questions']}")
@@ -134,12 +136,13 @@ if st.session_state["awaiting_answer"] and st.session_state["current_question"]:
                 "correct": correct
             })
             st.session_state["submitted"] = True
+            st.session_state["awaiting_next"] = True
 
-    if st.session_state["submitted"]:
+    if st.session_state["submitted"] and st.session_state["awaiting_next"]:
         st.info(st.session_state["last_result"])
-
         if st.button("Next Question"):
             st.session_state["question_count"] += 1
+            st.session_state["awaiting_next"] = False
             if st.session_state["question_count"] >= st.session_state["max_questions"]:
                 st.session_state["awaiting_answer"] = False
                 st.success(f"🎉 Session complete! You got {st.session_state['score']} out of {st.session_state['max_questions']} correct.")
