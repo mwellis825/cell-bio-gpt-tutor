@@ -1,4 +1,4 @@
-# ✅ Adaptive GPT Tutor – Streamlit App with Reliable Single-Click Flow and Review Screen
+# ✅ Adaptive GPT Tutor – Streamlit App with Fixed Review + Single-Click Flow
 # Requires: openai==0.28.1, streamlit
 
 import openai
@@ -14,16 +14,18 @@ def init_session():
         "question_count": 0,
         "max_questions": 5,
         "score": 0,
+        "last_result": None,
+        "awaiting_answer": False,
         "current_question": None,
         "current_difficulty": "easy",
+        "submitted": False,
+        "selected_answer": None,
         "student_id": "",
         "topic": "",
         "review": [],
         "review_mode": False,
-        "answer_submitted": False,
-        "last_result": "",
-        "selected_answer": None,
-        "phase": "setup"  # setup, quiz, feedback, complete
+        "awaiting_next": False,
+        "session_complete": False
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -31,7 +33,7 @@ def init_session():
 
 init_session()
 
-# --- Performance Tracking ---
+# --- Student performance tracking ---
 def get_student_level(student_id):
     record = st.session_state["student_data"].get(student_id, {"attempts": 0, "correct": 0})
     if record["attempts"] == 0:
@@ -44,13 +46,14 @@ def update_student_record(student_id, correct):
     record["attempts"] += 1
     record["correct"] += int(correct)
 
-# --- GPT Prompts ---
+# --- Prompt builder ---
 def build_prompt(topic, difficulty):
     return (
         f"Ask one {difficulty} multiple-choice question about {topic}, using only content from the lecture slides. "
         f"Provide 4 labeled options (A-D), one of which is correct. Do NOT give the correct answer or any explanation."
     )
 
+# --- GPT question generator ---
 def get_question(topic, difficulty):
     prompt = build_prompt(topic, difficulty)
     try:
@@ -66,6 +69,7 @@ def get_question(topic, difficulty):
         st.error(f"OpenAI Error: {e}")
         return "❌ Failed to generate question."
 
+# --- GPT evaluator ---
 def evaluate_answer(question, student_answer):
     try:
         response = openai.ChatCompletion.create(
@@ -81,11 +85,10 @@ def evaluate_answer(question, student_answer):
         st.error(f"OpenAI Error: {e}")
         return False
 
-# --- Streamlit UI ---
+# --- Streamlit App UI ---
 st.set_page_config(page_title="Adaptive Cell Bio Tutor", layout="centered")
 st.title("🧬 Adaptive Cell Biology Tutor")
 
-# --- Review Mode ---
 if st.session_state["review_mode"]:
     st.header("📝 Review Your Answers")
     for idx, entry in enumerate(st.session_state["review"], 1):
@@ -95,61 +98,63 @@ if st.session_state["review_mode"]:
         st.markdown(f"**Result:** {'✅ Correct' if entry['correct'] else '❌ Incorrect'}")
     st.stop()
 
-# --- Setup Phase ---
-if st.session_state["phase"] == "setup":
-    student_id = st.text_input("Enter your name or ID:", value=st.session_state["student_id"])
-    topic = st.text_input("Enter a topic (e.g., protein sorting):", value=st.session_state["topic"])
+student_id = st.text_input("Enter your name or ID:", value=st.session_state["student_id"])
+topic = st.text_input("Enter a topic (e.g., protein sorting):", value=st.session_state["topic"])
 
-    if student_id and topic and st.button("Start Session"):
-        st.session_state["student_id"] = student_id
-        st.session_state["topic"] = topic
-        st.session_state["question_count"] = 0
-        st.session_state["score"] = 0
-        st.session_state["review"] = []
-        st.session_state["current_difficulty"] = get_student_level(student_id)
-        st.session_state["current_question"] = get_question(topic, st.session_state["current_difficulty"])
-        st.session_state["phase"] = "quiz"
-        st.session_state["answer_submitted"] = False
-        st.session_state["last_result"] = ""
-        st.session_state["selected_answer"] = None
+if student_id and topic and st.session_state["question_count"] == 0 and not st.session_state["awaiting_answer"]:
+    if st.button("Start Session"):
+        st.session_state.update({
+            "score": 0,
+            "last_result": None,
+            "student_id": student_id,
+            "topic": topic,
+            "question_count": 0,
+            "review": [],
+            "submitted": False,
+            "awaiting_next": False,
+            "session_complete": False,
+            "review_mode": False,
+            "current_difficulty": get_student_level(student_id),
+            "current_question": get_question(topic, get_student_level(student_id)),
+            "awaiting_answer": True
+        })
 
-# --- Quiz Phase ---
-if st.session_state["phase"] == "quiz":
+if st.session_state["awaiting_answer"] and st.session_state["current_question"]:
     st.subheader(f"❓ Question {st.session_state['question_count'] + 1} of {st.session_state['max_questions']}")
     st.markdown(st.session_state["current_question"])
+    answer_key = f"answer_{st.session_state['question_count']}"
+    selected = st.radio("Select your answer:", ["A", "B", "C", "D"], key=answer_key)
 
-    st.session_state["selected_answer"] = st.radio("Select your answer:", ["A", "B", "C", "D"], key=f"q{st.session_state['question_count']}")
+    if not st.session_state["submitted"]:
+        if st.button("Submit Answer"):
+            correct = evaluate_answer(st.session_state["current_question"], selected)
+            update_student_record(student_id, correct)
+            st.session_state["score"] += int(correct)
+            st.session_state["last_result"] = (
+                "✅ Great job! That’s correct. You’re doing well."
+                if correct else
+                "❌ That’s not quite right. Don’t worry—review the concept and try again!"
+            )
+            st.session_state["review"].append({
+                "question": st.session_state["current_question"],
+                "answer": selected,
+                "correct": correct
+            })
+            st.session_state["submitted"] = True
 
-    if st.button("Submit Answer") and not st.session_state["answer_submitted"]:
-        correct = evaluate_answer(st.session_state["current_question"], st.session_state["selected_answer"])
-        update_student_record(st.session_state["student_id"], correct)
-        st.session_state["score"] += int(correct)
-        st.session_state["last_result"] = (
-            "✅ Great job! That’s correct. You’re doing well."
-            if correct else
-            "❌ That’s not quite right. Don’t worry—review the concept and try again!"
-        )
-        st.session_state["review"].append({
-            "question": st.session_state["current_question"],
-            "answer": st.session_state["selected_answer"],
-            "correct": correct
-        })
-        st.session_state["answer_submitted"] = True
-
-    if st.session_state["answer_submitted"]:
+    elif st.session_state["submitted"]:
         st.info(st.session_state["last_result"])
         if st.button("Next Question"):
             st.session_state["question_count"] += 1
             if st.session_state["question_count"] >= st.session_state["max_questions"]:
-                st.session_state["phase"] = "complete"
+                st.session_state["awaiting_answer"] = False
+                st.session_state["session_complete"] = True
             else:
-                st.session_state["current_difficulty"] = get_student_level(st.session_state["student_id"])
-                st.session_state["current_question"] = get_question(st.session_state["topic"], st.session_state["current_difficulty"])
-                st.session_state["answer_submitted"] = False
-                st.session_state["selected_answer"] = None
+                st.session_state["submitted"] = False
+                st.session_state["current_difficulty"] = get_student_level(student_id)
+                st.session_state["current_question"] = get_question(topic, st.session_state["current_difficulty"])
 
-# --- Completion Phase ---
-if st.session_state["phase"] == "complete":
+if st.session_state["session_complete"]:
     st.success(f"🎉 Session complete! You got {st.session_state['score']} out of {st.session_state['max_questions']} correct.")
     if st.button("Review Your Answers"):
         st.session_state["review_mode"] = True
