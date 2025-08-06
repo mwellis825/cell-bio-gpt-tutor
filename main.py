@@ -1,42 +1,28 @@
-# ✅ Adaptive GPT Tutor – Streamlit Version
-# Requires: openai, streamlit (pip install openai streamlit)
+# ✅ Adaptive GPT Tutor – Streamlit Version (with error handling and gpt-3.5-turbo)
+# Requires: openai==0.28.1, streamlit
 
 import openai
 import json
-import datetime
 import streamlit as st
 
 # --- Configuration ---
-openai.api_key = "OPEN_API_KEY"  # Replace with your actual key
+openai.api_key = st.secrets["OPENAI_API_KEY"]  # Secure key management
 
-# --- Load or initialize student history ---
-def load_student_data():
-    try:
-        with open("student_data.json", "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
+# --- In-memory student data (since file writes aren't supported on Streamlit Cloud) ---
+if "student_data" not in st.session_state:
+    st.session_state["student_data"] = {}
 
-def save_student_data(data):
-    with open("student_data.json", "w") as f:
-        json.dump(data, f, indent=2)
-
-student_data = load_student_data()
-
-# --- Get student level ---
 def get_student_level(student_id):
-    record = student_data.get(student_id, {"attempts": 0, "correct": 0})
+    record = st.session_state["student_data"].get(student_id, {"attempts": 0, "correct": 0})
     if record["attempts"] == 0:
         return "easy"
     accuracy = record["correct"] / record["attempts"]
     return "hard" if accuracy > 0.8 else "easy"
 
-# --- Update record ---
 def update_student_record(student_id, correct):
-    record = student_data.setdefault(student_id, {"attempts": 0, "correct": 0})
+    record = st.session_state["student_data"].setdefault(student_id, {"attempts": 0, "correct": 0})
     record["attempts"] += 1
     record["correct"] += int(correct)
-    save_student_data(student_data)
 
 # --- Prompt builder ---
 def build_prompt(topic, difficulty):
@@ -48,39 +34,36 @@ def build_prompt(topic, difficulty):
 # --- GPT question generator ---
 def get_question(topic, difficulty):
     prompt = build_prompt(topic, difficulty)
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a cell biology tutor. Only ask questions based on the lecture slides."},
-            {"role": "user", "content": prompt},
-        ]
-    )
-    return response.choices[0].message.content
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a cell biology tutor. Only ask questions based on the lecture slides."},
+                {"role": "user", "content": prompt},
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        st.error(f"OpenAI Error: {e}")
+        return "❌ Failed to generate question."
 
 # --- GPT evaluator ---
 def evaluate_answer(question, student_answer):
-    response = openai.ChatCompletion.create(
-        try:
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a cell biology tutor. Only ask questions based on the lecture slides."},
-            {"role": "user", "content": prompt},
-        ]
-    )
-except Exception as e:
-    st.error(f"OpenAI Error: {e}")
-    return "Error generating question."
-model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "Evaluate a student's answer. Reply only with 'Correct' or 'Incorrect'."},
-            {"role": "user", "content": f"Question: {question}\nAnswer: {student_answer}"}
-        ]
-    )
-    verdict = response.choices[0].message.content.strip().lower()
-    return verdict.startswith("correct")
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Evaluate a student's answer. Reply only with 'Correct' or 'Incorrect'."},
+                {"role": "user", "content": f"Question: {question}\nAnswer: {student_answer}"}
+            ]
+        )
+        verdict = response.choices[0].message.content.strip().lower()
+        return verdict.startswith("correct")
+    except Exception as e:
+        st.error(f"OpenAI Error: {e}")
+        return False
 
-# --- Streamlit App ---
+# --- Streamlit App UI ---
 st.set_page_config(page_title="Adaptive Cell Bio Tutor", layout="centered")
 st.title("🧬 Adaptive Cell Biology Tutor")
 
