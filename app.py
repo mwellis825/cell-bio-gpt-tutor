@@ -317,10 +317,77 @@ def gen_dnd_pairs_from_context(topic: str, n_pairs: int = 5) -> List[Tuple[str,s
 
     # Try slides + fallback first
     context, _ = build_context_with_fallback(topic)
-    sys = ("Create Drag-and-Drop pairs ONLY from context; each pair maps a concise term to a matching description/location/output.")
+    sys = (
+        "Create Drag-and-Drop pairs ONLY from context; each pair maps a concise term to a matching description/location/output."
+    )
     user = f"""
 Context:
 {context}
+
+Task:
+Provide {n_pairs} pairs for a Drag-and-Drop activity as a JSON array of objects:
+- drag: short text (term/step) <= 8 words
+- drop: short label (matching description/location/output) <= 10 words
+Constraints:
+- Use distinct pairs; avoid duplicates.
+- Keep both texts concise and readable for undergrads.
+- Only use information explicitly present in context/fallback.
+"""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o", temperature=0.2,
+            messages=[{"role": "system", "content": sys},
+                      {"role": "user", "content": user}]
+        )
+        raw = resp.choices[0].message.content or "[]"
+        arr = json.loads(raw.strip(" \n`"))
+        pairs = []
+        for obj in arr:
+            if isinstance(obj, dict) and "drag" in obj and "drop" in obj:
+                pairs.append((obj["drag"], obj["drop"]))
+        pairs = pairs[:n_pairs]
+    except Exception:
+        pairs = []
+
+    if len(pairs) >= max(3, n_pairs // 2):
+        return pairs
+
+    # Heuristic fallback by topic (OpenStax-style)
+    t = topic.lower()
+    if "electron transport" in t or "etc" in t or "oxidative" in t:
+        fallback = [
+            ("Complex I", "NADH → e⁻, pumps H⁺"),
+            ("Complex II", "FADH₂ → e⁻ (no pumping)"),
+            ("Complex III", "Q → Cyt c, pumps H⁺"),
+            ("Complex IV", "O₂ → H₂O, pumps H⁺"),
+            ("ATP synthase", "H⁺ gradient → ATP"),
+        ]
+    elif "glycolysis" in t:
+        fallback = [
+            ("Hexokinase", "Glucose → G6P"),
+            ("PFK-1", "F6P → F1,6BP"),
+            ("Pyruvate kinase", "PEP → Pyruvate"),
+            ("NAD⁺ reduction", "Generates NADH"),
+            ("ATP yield", "Net 2 ATP"),
+        ]
+    elif "rtk" in t or "receptor tyrosine" in t:
+        fallback = [
+            ("Ligand binding", "Dimerization"),
+            ("Autophosphorylation", "Tyr residues"),
+            ("Grb2/SOS", "Ras activation"),
+            ("MAPK cascade", "Phosphorylation"),
+            ("PI3K → AKT", "Pro-survival"),
+        ]
+    else:
+        fallback = [
+            ("Nucleus", "DNA storage"),
+            ("ER", "Protein folding"),
+            ("Golgi", "Modification/Sorting"),
+            ("Lysosome", "Acid hydrolases"),
+            ("Mitochondria", "ATP production"),
+        ]
+    return fallback[:n_pairs]
+
 
 Task:
 Provide {n_pairs} pairs for a Drag-and-Drop activity as a JSON array of objects:
