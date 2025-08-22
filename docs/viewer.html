@@ -2,50 +2,86 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' data:; style-src 'self' 'unsafe-inline' data:; img-src 'self' data: blob:; connect-src 'self' data: blob:;">
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <!-- Simple CSP that allows our local scripts and data: URLs -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self' data: blob:;
+                 script-src 'self' 'unsafe-inline' 'unsafe-eval' data:;
+                 style-src 'self' 'unsafe-inline' data:;
+                 img-src 'self' data: blob:;
+                 connect-src 'self' data: blob:;">
+
+  <!-- Core H5P CSS you copied to docs/ -->
   <link rel="stylesheet" href="./h5p.css" />
   <style>
-    html, body { height: 100%; margin:0; }
+    html, body { height: 100%; margin: 0; background: #fff; }
     #app { min-height: 100vh; }
   </style>
+
+  <!-- ✅ Define H5PIntegration BEFORE loading frame/main bundles -->
+  <script>
+    window.H5PIntegration = {
+      baseUrl: window.location.origin + window.location.pathname.replace(/\/[^\/]*$/, ''),
+      url: window.location.href,
+      hubIsEnabled: false,
+      saveFreq: false,
+      ajax: { setFinished: "", contentUserData: "" },
+      siteUrl: window.location.origin,
+      l10n: { H5P: { fullscreen: "Fullscreen", exitFullscreen: "Exit fullscreen" } },
+      libraryUrl: "./",
+      postUserStatistics: false,
+      copyrightSemantics: {},
+      disableHub: true,
+      core: {
+        scripts: [], styles: []
+      },
+      loadedJs: [], loadedCss: [],
+      // Not strictly required, but some content types check this:
+      contents: {}
+    };
+  </script>
+
+  <!-- These two files must exist in /docs (copied from h5p-standalone dist) -->
+  <script src="./main.bundle.js"></script>
+  <script src="./frame.bundle.js"></script>
 </head>
 <body>
   <div id="app"></div>
 
-  <script src="./main.bundle.js"></script>
-  <script src="./frame.bundle.js"></script>
-
   <script>
-    // Expect a base64 H5P passed via URL fragment: #b64=<base64-zip>
+    // Expect base64-encoded .h5p zip after #b64=...
     function getB64() {
       try {
         const m = location.hash.match(/b64=([^&]+)/);
         return m ? decodeURIComponent(m[1]) : null;
-      } catch (e) { return null; }
+      } catch { return null; }
     }
     function boot() {
-      var tries = 0, b64 = getB64();
+      const b64 = getB64();
       if (!b64) {
         document.getElementById('app').innerHTML =
-          '<p style="color:#b00">No H5P payload. Append #b64=&lt;base64&gt; to the URL.</p>';
+          '<p style="color:#b00;padding:1rem">No H5P payload. Append <code>#b64=&lt;base64&gt;</code> to the URL.</p>';
         return;
       }
+      let tries = 0;
       (function wait() {
         tries++;
         if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {
           try {
-            window.H5PStandalone.display('#app', { h5pContent: 'data:application/zip;base64,' + b64 });
+            window.H5PStandalone.display('#app', {
+              h5pContent: 'data:application/zip;base64,' + b64
+            });
           } catch (e) {
             document.getElementById('app').innerHTML =
-              '<p style="color:#b00">Could not initialize H5P: ' + (e && e.message ? e.message : e) + '</p>';
+              '<p style="color:#b00;padding:1rem">Could not initialize H5P: ' +
+              (e && e.message ? e.message : e) + '</p>';
           }
         } else if (tries < 240) {
           setTimeout(wait, 50);
         } else {
           document.getElementById('app').innerHTML =
-            '<p style="color:#b00">H5P API not ready.</p>';
+            '<p style="color:#b00;padding:1rem">H5P API not ready.</p>';
         }
       })();
     }
