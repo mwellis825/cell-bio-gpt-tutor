@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
 
-  <!-- Simple CSP that allows our local scripts and data: URLs -->
+  <!-- CSP that allows local scripts and data: URLs -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self' data: blob:;
                  script-src 'self' 'unsafe-inline' 'unsafe-eval' data:;
@@ -12,14 +12,15 @@
                  img-src 'self' data: blob:;
                  connect-src 'self' data: blob:;">
 
-  <!-- Core H5P CSS you copied to docs/ -->
+  <!-- H5P CSS you copied to /docs; font 404s are harmless -->
   <link rel="stylesheet" href="./h5p.css" />
   <style>
     html, body { height: 100%; margin: 0; background: #fff; }
     #app { min-height: 100vh; }
+    .err { color:#b00; padding:1rem; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
   </style>
 
-  <!-- ✅ Define H5PIntegration BEFORE loading frame/main bundles -->
+  <!-- Define H5PIntegration BEFORE any bundles -->
   <script>
     window.H5PIntegration = {
       baseUrl: window.location.origin + window.location.pathname.replace(/\/[^\/]*$/, ''),
@@ -33,39 +34,51 @@
       postUserStatistics: false,
       copyrightSemantics: {},
       disableHub: true,
-      core: {
-        scripts: [], styles: []
-      },
+      core: { scripts: [], styles: [] },
       loadedJs: [], loadedCss: [],
-      // Not strictly required, but some content types check this:
       contents: {}
     };
   </script>
 
-  <!-- These two files must exist in /docs (copied from h5p-standalone dist) -->
-  <script src="./main.bundle.js"></script>
-  <script src="./frame.bundle.js"></script>
-</head>
-<body>
-  <div id="app"></div>
-
   <script>
-    // Expect base64-encoded .h5p zip after #b64=...
+    // Sequential loader for local bundles in /docs
+    function loadScript(src) {
+      return new Promise(function(resolve, reject) {
+        var s = document.createElement('script');
+        s.src = src;
+        s.onload = function(){ resolve(); };
+        s.onerror = function(e){ reject(new Error("Failed to load: " + src)); };
+        document.head.appendChild(s);
+      });
+    }
+
     function getB64() {
       try {
         const m = location.hash.match(/b64=([^&]+)/);
         return m ? decodeURIComponent(m[1]) : null;
       } catch { return null; }
     }
-    function boot() {
+
+    async function boot() {
+      const app = document.getElementById('app');
       const b64 = getB64();
       if (!b64) {
-        document.getElementById('app').innerHTML =
-          '<p style="color:#b00;padding:1rem">No H5P payload. Append <code>#b64=&lt;base64&gt;</code> to the URL.</p>';
+        app.innerHTML = '<p class="err">No H5P payload. Append <code>#b64=&lt;base64&gt;</code> to the URL.</p>';
         return;
       }
+
+      try {
+        // IMPORTANT: Load main first, then frame (same files you copied from h5p-standalone dist)
+        await loadScript("./main.bundle.js");
+        await loadScript("./frame.bundle.js");
+      } catch (e) {
+        app.innerHTML = '<p class="err">' + e.message + '</p>';
+        return;
+      }
+
+      // Wait for API readiness
       let tries = 0;
-      (function wait() {
+      (function waitReady(){
         tries++;
         if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {
           try {
@@ -73,19 +86,23 @@
               h5pContent: 'data:application/zip;base64,' + b64
             });
           } catch (e) {
-            document.getElementById('app').innerHTML =
-              '<p style="color:#b00;padding:1rem">Could not initialize H5P: ' +
+            app.innerHTML = '<p class="err">Could not initialize H5P: ' +
               (e && e.message ? e.message : e) + '</p>';
           }
         } else if (tries < 240) {
-          setTimeout(wait, 50);
+          setTimeout(waitReady, 50);
         } else {
-          document.getElementById('app').innerHTML =
-            '<p style="color:#b00;padding:1rem">H5P API not ready.</p>';
+          app.innerHTML = '<p class="err">H5P API not ready. ' +
+            'Check that <code>main.bundle.js</code> and <code>frame.bundle.js</code> exist in /docs and are real JS files.</p>';
         }
       })();
     }
-    boot();
+
+    // Run after DOM is ready
+    document.addEventListener('DOMContentLoaded', boot);
   </script>
+</head>
+<body>
+  <div id="app"></div>
 </body>
 </html>
