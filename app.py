@@ -183,12 +183,60 @@ def gen_fib_lines_from_context(topic: str, difficulty: str, n_items: int) -> Lis
     context, sources = build_context_with_fallback(topic)
     sys = (
         "You are a Cell Biology tutor bound to the provided context. "
-        "You must ONLY use information present in the context. "
-        "If insufficient, you may rely on the fallback paragraph included in context."
+        "Only use information present in the context/fallback; do NOT invent facts. "
+        "Avoid definition- or recall-style prompts. Prefer causal, predictive reasoning about perturbations."
     )
     user = f"""
 Topic: {topic}
 Difficulty: {difficulty}
+
+Context:
+{context}
+
+Task:
+Produce {n_items} concise, critical-thinking Fill-in-the-Blanks items using H5P syntax.
+Rules:
+- Exactly ONE sentence and ONE blank per item.
+- The blank should be *increase/increased* or *decrease/decreased* (or similarly predictive outcomes).
+- Use asterisks for acceptable answers/variants, e.g., *increase/increased*.
+- Keep cognitive load low but conceptual (predictive). No definition recall (e.g., "X is Y").
+- Do NOT repeat identical structures; vary components perturbed and downstream targets.
+- If context is insufficient, write items that say 'Not in slides *increase/decrease*.' (rare).
+
+Return as a numbered list of plain lines.
+"""
+    def call_llm(temp=0.2):
+        resp = client.chat.completions.create(
+            model="gpt-4o", temperature=temp,
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
+        )
+        return resp.choices[0].message.content or ""
+
+    text = call_llm(0.2)
+
+    def parse_and_filter(text: str) -> List[str]:
+        out = []
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            s = s.lstrip("0123456789). ").strip()
+            # must contain *answer* and be predictive (heuristic)
+            predictive = ("*increase" in s.lower()) or ("*decrease" in s.lower())
+            if "*" in s and predictive and not re.search(r"\bis\b|\bare\b|\bdefined as\b", s.lower()):
+                out.append(s)
+        return out
+
+    lines = parse_and_filter(text)
+    if len(lines) < n_items:
+        # regenerate once with slightly higher temperature to diversify
+        text2 = call_llm(0.4)
+        lines = (lines + parse_and_filter(text2))[:n_items]
+
+    if not lines:
+        lines = ["If proton leak increases across the inner membrane, ATP synthase output will *decrease/decreased*."]
+    return lines[:n_items]
+
 
 Context:
 {context}
@@ -266,11 +314,77 @@ Keep wording short. Use only slide/fallback facts. If insufficient, return [].
 def gen_dnd_pairs_from_context(topic: str, n_pairs: int = 5) -> List[Tuple[str,str]]:
     if client is None:
         return []
+
+    # Try slides + fallback first
     context, _ = build_context_with_fallback(topic)
     sys = ("Create Drag-and-Drop pairs ONLY from context; each pair maps a concise term to a matching description/location/output.")
     user = f"""
 Context:
 {context}
+
+Task:
+Provide {n_pairs} pairs for a Drag-and-Drop activity as a JSON array of objects:
+- drag: short text (term/step) <= 8 words
+- drop: short label (matching description/location/output) <= 10 words
+Constraints:
+- Use distinct pairs; avoid duplicates.
+- Keep both texts concise and readable for undergrads.
+- Only use information explicitly present in context/fallback.
+"""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o", temperature=0.2,
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
+        )
+        raw = resp.choices[0].message.content or "[]"
+        arr = json.loads(raw.strip(" \n`"))
+        pairs = []
+        for obj in arr:
+            if isinstance(obj, dict) and "drag" in obj and "drop" in obj:
+                pairs.append((obj["drag"], obj["drop"]))
+        pairs = pairs[:n_pairs]
+    except Exception:
+        pairs = []
+
+    if len(pairs) >= max(3, n_pairs//2):
+        return pairs
+
+    # Heuristic fallback by topic (OpenStax-style)
+    t = topic.lower()
+    if "electron transport" in t or "etc" in t or "oxidative" in t:
+        fallback = [
+            ("Complex I", "NADH → e⁻, pumps H⁺"),
+            ("Complex II", "FADH₂ → e⁻ (no pumping)"),
+            ("Complex III", "Q → Cyt c, pumps H⁺"),
+            ("Complex IV", "O₂ → H₂O, pumps H⁺"),
+            ("ATP synthase", "H⁺ gradient → ATP"),
+        ]
+    elif "glycolysis" in t:
+        fallback = [
+            ("Hexokinase", "Glucose → G6P"),
+            ("PFK-1", "F6P → F1,6BP"),
+            ("Pyruvate kinase", "PEP → Pyruvate"),
+            ("NAD⁺ reduction", "Generates NADH"),
+            ("ATP yield", "Net 2 ATP"),
+        ]
+    elif "rtk" in t or "receptor tyrosine" in t:
+        fallback = [
+            ("Ligand binding", "Dimerization"),
+            ("Autophosphorylation", "Tyr residues"),
+            ("Grb2/SOS", "Ras activation"),
+            ("MAPK cascade", "Phosphorylation"),
+            ("PI3K → AKT", "Pro-survival"),
+        ]
+    else:
+        fallback = [
+            ("Nucleus", "DNA storage"),
+            ("ER", "Protein folding"),
+            ("Golgi", "Modification/Sorting"),
+            ("Lysosome", "Acid hydrolases"),
+            ("Mitochondria", "ATP production"),
+        ]
+    return fallback[:n_pairs]
+
 
 Task:
 Provide {n_pairs} pairs for a Drag-and-Drop activity as a JSON array of objects:
@@ -374,46 +488,64 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
 # Inline H5P renderer (LOCAL assets, no CDN)
 # -------------------------------
 def render_h5p_inline(h5p_bytes: bytes, height: int = 560):
+    """Render .h5p using locally vendored h5p-standalone assets (no CDN)."""
     if not h5p_bytes:
         return
+
     # Load local JS/CSS once
     if st.session_state.H5P_FRAME_JS is None or st.session_state.H5P_MAIN_JS is None or st.session_state.H5P_CSS is None:
         try:
-            st.session_state.H5P_FRAME_JS = (VENDOR_H5P_DIR / "frame.bundle.js").read_text(encoding="utf-8")
             st.session_state.H5P_MAIN_JS  = (VENDOR_H5P_DIR / "main.bundle.js").read_text(encoding="utf-8")
+            st.session_state.H5P_FRAME_JS = (VENDOR_H5P_DIR / "frame.bundle.js").read_text(encoding="utf-8")
             st.session_state.H5P_CSS      = (VENDOR_H5P_DIR / "styles" / "h5p.css").read_text(encoding="utf-8")
         except Exception as e:
-            st.error("Local H5P assets missing. Add vendor/h5p/{frame.bundle.js, main.bundle.js, styles/h5p.css}.")
+            st.error("Local H5P assets missing. Add vendor/h5p/{main.bundle.js, frame.bundle.js, styles/h5p.css}.")
             st.caption(f"(Details: {e})")
             st.download_button("⬇️ Download activity (.h5p)",
                                data=h5p_bytes, file_name="activity_generated.h5p", mime="application/zip")
             return
 
     b64 = base64.b64encode(h5p_bytes).decode("utf-8")
+
+    # Load MAIN first, then FRAME; wait for H5PStandalone to exist
     html = f"""
     <style>{st.session_state.H5P_CSS}</style>
-    <div id="h5p-container" style="border:0; margin:0; padding:0;"></div>
-    <script>
-    {st.session_state.H5P_FRAME_JS}
-    </script>
+    <div id="h5p-container"></div>
     <script>
     {st.session_state.H5P_MAIN_JS}
     </script>
     <script>
-      try {{
-        H5PStandalone.display('#h5p-container', {{
-          h5pContent: "data:application/zip;base64,{b64}"
-        }});
-      }} catch(e) {{
-        document.getElementById('h5p-container').innerHTML =
-          "<p style='color:#b00'>Couldn’t initialize H5P locally. Use the download button below.</p>";
-      }}
+    {st.session_state.H5P_FRAME_JS}
+    </script>
+    <script>
+      (function() {{
+        var tries = 0;
+        function boot() {{
+          tries += 1;
+          if (window.H5PStandalone && typeof H5PStandalone.display === 'function') {{
+            try {{
+              H5PStandalone.display('#h5p-container', {{
+                h5pContent: "data:application/zip;base64,{b64}"
+              }});
+            }} catch (e) {{
+              document.getElementById('h5p-container').innerHTML =
+                "<p style='color:#b00'>Couldn’t initialize H5P locally. Use the download button below.</p>";
+            }}
+          }} else if (tries < 40) {{
+            setTimeout(boot, 100); // wait up to ~4s total
+          }} else {{
+            document.getElementById('h5p-container').innerHTML =
+              "<p style='color:#b00'>H5P scripts loaded but API not ready. Try reload or use the download button below.</p>";
+          }}
+        }}
+        boot();
+      }})();
     </script>
     """
     st.components.v1.html(html, height=height, scrolling=True)
-    # Always provide a fallback download
     st.download_button("⬇️ Download activity (.h5p)",
                        data=h5p_bytes, file_name="activity_generated.h5p", mime="application/zip")
+
 
 # -------------------------------
 # UI
@@ -435,10 +567,10 @@ if generate:
     fib_bytes = None
     try:
         lines = gen_fib_lines_from_context(topic, difficulty="medium", n_items=st.session_state.n_items)
-        fib_bytes = build_fib_from_master(
-            "Predict whether the following would increase or decrease activity:",
-            lines
-        )
+        # after lines = gen_fib_lines_from_context(...)
+instructions = f"Based ONLY on your course slides: predict the downstream effect for **{st.session_state.topic}** (use *increase/decrease* in the blank)."
+fib_bytes = build_fib_from_master(instructions, lines)
+
     except Exception as e:
         st.error(f"FIB generation failed: {e}")
 
