@@ -1,4 +1,4 @@
-# app.py — Cell Bio Tutor (Slides-Only, LLM-authored, H5P per-iframe loader + CDN toggle)
+# app.py — Cell Bio Tutor (Slides-Only, LLM-authored, H5P local per-iframe loader, no CDN)
 
 import os, io, json, base64, zipfile, pathlib, re, uuid, hashlib
 from typing import List, Dict, Optional, Tuple
@@ -58,7 +58,6 @@ def init_state():
         n_items=3,
         gen_mcq=True,
         gen_dnd=True,
-        use_cdn=False,           # <-- toggle to load H5P libs from CDN (diagnostics)
         index_ready=False,
         index_chunks=[],
         index_embeds=None,
@@ -114,7 +113,7 @@ def ensure_index() -> bool:
             BATCH = 64
             for i in range(0, len(texts), BATCH):
                 batch = texts[i:i+BATCH]
-                resp = cli.embeddings.create(model="text-embedding-3-small", input=batch)
+                resp = cli.embeddings.create(model=EMBED_MODEL, input=batch)
                 embeds.extend([np.array(d.embedding, dtype=np.float32) for d in resp.data])
             st.session_state.index_embeds = np.vstack(embeds).astype(np.float32)
         except Exception as e:
@@ -376,10 +375,7 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
         return None
 
 # --------------------------------
-# Inline H5P renderer
-#   - Always loads libs INSIDE the component iframe
-#   - Supports Local (Blob) or CDN (toggle) each time
-#   - Unique keys per activity to avoid collisions
+# Inline H5P renderer — Local Blob per iframe
 # --------------------------------
 def _read_text(path: pathlib.Path) -> Optional[str]:
     try:
@@ -400,22 +396,54 @@ def _local_assets_as_b64() -> Optional[Dict[str, str]]:
         "css": css_txt
     }
 
-def render_h5p_inline(h5p_bytes: bytes, comp_id: str, height: int = 560, use_cdn: bool = False):
+def render_h5p_inline(h5p_bytes: bytes, comp_id: str, height: int = 560):
     if not h5p_bytes:
+        return
+
+    assets = _local_assets_as_b64()
+    if not assets:
+        st.download_button("⬇️ Download activity (.h5p)",
+                           data=h5p_bytes,
+                           file_name=f"activity_{comp_id}.h5p",
+                           mime="application/zip",
+                           key=f"dl-missing-{comp_id}")
         return
 
     b64 = base64.b64encode(h5p_bytes).decode("utf-8")
     container_id = f"h5p-container-{comp_id}"
+    css_txt = assets["css"]
+    main_b64 = assets["main_b64"]
+    frame_b64 = assets["frame_b64"]
 
-    if use_cdn:
-        # Load fresh in this iframe via CDN every time
-        html = f"""
-        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/styles/h5p.css">
-        <div id="{container_id}"></div>
-        <script src="https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/main.bundle.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/frame.bundle.js"></script>
-        <script>
-          (function() {{
+    html = f"""
+    <style>{css_txt}</style>
+    <div id="{container_id}"></div>
+    <script>
+      (function() {{
+        function b64ToUrl(b64, mime) {{
+          var binStr = atob(b64);
+          var len = binStr.length;
+          var arr = new Uint8Array(len);
+          for (var i=0; i<len; i++) arr[i] = binStr.charCodeAt(i);
+          var blob = new Blob([arr], {{type: mime}});
+          return URL.createObjectURL(blob);
+        }}
+        function loadScript(url) {{
+          return new Promise(function(resolve, reject) {{
+            var s = document.createElement('script');
+            s.src = url;
+            s.onload = function() {{ resolve(); }};
+            s.onerror = function(e) {{ reject(e); }};
+            document.head.appendChild(s);
+          }});
+        }}
+        var mainUrl = b64ToUrl("{main_b64}", "text/javascript");
+        var frameUrl = b64ToUrl("{frame_b64}", "text/javascript");
+
+        // Load MAIN, then FRAME, then boot in THIS iframe
+        loadScript(mainUrl)
+          .then(function() {{ return loadScript(frameUrl); }})
+          .then(function() {{
             var tries = 0;
             function boot() {{
               tries++;
@@ -426,91 +454,25 @@ def render_h5p_inline(h5p_bytes: bytes, comp_id: str, height: int = 560, use_cdn
                   }});
                 }} catch (e) {{
                   document.getElementById('{container_id}').innerHTML =
-                    "<p style='color:#b00'>Couldn’t initialize H5P (CDN). Use download below.</p>";
+                    "<p style='color:#b00'>Couldn’t initialize H5P (local). Use the download button below.</p>";
                 }}
-              }} else if (tries < 200) {{
+              }} else if (tries < 240) {{
                 setTimeout(boot, 50);
               }} else {{
                 document.getElementById('{container_id}').innerHTML =
-                  "<p style='color:#b00'>H5P API not ready (CDN). Use download below.</p>";
+                  "<p style='color:#b00'>H5P API not ready (local). Use the download button below.</p>";
               }}
             }}
             boot();
-          }})();
-        </script>
-        """
-        st.components.v1.html(html, height=height, scrolling=True)
-    else:
-        # Local assets loaded per iframe via Blob URLs
-        assets = _local_assets_as_b64()
-        if not assets:
-            st.download_button("⬇️ Download activity (.h5p)",
-                               data=h5p_bytes,
-                               file_name=f"activity_{comp_id}.h5p",
-                               mime="application/zip",
-                               key=f"dl-missing-{comp_id}")
-            return
-
-        css_txt = assets["css"]
-        main_b64 = assets["main_b64"]
-        frame_b64 = assets["frame_b64"]
-
-        html = f"""
-        <style>{css_txt}</style>
-        <div id="{container_id}"></div>
-        <script>
-          (function() {{
-            function b64ToUrl(b64, mime) {{
-              var binStr = atob(b64);
-              var len = binStr.length;
-              var arr = new Uint8Array(len);
-              for (var i=0; i<len; i++) arr[i] = binStr.charCodeAt(i);
-              var blob = new Blob([arr], {{type: mime}});
-              return URL.createObjectURL(blob);
-            }}
-            function loadScript(url) {{
-              return new Promise(function(resolve, reject) {{
-                var s = document.createElement('script');
-                s.src = url;
-                s.onload = function() {{ resolve(); }};
-                s.onerror = function(e) {{ reject(e); }};
-                document.head.appendChild(s);
-              }});
-            }}
-            var mainUrl = b64ToUrl("{main_b64}", "text/javascript");
-            var frameUrl = b64ToUrl("{frame_b64}", "text/javascript");
-            loadScript(mainUrl)
-              .then(function() {{ return loadScript(frameUrl); }})
-              .then(function() {{
-                var tries = 0;
-                function boot() {{
-                  tries++;
-                  if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {{
-                    try {{
-                      window.H5PStandalone.display("#{container_id}", {{
-                        h5pContent: "data:application/zip;base64,{b64}"
-                      }});
-                    }} catch (e) {{
-                      document.getElementById('{container_id}').innerHTML =
-                        "<p style='color:#b00'>Couldn’t initialize H5P (local). Use download below.</p>";
-                    }}
-                  }} else if (tries < 200) {{
-                    setTimeout(boot, 50);
-                  }} else {{
-                    document.getElementById('{container_id}').innerHTML =
-                      "<p style='color:#b00'>H5P API not ready (local). Use download below.</p>";
-                  }}
-                }}
-                boot();
-              }})
-              .catch(function(err) {{
-                document.getElementById('{container_id}').innerHTML =
-                  "<p style='color:#b00'>Failed to load H5P libraries (local). Use download below.</p>";
-              }});
-          }})();
-        </script>
-        """
-        st.components.v1.html(html, height=height, scrolling=True)
+          }})
+          .catch(function(err) {{
+            document.getElementById('{container_id}').innerHTML =
+              "<p style='color:#b00'>Failed to load H5P libraries (local). Use the download button below.</p>";
+          }});
+      }})();
+    </script>
+    """
+    st.components.v1.html(html, height=height, scrolling=True)
 
     run_id = st.session_state.run_id or "norun"
     digest = hashlib.md5(h5p_bytes).hexdigest()[:8]
@@ -528,7 +490,6 @@ with st.sidebar:
     st.session_state.n_items = st.slider("Items per FIB", 2, 6, st.session_state.n_items, 1)
     st.session_state.gen_mcq = st.toggle("Also generate MCQs", value=st.session_state.gen_mcq)
     st.session_state.gen_dnd = st.toggle("Also generate Drag-and-Drop", value=st.session_state.gen_dnd)
-    st.session_state.use_cdn = st.toggle("Use H5P CDN (diagnose local files)", value=st.session_state.use_cdn)
     st.caption("All generations use ONLY your slides; if thin, adds a small OpenStax fallback snippet.")
 
 topic = st.text_input("What do you want help with? (e.g., “electron transport chain”, “RTK”):", value=st.session_state.topic)
@@ -576,7 +537,7 @@ if current_run and current_run in st.session_state.cache:
     if data.get("fib_bytes"):
         st.success("Fill-in-the-Blanks (slides-only)")
         try:
-            render_h5p_inline(data["fib_bytes"], comp_id=f"fib-{current_run}", height=560, use_cdn=st.session_state.use_cdn)
+            render_h5p_inline(data["fib_bytes"], comp_id=f"fib-{current_run}", height=560)
         except Exception as e:
             st.error(f"Render error (FIB): {e}")
 
@@ -594,6 +555,6 @@ if current_run and current_run in st.session_state.cache:
     if data.get("dnd_bytes"):
         st.success("Drag-and-Drop (slides-only)")
         try:
-            render_h5p_inline(data["dnd_bytes"], comp_id=f"dnd-{current_run}", height=520, use_cdn=st.session_state.use_cdn)
+            render_h5p_inline(data["dnd_bytes"], comp_id=f"dnd-{current_run}", height=520)
         except Exception as e:
             st.error(f"Render error (DnD): {e}")
