@@ -4,15 +4,16 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
 
-  <!-- ✅ Allow blob: for scripts (H5P loads content libs via Blob URLs) -->
+  <!-- CSP: allow local, blob:, data:, and CDN (jsdelivr) -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self' data: blob:;
-                 script-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:;
-                 style-src  'self' 'unsafe-inline' data: blob:;
-                 img-src    'self' data: blob:;
-                 connect-src 'self' data: blob:;
-                 worker-src 'self' blob:;">
+        content="default-src 'self' https: data: blob:;
+                 script-src  'self' https: 'unsafe-inline' 'unsafe-eval' data: blob:;
+                 style-src   'self' https: 'unsafe-inline' data: blob:;
+                 img-src     'self' https: data: blob:;
+                 connect-src 'self' https: data: blob:;
+                 worker-src  'self' blob:;">
 
+  <!-- Core CSS (from h5p-standalone dist you copied into /docs) -->
   <link rel="stylesheet" href="./h5p.css" />
   <style>
     html, body { height:100%; margin:0; background:#fff; }
@@ -32,7 +33,6 @@
       l10n: { H5P: { fullscreen: "Fullscreen", exitFullscreen: "Exit fullscreen" } },
       libraryUrl: "./",
       postUserStatistics: false,
-      copyrightSemantics: {},
       disableHub: true,
       core: { scripts: [], styles: [] },
       loadedJs: [], loadedCss: [],
@@ -46,7 +46,7 @@
         var s = document.createElement('script');
         s.src = src;
         s.onload = function(){ console.log("Loaded", src); resolve(); };
-        s.onerror = function(e){ reject(new Error("Failed to load: " + src)); };
+        s.onerror = function(){ reject(new Error("Failed to load: " + src)); };
         document.head.appendChild(s);
       });
     }
@@ -63,14 +63,28 @@
         app.innerHTML = '<p class="err">No H5P payload. Append <code>#b64=&lt;base64&gt;</code> to the URL.</p>';
         return;
       }
+
+      // 1) Try LOCAL bundles (your /docs files)
       try {
-        // IMPORTANT: main first, then frame
         await loadScript("./main.bundle.js");
         await loadScript("./frame.bundle.js");
       } catch (e) {
-        app.innerHTML = '<p class="err">' + e.message + '</p>';
-        return;
+        console.warn(e.message);
       }
+
+      // 2) If H5PStandalone still missing, fall back to CDN (known-good v1.3.0)
+      if (!(window.H5PStandalone && typeof window.H5PStandalone.display === 'function')) {
+        console.warn("Local bundles didn’t expose H5PStandalone; loading CDN fallback…");
+        try {
+          await loadScript("https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/main.bundle.js");
+          await loadScript("https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/frame.bundle.js");
+        } catch (e) {
+          app.innerHTML = '<p class="err">' + e.message + '</p>';
+          return;
+        }
+      }
+
+      // 3) Wait briefly for readiness and display
       let tries = 0;
       (function waitReady(){
         tries++;
@@ -87,15 +101,12 @@
         } else if (tries < 240) {
           setTimeout(waitReady, 50);
         } else {
-          app.innerHTML = '<p class="err">H5P API not ready. Check CSP allows <code>blob:</code> in <code>script-src</code>, and that both bundles exist.</p>';
+          app.innerHTML = '<p class="err">H5P API not ready. Verify CSP and that either local or CDN bundles load.</p>';
         }
       })();
     }
     document.addEventListener('DOMContentLoaded', boot);
   </script>
-
-  <!-- We’ll also keep link tags for bundles if you prefer static linking
-       (but dynamic loader above is robust). Not strictly required here. -->
 </head>
 <body>
   <div id="app"></div>
