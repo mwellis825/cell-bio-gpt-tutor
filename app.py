@@ -1,14 +1,15 @@
-# app.py — Cell Bio Tutor (Slides-Only, LLM-authored, H5P local inline-eval loader, no CDN/Blob)
+# app.py — Cell Bio Tutor (Slides-only, LLM-authored, H5P via GitHub Pages viewer)
+# Renders H5P by embedding https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html#b64=<base64>
 
-import os, io, json, base64, zipfile, pathlib, re, uuid, hashlib
+import os, io, json, base64, zipfile, pathlib, re, uuid, hashlib, html
 from typing import List, Dict, Optional, Tuple
 import streamlit as st
 import numpy as np
 from pypdf import PdfReader
 
-# --------------------------------
+# ------------------------------
 # Page / Paths
-# --------------------------------
+# ------------------------------
 st.set_page_config(page_title="Cell Bio Tutor — Slides Only", layout="centered")
 st.title("🧬 Cell Bio Tutor — Slides-Only (LLM + H5P)")
 
@@ -17,11 +18,13 @@ SLIDES_DIR = ROOT / "slides"
 TEMPLATES_DIR = ROOT / "templates"
 FIB_MASTER = TEMPLATES_DIR / "rtk_fill_in_blanks_FIXED_blocks.h5p"
 DND_MASTER = TEMPLATES_DIR / "cellular_respiration_aligned_course_style.h5p"
-VENDOR_H5P_DIR = ROOT / "vendor" / "h5p"  # main.bundle.js, frame.bundle.js, styles/h5p.css
 
-# --------------------------------
-# OpenAI (lazy init; no proxies)
-# --------------------------------
+# GitHub Pages viewer base (must exist in docs/ on your repo)
+GH_PAGES_VIEWER = "https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html#b64="
+
+# ------------------------------
+# OpenAI (lazy init)
+# ------------------------------
 EMBED_MODEL = "text-embedding-3-small"
 
 def _get_api_key() -> Optional[str]:
@@ -49,9 +52,9 @@ def client():
         st.session_state.openai_client = _get_openai_client()
     return st.session_state.openai_client
 
-# --------------------------------
+# ------------------------------
 # Session state
-# --------------------------------
+# ------------------------------
 def init_state():
     defaults = dict(
         topic="",
@@ -62,7 +65,7 @@ def init_state():
         index_chunks=[],
         index_embeds=None,
         run_id=None,
-        cache={},  # generated artifacts by run_id
+        cache={},  # by run_id: {"fib_bytes":..., "dnd_bytes":..., "mcqs":[...]}
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -70,9 +73,9 @@ def init_state():
 
 init_state()
 
-# --------------------------------
+# ------------------------------
 # Slides ingestion & retrieval
-# --------------------------------
+# ------------------------------
 def extract_pages(pdf_path: pathlib.Path) -> List[Dict]:
     out = []
     try:
@@ -120,7 +123,7 @@ def ensure_index() -> bool:
             st.warning(f"Embeddings failed; retrieval will be keyword-only. ({e})")
             st.session_state.index_embeds = None
     else:
-        st.info("No OpenAI client: retrieval will be keyword-only.")
+        st.info("No OpenAI key: retrieval will be keyword-only.")
 
     st.session_state.index_ready = True
     return True
@@ -181,9 +184,9 @@ def build_context_with_fallback(query: str, min_chars: int = 1200) -> Tuple[str,
         ctx = (ctx + "\n\n[OpenStax fallback]\n" + fb) if ctx else fb
     return ctx, src
 
-# --------------------------------
+# ------------------------------
 # LLM generation (slides + fallback)
-# --------------------------------
+# ------------------------------
 def gen_fib_lines_from_context(topic: str, difficulty: str, n_items: int) -> List[str]:
     if client() is None:
         raise RuntimeError("OpenAI client not initialized.")
@@ -302,9 +305,9 @@ Distinct pairs; concise; use only context/fallback.
         ("Mitochondria", "ATP production"),
     ][:n_pairs]
 
-# --------------------------------
+# ------------------------------
 # H5P builders (from master .h5p)
-# --------------------------------
+# ------------------------------
 def build_fib_from_master(instructions: str, lines: List[str]) -> Optional[bytes]:
     if not FIB_MASTER.exists():
         st.error("FIB master missing in templates/.")
@@ -336,7 +339,7 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
     if not DND_MASTER.exists():
         st.error("DnD master missing in templates/.")
         return None
-    # Compact L/R layout (rows of small text boxes)
+    # Compact left/right rows
     elements, zones = [], []
     y_dr, y_zn = 6.5, 13.9
     for i, (drag, drop) in enumerate(pairs[:5]):
@@ -374,117 +377,35 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
         st.error(f"Couldn’t build DnD H5P: {e}")
         return None
 
-# --------------------------------
-# Inline H5P renderer — Local inline-eval per iframe (no Blob/CDN)
-# --------------------------------
-def _read_text(path: pathlib.Path) -> Optional[str]:
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception:
-        return None
-
-def _local_assets_as_b64() -> Optional[Dict[str, str]]:
-    main_js = _read_text(VENDOR_H5P_DIR / "main.bundle.js")
-    frame_js = _read_text(VENDOR_H5P_DIR / "frame.bundle.js")
-    css_txt = _read_text(VENDOR_H5P_DIR / "styles" / "h5p.css")
-    if not (main_js and frame_js and css_txt):
-        st.error("Local H5P assets missing. Add vendor/h5p/{main.bundle.js, frame.bundle.js, styles/h5p.css}.")
-        return None
-    # Base64 encode and JSON-escape later for safe insertion
-    return {
-        "main_b64": base64.b64encode(main_js.encode("utf-8")).decode("utf-8"),
-        "frame_b64": base64.b64encode(frame_js.encode("utf-8")).decode("utf-8"),
-        "css": css_txt
-    }
-
-def render_h5p_inline(h5p_bytes: bytes, comp_id: str, height: int = 560):
+# ------------------------------
+# H5P renderer via GitHub Pages (iframe)
+# ------------------------------
+def render_h5p_via_pages(h5p_bytes: bytes, comp_id: str, height: int = 600):
     if not h5p_bytes:
         return
-
-    assets = _local_assets_as_b64()
-    if not assets:
-        st.download_button("⬇️ Download activity (.h5p)",
-                           data=h5p_bytes,
-                           file_name=f"activity_{comp_id}.h5p",
-                           mime="application/zip",
-                           key=f"dl-missing-{comp_id}")
-        return
-
     b64 = base64.b64encode(h5p_bytes).decode("utf-8")
-    container_id = f"h5p-container-{comp_id}"
-    css_txt = assets["css"]
-    main_b64 = assets["main_b64"]
-    frame_b64 = assets["frame_b64"]
+    viewer_url = GH_PAGES_VIEWER + html.escape(b64)
+    st.components.v1.iframe(src=viewer_url, height=height)
 
-    # Inline-eval loader: decode base64 to string and eval in global scope
-    # Avoids Blob and external CDN; survives CSPs that allow inline script but block blob/src.
-    html = f"""
-    <style>{css_txt}</style>
-    <div id="{container_id}"></div>
-    <script>
-      (function() {{
-        function evalB64(b64) {{
-          try {{
-            var code = atob(b64);
-            // global eval (indirect) to avoid scoping issues
-            (0, eval)(code);
-            return true;
-          }} catch (e) {{
-            console.error("Eval failed", e);
-            return false;
-          }}
-        }}
-        var ok1 = evalB64("{main_b64}");
-        var ok2 = ok1 && evalB64("{frame_b64}");
-        var tries = 0;
-        function boot() {{
-          tries++;
-          if (ok2 && window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {{
-            try {{
-              window.H5PStandalone.display("#{container_id}", {{
-                h5pContent: "data:application/zip;base64,{b64}"
-              }});
-            }} catch (e) {{
-              document.getElementById('{container_id}').innerHTML =
-                "<p style='color:#b00'>Couldn’t initialize H5P (inline). Use the download button below.</p>";
-            }}
-          }} else if (tries < 240) {{
-            setTimeout(boot, 50);
-          }} else {{
-            document.getElementById('{container_id}').innerHTML =
-              "<p style='color:#b00'>H5P API not ready (inline). Use the download button below.</p>";
-          }}
-        }}
-        boot();
-      }})();
-    </script>
-    """
-    st.components.v1.html(html, height=height, scrolling=True)
-
-    run_id = st.session_state.run_id or "norun"
-    digest = hashlib.md5(h5p_bytes).hexdigest()[:8]
-    st.download_button("⬇️ Download activity (.h5p)",
-                       data=h5p_bytes,
-                       file_name=f"activity_{comp_id}.h5p",
-                       mime="application/zip",
-                       key=f"dl-{comp_id}-{run_id}-{digest}")
-
-# --------------------------------
+# ------------------------------
 # Sidebar / Controls
-# --------------------------------
+# ------------------------------
 with st.sidebar:
     st.header("Authoring")
     st.session_state.n_items = st.slider("Items per FIB", 2, 6, st.session_state.n_items, 1)
     st.session_state.gen_mcq = st.toggle("Also generate MCQs", value=st.session_state.gen_mcq)
     st.session_state.gen_dnd = st.toggle("Also generate Drag-and-Drop", value=st.session_state.gen_dnd)
-    st.caption("All generations use ONLY your slides; if thin, adds a small OpenStax fallback snippet.")
+    st.caption("Generations use ONLY your slides; if thin, adds a tiny OpenStax fallback snippet.")
 
-topic = st.text_input("What do you want help with? (e.g., “electron transport chain”, “RTK”):", value=st.session_state.topic)
+topic = st.text_input(
+    "What do you want help with? (e.g., “electron transport chain”, “RTK”):",
+    value=st.session_state.topic
+)
 generate_clicked = st.button("Generate Activity")
 
-# --------------------------------
-# Generate (once) and cache by run_id
-# --------------------------------
+# ------------------------------
+# Generate and cache by run_id
+# ------------------------------
 if generate_clicked:
     st.session_state.run_id = uuid.uuid4().hex[:8]
     st.session_state.topic = topic
@@ -514,9 +435,9 @@ if generate_clicked:
         except Exception as e:
             st.warning(f"DnD generation failed: {e}")
 
-# --------------------------------
+# ------------------------------
 # Render last run
-# --------------------------------
+# ------------------------------
 current_run = st.session_state.run_id
 if current_run and current_run in st.session_state.cache:
     data = st.session_state.cache[current_run]
@@ -524,9 +445,17 @@ if current_run and current_run in st.session_state.cache:
     if data.get("fib_bytes"):
         st.success("Fill-in-the-Blanks (slides-only)")
         try:
-            render_h5p_inline(data["fib_bytes"], comp_id=f"fib-{current_run}", height=560)
+            render_h5p_via_pages(data["fib_bytes"], comp_id=f"fib-{current_run}", height=600)
         except Exception as e:
             st.error(f"Render error (FIB): {e}")
+        # Always provide a download fallback
+        st.download_button(
+            "⬇️ Download FIB (.h5p)",
+            data=data["fib_bytes"],
+            file_name=f"fib_{current_run}.h5p",
+            mime="application/zip",
+            key=f"dl-fib-{current_run}-{hashlib.md5(data['fib_bytes']).hexdigest()[:8]}",
+        )
 
     mcqs = data.get("mcqs", [])
     if mcqs:
@@ -542,6 +471,13 @@ if current_run and current_run in st.session_state.cache:
     if data.get("dnd_bytes"):
         st.success("Drag-and-Drop (slides-only)")
         try:
-            render_h5p_inline(data["dnd_bytes"], comp_id=f"dnd-{current_run}", height=520)
+            render_h5p_via_pages(data["dnd_bytes"], comp_id=f"dnd-{current_run}", height=600)
         except Exception as e:
             st.error(f"Render error (DnD): {e}")
+        st.download_button(
+            "⬇️ Download DnD (.h5p)",
+            data=data["dnd_bytes"],
+            file_name=f"dnd_{current_run}.h5p",
+            mime="application/zip",
+            key=f"dl-dnd-{current_run}-{hashlib.md5(data['dnd_bytes']).hexdigest()[:8]}",
+        )
