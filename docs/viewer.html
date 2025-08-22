@@ -4,20 +4,20 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
 
-  <!-- CSP that allows local scripts and data: URLs -->
+  <!-- ✅ Allow blob: for scripts (H5P loads content libs via Blob URLs) -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self' data: blob:;
-                 script-src 'self' 'unsafe-inline' 'unsafe-eval' data:;
-                 style-src 'self' 'unsafe-inline' data:;
-                 img-src 'self' data: blob:;
-                 connect-src 'self' data: blob:;">
+                 script-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:;
+                 style-src  'self' 'unsafe-inline' data: blob:;
+                 img-src    'self' data: blob:;
+                 connect-src 'self' data: blob:;
+                 worker-src 'self' blob:;">
 
-  <!-- H5P CSS you copied to /docs; font 404s are harmless -->
   <link rel="stylesheet" href="./h5p.css" />
   <style>
-    html, body { height: 100%; margin: 0; background: #fff; }
-    #app { min-height: 100vh; }
-    .err { color:#b00; padding:1rem; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    html, body { height:100%; margin:0; background:#fff; }
+    #app { min-height:100vh; }
+    .err { color:#b00; padding:1rem; font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
   </style>
 
   <!-- Define H5PIntegration BEFORE any bundles -->
@@ -41,24 +41,21 @@
   </script>
 
   <script>
-    // Sequential loader for local bundles in /docs
     function loadScript(src) {
       return new Promise(function(resolve, reject) {
         var s = document.createElement('script');
         s.src = src;
-        s.onload = function(){ resolve(); };
+        s.onload = function(){ console.log("Loaded", src); resolve(); };
         s.onerror = function(e){ reject(new Error("Failed to load: " + src)); };
         document.head.appendChild(s);
       });
     }
-
     function getB64() {
       try {
         const m = location.hash.match(/b64=([^&]+)/);
         return m ? decodeURIComponent(m[1]) : null;
       } catch { return null; }
     }
-
     async function boot() {
       const app = document.getElementById('app');
       const b64 = getB64();
@@ -66,21 +63,19 @@
         app.innerHTML = '<p class="err">No H5P payload. Append <code>#b64=&lt;base64&gt;</code> to the URL.</p>';
         return;
       }
-
       try {
-        // IMPORTANT: Load main first, then frame (same files you copied from h5p-standalone dist)
+        // IMPORTANT: main first, then frame
         await loadScript("./main.bundle.js");
         await loadScript("./frame.bundle.js");
       } catch (e) {
         app.innerHTML = '<p class="err">' + e.message + '</p>';
         return;
       }
-
-      // Wait for API readiness
       let tries = 0;
       (function waitReady(){
         tries++;
         if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {
+          console.log("H5PStandalone ready; rendering content…");
           try {
             window.H5PStandalone.display('#app', {
               h5pContent: 'data:application/zip;base64,' + b64
@@ -92,15 +87,15 @@
         } else if (tries < 240) {
           setTimeout(waitReady, 50);
         } else {
-          app.innerHTML = '<p class="err">H5P API not ready. ' +
-            'Check that <code>main.bundle.js</code> and <code>frame.bundle.js</code> exist in /docs and are real JS files.</p>';
+          app.innerHTML = '<p class="err">H5P API not ready. Check CSP allows <code>blob:</code> in <code>script-src</code>, and that both bundles exist.</p>';
         }
       })();
     }
-
-    // Run after DOM is ready
     document.addEventListener('DOMContentLoaded', boot);
   </script>
+
+  <!-- We’ll also keep link tags for bundles if you prefer static linking
+       (but dynamic loader above is robust). Not strictly required here. -->
 </head>
 <body>
   <div id="app"></div>
