@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
 
-  <!-- CSP: allow local, blob:, data:, and CDN (jsdelivr) -->
+  <!-- CSP: allow local, blob:, data:, and https (CDN + your .h5p host) -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self' https: data: blob:;
                  script-src  'self' https: 'unsafe-inline' 'unsafe-eval' data: blob:;
@@ -13,7 +13,7 @@
                  connect-src 'self' https: data: blob:;
                  worker-src  'self' blob:;">
 
-  <!-- Core CSS (from h5p-standalone dist you copied into /docs) -->
+  <!-- Core H5P CSS you put in /docs (from h5p-standalone dist) -->
   <link rel="stylesheet" href="./h5p.css" />
   <style>
     html, body { height:100%; margin:0; background:#fff; }
@@ -41,30 +41,28 @@
   </script>
 
   <script>
+    function qp(name) {
+      const u = new URL(location.href);
+      return u.searchParams.get(name);
+    }
     function loadScript(src) {
-      return new Promise(function(resolve, reject) {
-        var s = document.createElement('script');
+      return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
         s.src = src;
-        s.onload = function(){ console.log("Loaded", src); resolve(); };
-        s.onerror = function(){ reject(new Error("Failed to load: " + src)); };
+        s.onload = () => { console.log("Loaded", src); resolve(); };
+        s.onerror = () => reject(new Error("Failed to load: " + src));
         document.head.appendChild(s);
       });
     }
-    function getB64() {
-      try {
-        const m = location.hash.match(/b64=([^&]+)/);
-        return m ? decodeURIComponent(m[1]) : null;
-      } catch { return null; }
-    }
     async function boot() {
       const app = document.getElementById('app');
-      const b64 = getB64();
-      if (!b64) {
-        app.innerHTML = '<p class="err">No H5P payload. Append <code>#b64=&lt;base64&gt;</code> to the URL.</p>';
+      const src = qp('src'); // <-- absolute/public URL to the .h5p file
+      if (!src) {
+        app.innerHTML = '<p class="err">No H5P source. Use <code>?src=&lt;url-to-your.h5p&gt;</code>.</p>';
         return;
       }
 
-      // 1) Try LOCAL bundles (your /docs files)
+      // 1) Try LOCAL bundles (from /docs)
       try {
         await loadScript("./main.bundle.js");
         await loadScript("./frame.bundle.js");
@@ -72,9 +70,9 @@
         console.warn(e.message);
       }
 
-      // 2) If H5PStandalone still missing, fall back to CDN (known-good v1.3.0)
+      // 2) If not ready, fall back to CDN (known-good version)
       if (!(window.H5PStandalone && typeof window.H5PStandalone.display === 'function')) {
-        console.warn("Local bundles didn’t expose H5PStandalone; loading CDN fallback…");
+        console.warn("Local bundles did not expose H5PStandalone; loading CDN fallback…");
         try {
           await loadScript("https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/main.bundle.js");
           await loadScript("https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/frame.bundle.js");
@@ -84,16 +82,14 @@
         }
       }
 
-      // 3) Wait briefly for readiness and display
+      // 3) Wait for readiness and display the .h5p from ?src=
       let tries = 0;
       (function waitReady(){
         tries++;
         if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {
           console.log("H5PStandalone ready; rendering content…");
           try {
-            window.H5PStandalone.display('#app', {
-              h5pContent: 'data:application/zip;base64,' + b64
-            });
+            window.H5PStandalone.display('#app', { h5pContent: src });
           } catch (e) {
             app.innerHTML = '<p class="err">Could not initialize H5P: ' +
               (e && e.message ? e.message : e) + '</p>';
@@ -101,7 +97,7 @@
         } else if (tries < 240) {
           setTimeout(waitReady, 50);
         } else {
-          app.innerHTML = '<p class="err">H5P API not ready. Verify CSP and that either local or CDN bundles load.</p>';
+          app.innerHTML = '<p class="err">H5P API not ready. Verify CSP and bundles.</p>';
         }
       })();
     }
