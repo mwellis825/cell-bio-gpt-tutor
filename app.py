@@ -1,9 +1,4 @@
-# app.py — Cell Bio Tutor (Slides-Only, LLM-authored, Offline H5P, Stable Keys)
-# Fixes for logs issue:
-# - Do NOT create OpenAI client at import time (lazy init instead)
-# - Pin httpx==0.25.2 in requirements to support 'proxies' kw used by OpenAI SDK
-# - Never pass 'proxies' ourselves
-# - Guard all LLM calls; UI loads even without client
+# app.py — Cell Bio Tutor (Slides-Only, LLM-authored, Offline H5P with Blob loader, Stable Keys)
 
 import os, io, json, base64, zipfile, pathlib, re, uuid, hashlib
 from typing import List, Dict, Optional, Tuple
@@ -41,7 +36,6 @@ def _get_openai_client():
         return None
     try:
         from openai import OpenAI
-        # Do NOT pass httpx client or proxies; rely on SDK defaults
         return OpenAI(api_key=key)
     except Exception as e:
         st.error(f"Could not initialize OpenAI client: {e}")
@@ -51,7 +45,6 @@ if "openai_client" not in st.session_state:
     st.session_state.openai_client = None
 
 def client():
-    # lazy construct
     if st.session_state.openai_client is None:
         st.session_state.openai_client = _get_openai_client()
     return st.session_state.openai_client
@@ -68,8 +61,8 @@ def init_state():
         index_ready=False,
         index_chunks=[],
         index_embeds=None,
-        H5P_FRAME_JS=None,
         H5P_MAIN_JS=None,
+        H5P_FRAME_JS=None,
         H5P_CSS=None,
         H5P_LIBS_INJECTED=False,
         run_id=None,
@@ -116,7 +109,6 @@ def ensure_index() -> bool:
 
     st.session_state.index_chunks = chunks
 
-    # Try embeddings (if client available); fallback to keyword
     cli = client()
     if cli:
         try:
@@ -144,7 +136,6 @@ def search_chunks(query: str, k: int = 8) -> List[Dict]:
     M = st.session_state.index_embeds
 
     if M is None:
-        # keyword scoring fallback
         q = query.lower()
         toks = [t for t in re.findall(r"\w+", q) if t]
         scored = []
@@ -388,26 +379,36 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
         return None
 
 # --------------------------------
-# Inline H5P renderer (local assets; unique keys; inject once)
+# Inline H5P renderer (local assets via Blob URLs; unique keys; inject once)
 # --------------------------------
-def _ensure_h5p_assets_loaded() -> bool:
+def _read_text(path: pathlib.Path) -> Optional[str]:
     try:
-        if st.session_state.H5P_MAIN_JS is None:
-            st.session_state.H5P_MAIN_JS  = (VENDOR_H5P_DIR / "main.bundle.js").read_text(encoding="utf-8")
-        if st.session_state.H5P_FRAME_JS is None:
-            st.session_state.H5P_FRAME_JS = (VENDOR_H5P_DIR / "frame.bundle.js").read_text(encoding="utf-8")
-        if st.session_state.H5P_CSS is None:
-            st.session_state.H5P_CSS      = (VENDOR_H5P_DIR / "styles" / "h5p.css").read_text(encoding="utf-8")
-        return True
-    except Exception as e:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+def _ensure_h5p_assets_loaded() -> Optional[Dict[str, str]]:
+    """
+    Read local files. Return dict with base64'd JS/CSS (for safe Blob injection) or None if missing.
+    """
+    main_js = _read_text(VENDOR_H5P_DIR / "main.bundle.js")
+    frame_js = _read_text(VENDOR_H5P_DIR / "frame.bundle.js")
+    css_txt = _read_text(VENDOR_H5P_DIR / "styles" / "h5p.css")
+    if not (main_js and frame_js and css_txt):
         st.error("Local H5P assets missing. Add vendor/h5p/{main.bundle.js, frame.bundle.js, styles/h5p.css}.")
-        st.caption(f"(Details: {e})")
-        return False
+        return None
+    return {
+        "main_b64": base64.b64encode(main_js.encode("utf-8")).decode("utf-8"),
+        "frame_b64": base64.b64encode(frame_js.encode("utf-8")).decode("utf-8"),
+        "css": css_txt
+    }
 
 def render_h5p_inline(h5p_bytes: bytes, comp_id: str, height: int = 560):
     if not h5p_bytes:
         return
-    if not _ensure_h5p_assets_loaded():
+
+    assets = _ensure_h5p_assets_loaded()
+    if not assets:
         st.download_button("⬇️ Download activity (.h5p)",
                            data=h5p_bytes,
                            file_name=f"activity_{comp_id}.h5p",
@@ -417,77 +418,70 @@ def render_h5p_inline(h5p_bytes: bytes, comp_id: str, height: int = 560):
 
     b64 = base64.b64encode(h5p_bytes).decode("utf-8")
     container_id = f"h5p-container-{comp_id}"
+    css_txt = assets["css"]
+    main_b64 = assets["main_b64"]
+    frame_b64 = assets["frame_b64"]
 
-    if not st.session_state.H5P_LIBS_INJECTED:
-        html = f"""
-        <style>{st.session_state.H5P_CSS}</style>
-        <div id="{container_id}"></div>
-        <script>{st.session_state.H5P_MAIN_JS}</script>
-        <script>{st.session_state.H5P_FRAME_JS}</script>
-        <script>
-        (function() {{
-          window.__H5P_LIBS_READY__ = false;
-          let tries = 0;
-          function markReady() {{
-            if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {{
-              window.__H5P_LIBS_READY__ = true;
-            }} else if (tries < 160) {{
-              tries++; setTimeout(markReady, 50);
-            }}
-          }}
-          markReady();
-          let bootTries = 0;
-          function boot() {{
-            bootTries++;
-            if (window.__H5P_LIBS_READY__) {{
-              try {{
-                window.H5PStandalone.display('#{container_id}', {{
-                  h5pContent: "data:application/zip;base64,{b64}"
-                }});
-              }} catch (e) {{
-                document.getElementById('{container_id}').innerHTML =
-                  "<p style='color:#b00'>Couldn’t initialize H5P locally. Use the download button below.</p>";
+    # Load JS bundles via Blob URLs to avoid inline <script> pitfalls
+    html = f"""
+    <style>{css_txt}</style>
+    <div id="{container_id}"></div>
+    <script>
+      (function() {{
+        function b64ToUrl(b64, mime) {{
+          var binStr = atob(b64);
+          var len = binStr.length;
+          var arr = new Uint8Array(len);
+          for (var i=0; i<len; i++) arr[i] = binStr.charCodeAt(i);
+          var blob = new Blob([arr], {{type: mime}});
+          return URL.createObjectURL(blob);
+        }}
+
+        function loadScript(url) {{
+          return new Promise(function(resolve, reject) {{
+            var s = document.createElement('script');
+            s.src = url;
+            s.onload = function() {{ resolve(); }};
+            s.onerror = function(e) {{ reject(e); }};
+            document.head.appendChild(s);
+          }});
+        }}
+
+        var mainUrl = b64ToUrl("{main_b64}", "text/javascript");
+        var frameUrl = b64ToUrl("{frame_b64}", "text/javascript");
+
+        // Load MAIN first, then FRAME, then boot
+        loadScript(mainUrl)
+          .then(function() {{ return loadScript(frameUrl); }})
+          .then(function() {{
+            var tries = 0;
+            function boot() {{
+              tries++;
+              if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {{
+                try {{
+                  window.H5PStandalone.display("#{container_id}", {{
+                    h5pContent: "data:application/zip;base64,{b64}"
+                  }});
+                }} catch (e) {{
+                  document.getElementById("{container_id}").innerHTML =
+                    "<p style='color:#b00'>Couldn’t initialize H5P locally. Use the download button below.</p>";
+                }}
+              }} else if (tries < 200) {{
+                setTimeout(boot, 50);
+              }} else {{
+                document.getElementById("{container_id}").innerHTML =
+                  "<p style='color:#b00'>H5P API not ready. Use the download button below.</p>";
               }}
-            }} else if (bootTries < 200) {{
-              setTimeout(boot, 50);
-            }} else {{
-              document.getElementById('{container_id}').innerHTML =
-                "<p style='color:#b00'>H5P scripts loaded but API not ready. Use the download button below.</p>";
             }}
-          }}
-          boot();
-        }})();
-        </script>
-        """
-        st.session_state.H5P_LIBS_INJECTED = True
-    else:
-        html = f"""
-        <div id="{container_id}"></div>
-        <script>
-        (function() {{
-          let tries = 0;
-          function boot() {{
-            tries++;
-            if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {{
-              try {{
-                window.H5PStandalone.display('#{container_id}', {{
-                  h5pContent: "data:application/zip;base64,{b64}"
-                }});
-              }} catch (e) {{
-                document.getElementById('{container_id}').innerHTML =
-                  "<p style='color:#b00'>Couldn’t initialize H5P locally. Use the download button below.</p>";
-              }}
-            }} else if (tries < 200) {{
-              setTimeout(boot, 50);
-            }} else {{
-              document.getElementById('{container_id}').innerHTML =
-                "<p style='color:#b00'>H5P API not ready. Use the download button below.</p>";
-            }}
-          }}
-          boot();
-        }})();
-        </script>
-        """
+            boot();
+          }})
+          .catch(function(err) {{
+            document.getElementById("{container_id}").innerHTML =
+              "<p style='color:#b00'>Failed to load H5P libraries. Use the download button below.</p>";
+          }});
+      }})();
+    </script>
+    """
     st.components.v1.html(html, height=height, scrolling=True)
     run_id = st.session_state.run_id or "norun"
     digest = hashlib.md5(h5p_bytes).hexdigest()[:8]
