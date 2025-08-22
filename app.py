@@ -16,7 +16,7 @@ ROOT = pathlib.Path(__file__).parent
 SLIDES_DIR = ROOT / "slides"
 FIB_MASTER = ROOT / "templates" / "rtk_fill_in_blanks_FIXED_blocks.h5p"
 DND_MASTER = ROOT / "templates" / "cellular_respiration_aligned_course_style.h5p"
-VENDOR_H5P_DIR = ROOT / "vendor" / "h5p"  # contains frame.bundle.js, main.bundle.js, styles/h5p.css
+VENDOR_H5P_DIR = ROOT / "vendor" / "h5p"  # main.bundle.js, frame.bundle.js, styles/h5p.css
 
 # -------------------------------
 # OpenAI client (safe init)
@@ -180,7 +180,7 @@ def build_context_with_fallback(query: str, min_chars: int = 1200) -> Tuple[str,
 def gen_fib_lines_from_context(topic: str, difficulty: str, n_items: int) -> List[str]:
     if client is None:
         raise RuntimeError("OpenAI client not initialized.")
-    context, sources = build_context_with_fallback(topic)
+    context, _ = build_context_with_fallback(topic)
     sys = (
         "You are a Cell Biology tutor bound to the provided context. "
         "Only use information present in the context/fallback; do NOT invent facts. "
@@ -197,11 +197,11 @@ Task:
 Produce {n_items} concise, critical-thinking Fill-in-the-Blanks items using H5P syntax.
 Rules:
 - Exactly ONE sentence and ONE blank per item.
-- The blank should be *increase/increased* or *decrease/decreased* (or similarly predictive outcomes).
+- The blank should be *increase/increased* or *decrease/decreased* (or similar predictive outcomes).
 - Use asterisks for acceptable answers/variants, e.g., *increase/increased*.
-- Keep cognitive load low but conceptual (predictive). No definition recall (e.g., "X is Y").
-- Do NOT repeat identical structures; vary components perturbed and downstream targets.
-- If context is insufficient, write items that say 'Not in slides *increase/decrease*.' (rare).
+- Keep cognitive load low but conceptual (predictive). No definition recall.
+- Vary components perturbed and downstream targets.
+- If context is insufficient, write items that say 'Not in slides *increase/decrease*.'
 
 Return as a numbered list of plain lines.
 """
@@ -221,7 +221,6 @@ Return as a numbered list of plain lines.
             if not s:
                 continue
             s = s.lstrip("0123456789). ").strip()
-            # must contain *answer* and be predictive (heuristic)
             predictive = ("*increase" in s.lower()) or ("*decrease" in s.lower())
             if "*" in s and predictive and not re.search(r"\bis\b|\bare\b|\bdefined as\b", s.lower()):
                 out.append(s)
@@ -229,45 +228,9 @@ Return as a numbered list of plain lines.
 
     lines = parse_and_filter(text)
     if len(lines) < n_items:
-        # regenerate once with slightly higher temperature to diversify
         text2 = call_llm(0.4)
         lines = (lines + parse_and_filter(text2))[:n_items]
 
-    if not lines:
-        lines = ["If proton leak increases across the inner membrane, ATP synthase output will *decrease/decreased*."]
-    return lines[:n_items]
-
-
-Context:
-{context}
-
-Task:
-Produce {n_items} concise, critical-thinking Fill-in-the-Blanks items using H5P syntax.
-Rules:
-- ONE sentence per item.
-- Exactly ONE blank per sentence.
-- Use asterisks for acceptable answers and variants, e.g., *increase/increased*.
-- Keep cognitive load low. Focus on 'predict increase/decrease' consequences.
-- Do NOT invent facts beyond the context.
-
-Return as a numbered list of plain lines."""
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o", temperature=0.2,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
-        )
-        text = resp.choices[0].message.content or ""
-    except Exception as e:
-        raise RuntimeError(f"LLM call failed: {e}")
-
-    lines = []
-    for line in text.splitlines():
-        s = line.strip()
-        if not s: 
-            continue
-        s = s.lstrip("0123456789). ").strip()
-        if "*" in s:
-            lines.append(s)
     if not lines:
         lines = ["If proton leak increases across the inner membrane, ATP synthase output will *decrease/decreased*."]
     return lines[:n_items]
@@ -276,8 +239,7 @@ def gen_mcqs_from_context(topic: str, difficulty: str, n_items: int = 2) -> List
     if client is None:
         return []
     context, _ = build_context_with_fallback(topic)
-    sys = ("Create multiple-choice questions ONLY from the context. "
-           "Do not invent facts beyond the context.")
+    sys = ("Create multiple-choice questions ONLY from the context. Do not invent facts beyond the context.")
     user = f"""
 Context:
 {context}
@@ -298,7 +260,6 @@ Keep wording short. Use only slide/fallback facts. If insufficient, return [].
         raw = resp.choices[0].message.content or "[]"
     except Exception:
         return []
-    # Try to parse JSON from response
     try:
         j = json.loads(raw.strip(" \n`"))
         return j if isinstance(j, list) else []
@@ -336,8 +297,7 @@ Constraints:
     try:
         resp = client.chat.completions.create(
             model="gpt-4o", temperature=0.2,
-            messages=[{"role": "system", "content": sys},
-                      {"role": "user", "content": user}]
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
         )
         raw = resp.choices[0].message.content or "[]"
         arr = json.loads(raw.strip(" \n`"))
@@ -387,96 +347,6 @@ Constraints:
             ("Mitochondria", "ATP production"),
         ]
     return fallback[:n_pairs]
-
-
-Task:
-Provide {n_pairs} pairs for a Drag-and-Drop activity as a JSON array of objects:
-- drag: short text (term/step) <= 8 words
-- drop: short label (matching description/location/output) <= 10 words
-Constraints:
-- Use distinct pairs; avoid duplicates.
-- Keep both texts concise and readable for undergrads.
-- Only use information explicitly present in context/fallback.
-"""
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o", temperature=0.2,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
-        )
-        raw = resp.choices[0].message.content or "[]"
-        arr = json.loads(raw.strip(" \n`"))
-        pairs = []
-        for obj in arr:
-            if isinstance(obj, dict) and "drag" in obj and "drop" in obj:
-                pairs.append((obj["drag"], obj["drop"]))
-        pairs = pairs[:n_pairs]
-    except Exception:
-        pairs = []
-
-    if len(pairs) >= max(3, n_pairs//2):
-        return pairs
-
-    # Heuristic fallback by topic (OpenStax-style)
-    t = topic.lower()
-    if "electron transport" in t or "etc" in t or "oxidative" in t:
-        fallback = [
-            ("Complex I", "NADH → e⁻, pumps H⁺"),
-            ("Complex II", "FADH₂ → e⁻ (no pumping)"),
-            ("Complex III", "Q → Cyt c, pumps H⁺"),
-            ("Complex IV", "O₂ → H₂O, pumps H⁺"),
-            ("ATP synthase", "H⁺ gradient → ATP"),
-        ]
-    elif "glycolysis" in t:
-        fallback = [
-            ("Hexokinase", "Glucose → G6P"),
-            ("PFK-1", "F6P → F1,6BP"),
-            ("Pyruvate kinase", "PEP → Pyruvate"),
-            ("NAD⁺ reduction", "Generates NADH"),
-            ("ATP yield", "Net 2 ATP"),
-        ]
-    elif "rtk" in t or "receptor tyrosine" in t:
-        fallback = [
-            ("Ligand binding", "Dimerization"),
-            ("Autophosphorylation", "Tyr residues"),
-            ("Grb2/SOS", "Ras activation"),
-            ("MAPK cascade", "Phosphorylation"),
-            ("PI3K → AKT", "Pro-survival"),
-        ]
-    else:
-        fallback = [
-            ("Nucleus", "DNA storage"),
-            ("ER", "Protein folding"),
-            ("Golgi", "Modification/Sorting"),
-            ("Lysosome", "Acid hydrolases"),
-            ("Mitochondria", "ATP production"),
-        ]
-    return fallback[:n_pairs]
-
-
-Task:
-Provide {n_pairs} pairs for a Drag-and-Drop activity as a JSON array of objects:
-- drag: short text (term/step) <= 8 words
-- drop: short label (matching description/location/output) <= 8 words
-
-Only use information explicitly present in context/fallback.
-"""
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o", temperature=0.2,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
-        )
-        raw = resp.choices[0].message.content or "[]"
-    except Exception:
-        return []
-    try:
-        arr = json.loads(raw.strip(" \n`"))
-        pairs = []
-        for obj in arr:
-            if isinstance(obj, dict) and "drag" in obj and "drop" in obj:
-                pairs.append((obj["drag"], obj["drop"]))
-        return pairs[:n_pairs]
-    except Exception:
-        return []
 
 # -------------------------------
 # H5P builders from MASTER files
@@ -555,12 +425,10 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
 # Inline H5P renderer (LOCAL assets, no CDN)
 # -------------------------------
 def render_h5p_inline(h5p_bytes: bytes, height: int = 560):
-    """Render .h5p using locally vendored h5p-standalone assets (no CDN)."""
     if not h5p_bytes:
         return
-
-    # Load local JS/CSS once
-    if st.session_state.H5P_FRAME_JS is None or st.session_state.H5P_MAIN_JS is None or st.session_state.H5P_CSS is None:
+    # Load local JS/CSS once (MAIN first, then FRAME)
+    if st.session_state.H5P_MAIN_JS is None or st.session_state.H5P_FRAME_JS is None or st.session_state.H5P_CSS is None:
         try:
             st.session_state.H5P_MAIN_JS  = (VENDOR_H5P_DIR / "main.bundle.js").read_text(encoding="utf-8")
             st.session_state.H5P_FRAME_JS = (VENDOR_H5P_DIR / "frame.bundle.js").read_text(encoding="utf-8")
@@ -573,8 +441,6 @@ def render_h5p_inline(h5p_bytes: bytes, height: int = 560):
             return
 
     b64 = base64.b64encode(h5p_bytes).decode("utf-8")
-
-    # Load MAIN first, then FRAME; wait for H5PStandalone to exist
     html = f"""
     <style>{st.session_state.H5P_CSS}</style>
     <div id="h5p-container"></div>
@@ -588,10 +454,10 @@ def render_h5p_inline(h5p_bytes: bytes, height: int = 560):
       (function() {{
         var tries = 0;
         function boot() {{
-          tries += 1;
-          if (window.H5PStandalone && typeof H5PStandalone.display === 'function') {{
+          tries = tries + 1;
+          if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {{
             try {{
-              H5PStandalone.display('#h5p-container', {{
+              window.H5PStandalone.display('#h5p-container', {{
                 h5pContent: "data:application/zip;base64,{b64}"
               }});
             }} catch (e) {{
@@ -599,7 +465,7 @@ def render_h5p_inline(h5p_bytes: bytes, height: int = 560):
                 "<p style='color:#b00'>Couldn’t initialize H5P locally. Use the download button below.</p>";
             }}
           }} else if (tries < 40) {{
-            setTimeout(boot, 100); // wait up to ~4s total
+            setTimeout(boot, 100); /* wait up to ~4s total */
           }} else {{
             document.getElementById('h5p-container').innerHTML =
               "<p style='color:#b00'>H5P scripts loaded but API not ready. Try reload or use the download button below.</p>";
@@ -610,9 +476,9 @@ def render_h5p_inline(h5p_bytes: bytes, height: int = 560):
     </script>
     """
     st.components.v1.html(html, height=height, scrolling=True)
+    # Always provide a fallback download
     st.download_button("⬇️ Download activity (.h5p)",
                        data=h5p_bytes, file_name="activity_generated.h5p", mime="application/zip")
-
 
 # -------------------------------
 # UI
@@ -634,10 +500,8 @@ if generate:
     fib_bytes = None
     try:
         lines = gen_fib_lines_from_context(topic, difficulty="medium", n_items=st.session_state.n_items)
-        # after lines = gen_fib_lines_from_context(...)
-instructions = f"Based ONLY on your course slides: predict the downstream effect for **{st.session_state.topic}** (use *increase/decrease* in the blank)."
-fib_bytes = build_fib_from_master(instructions, lines)
-
+        instructions = f"Based ONLY on your course slides: predict the downstream effect for **{st.session_state.topic}** (use *increase/decrease* in the blank)."
+        fib_bytes = build_fib_from_master(instructions, lines)
     except Exception as e:
         st.error(f"FIB generation failed: {e}")
 
