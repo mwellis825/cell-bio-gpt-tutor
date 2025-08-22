@@ -1,4 +1,4 @@
-# app.py — Cell Bio Tutor (Slides-Only, LLM-authored, H5P local per-iframe loader, no CDN)
+# app.py — Cell Bio Tutor (Slides-Only, LLM-authored, H5P local inline-eval loader, no CDN/Blob)
 
 import os, io, json, base64, zipfile, pathlib, re, uuid, hashlib
 from typing import List, Dict, Optional, Tuple
@@ -375,7 +375,7 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
         return None
 
 # --------------------------------
-# Inline H5P renderer — Local Blob per iframe
+# Inline H5P renderer — Local inline-eval per iframe (no Blob/CDN)
 # --------------------------------
 def _read_text(path: pathlib.Path) -> Optional[str]:
     try:
@@ -390,6 +390,7 @@ def _local_assets_as_b64() -> Optional[Dict[str, str]]:
     if not (main_js and frame_js and css_txt):
         st.error("Local H5P assets missing. Add vendor/h5p/{main.bundle.js, frame.bundle.js, styles/h5p.css}.")
         return None
+    # Base64 encode and JSON-escape later for safe insertion
     return {
         "main_b64": base64.b64encode(main_js.encode("utf-8")).decode("utf-8"),
         "frame_b64": base64.b64encode(frame_js.encode("utf-8")).decode("utf-8"),
@@ -415,60 +416,46 @@ def render_h5p_inline(h5p_bytes: bytes, comp_id: str, height: int = 560):
     main_b64 = assets["main_b64"]
     frame_b64 = assets["frame_b64"]
 
+    # Inline-eval loader: decode base64 to string and eval in global scope
+    # Avoids Blob and external CDN; survives CSPs that allow inline script but block blob/src.
     html = f"""
     <style>{css_txt}</style>
     <div id="{container_id}"></div>
     <script>
       (function() {{
-        function b64ToUrl(b64, mime) {{
-          var binStr = atob(b64);
-          var len = binStr.length;
-          var arr = new Uint8Array(len);
-          for (var i=0; i<len; i++) arr[i] = binStr.charCodeAt(i);
-          var blob = new Blob([arr], {{type: mime}});
-          return URL.createObjectURL(blob);
+        function evalB64(b64) {{
+          try {{
+            var code = atob(b64);
+            // global eval (indirect) to avoid scoping issues
+            (0, eval)(code);
+            return true;
+          }} catch (e) {{
+            console.error("Eval failed", e);
+            return false;
+          }}
         }}
-        function loadScript(url) {{
-          return new Promise(function(resolve, reject) {{
-            var s = document.createElement('script');
-            s.src = url;
-            s.onload = function() {{ resolve(); }};
-            s.onerror = function(e) {{ reject(e); }};
-            document.head.appendChild(s);
-          }});
-        }}
-        var mainUrl = b64ToUrl("{main_b64}", "text/javascript");
-        var frameUrl = b64ToUrl("{frame_b64}", "text/javascript");
-
-        // Load MAIN, then FRAME, then boot in THIS iframe
-        loadScript(mainUrl)
-          .then(function() {{ return loadScript(frameUrl); }})
-          .then(function() {{
-            var tries = 0;
-            function boot() {{
-              tries++;
-              if (window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {{
-                try {{
-                  window.H5PStandalone.display("#{container_id}", {{
-                    h5pContent: "data:application/zip;base64,{b64}"
-                  }});
-                }} catch (e) {{
-                  document.getElementById('{container_id}').innerHTML =
-                    "<p style='color:#b00'>Couldn’t initialize H5P (local). Use the download button below.</p>";
-                }}
-              }} else if (tries < 240) {{
-                setTimeout(boot, 50);
-              }} else {{
-                document.getElementById('{container_id}').innerHTML =
-                  "<p style='color:#b00'>H5P API not ready (local). Use the download button below.</p>";
-              }}
+        var ok1 = evalB64("{main_b64}");
+        var ok2 = ok1 && evalB64("{frame_b64}");
+        var tries = 0;
+        function boot() {{
+          tries++;
+          if (ok2 && window.H5PStandalone && typeof window.H5PStandalone.display === 'function') {{
+            try {{
+              window.H5PStandalone.display("#{container_id}", {{
+                h5pContent: "data:application/zip;base64,{b64}"
+              }});
+            }} catch (e) {{
+              document.getElementById('{container_id}').innerHTML =
+                "<p style='color:#b00'>Couldn’t initialize H5P (inline). Use the download button below.</p>";
             }}
-            boot();
-          }})
-          .catch(function(err) {{
+          }} else if (tries < 240) {{
+            setTimeout(boot, 50);
+          }} else {{
             document.getElementById('{container_id}').innerHTML =
-              "<p style='color:#b00'>Failed to load H5P libraries (local). Use the download button below.</p>";
-          }});
+              "<p style='color:#b00'>H5P API not ready (inline). Use the download button below.</p>";
+          }}
+        }}
+        boot();
       }})();
     </script>
     """
