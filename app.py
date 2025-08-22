@@ -1,11 +1,8 @@
 import base64, io, json, random, time, zipfile, pathlib, os
-from typing import List, Dict
+from typing import List, Dict, Optional
 import streamlit as st
-from openai import OpenAI
 
-# -------------------------------
-# Config & paths
-# -------------------------------
+# ---------- Page ----------
 st.set_page_config(page_title="Cell Bio Tutor", layout="centered")
 st.title("🧬 Cell Bio Tutor")
 
@@ -13,37 +10,56 @@ REPO_ROOT = pathlib.Path(__file__).parent
 FIB_MASTER = REPO_ROOT / "templates" / "rtk_fill_in_blanks_FIXED_blocks.h5p"
 DND_MASTER = REPO_ROOT / "templates" / "cellular_respiration_aligned_course_style.h5p"
 
-# OpenAI client (optional LLM mode)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY", None))
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# ---------- OpenAI (robust init) ----------
+def get_openai_client() -> Optional[object]:
+    """Initialize OpenAI client safely. If anything fails, return None and show a warning."""
+    try:
+        from openai import OpenAI  # requires openai >= 1.x
+    except Exception as e:
+        st.warning(f"OpenAI library import failed. Using rule-based items. ({e})")
+        return None
 
-# -------------------------------
-# Session state
-# -------------------------------
+    api_key = os.getenv("OPENAI_API_KEY", None)
+    if not api_key:
+        # Streamlit Cloud: secrets live in st.secrets
+        api_key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
+    if not api_key:
+        st.info("No OPENAI_API_KEY found — continuing with rule-based items.")
+        return None
+
+    try:
+        # IMPORTANT: don’t pass custom base_url unless you know you need it
+        client = OpenAI(api_key=api_key)
+        return client
+    except Exception as e:
+        st.error("Couldn’t initialize OpenAI. Falling back to rule-based items.")
+        st.caption(f"(Details for admin: {e})")
+        return None
+
+client = get_openai_client()
+
+# ---------- Session ----------
 def init_state():
     defaults = dict(
         topic="",
-        difficulty="easy",      # easy / medium / hard
-        accuracy_window=[],     # last 5 MCQ results
+        difficulty="easy",
+        accuracy_window=[],
+        n_items=3,
+        use_ai=True if client else False,
         last_fib_bytes=None,
         last_dnd_bytes=None,
-        last_fib_lines=[],
-        use_ai=True,            # toggle LLM authoring
-        n_items=3,              # items per FIB activity
     )
     for k,v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k]=v
+        if k not in st.session_state: st.session_state[k]=v
 init_state()
 
-# -------------------------------
-# Utilities
-# -------------------------------
+# ---------- Inline H5P ----------
 def render_h5p_inline(h5p_bytes: bytes, height: int = 560):
-    """Render a .h5p package inline using h5p-standalone (CDN)."""
+    if not h5p_bytes:
+        return
     b64 = base64.b64encode(h5p_bytes).decode("utf-8")
     html = f"""
-    <div id="h5p-container" style="border:0; margin:0; padding:0;"></div>
+    <div id="h5p-container"></div>
     <script src="https://unpkg.com/h5p-standalone@1.3.0/dist/main.bundle.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/h5p-standalone@1.3.0/dist/styles/h5p.css">
     <script>
@@ -56,24 +72,16 @@ def render_h5p_inline(h5p_bytes: bytes, height: int = 560):
     """
     st.components.v1.html(html, height=height, scrolling=True)
 
+# ---------- Adaptivity ----------
 def record_result(correct: bool):
     st.session_state.accuracy_window.append(int(correct))
     if len(st.session_state.accuracy_window) > 5:
         st.session_state.accuracy_window = st.session_state.accuracy_window[-5:]
-    acc = sum(st.session_state.accuracy_window) / max(1, len(st.session_state.accuracy_window))
+    acc = sum(st.session_state.accuracy_window)/max(1,len(st.session_state.accuracy_window))
     st.session_state.difficulty = "hard" if acc>=0.8 else "medium" if acc>=0.5 else "easy"
 
-# -------------------------------
-# LLM-authored critical-thinking lines (FIB)
-# -------------------------------
-def generate_ct_fib_lines_llm(topic: str, difficulty: str, n_items: int = 3) -> List[str]:
-    """
-    Returns concise, critical-thinking lines with exactly ONE blank using H5P Blanks syntax:
-    Surround acceptable answers with asterisks, and variants with slashes: *increase/increased*.
-    """
-    if not client:
-        raise RuntimeError("OPENAI_API_KEY missing")
-
+# ---------- LLM & Fallback item generation ----------
+def generate_ct_fib_lines_llm(client, topic: str, difficulty: str, n_items: int) -> List[str]:
     sys = (
         "You are a college Cell Biology tutor. "
         "Generate short, critical-thinking prompts that ask students to PREDICT downstream effects of perturbations. "
@@ -84,26 +92,22 @@ def generate_ct_fib_lines_llm(topic: str, difficulty: str, n_items: int = 3) -> 
     user = (
         f"Topic: {topic}\n"
         f"Difficulty: {difficulty}\n"
-        f"Create {n_items} items. Each one sentence with one blank. "
+        f"Create {n_items} items. "
         f"Prefer 'increase/decrease' predictions about downstream components.\n"
-        f"Examples of style:\n"
+        f"Examples:\n"
         f"- If Complex I activity rises, proton motive force will *increase/increased*.\n"
         f"- If RTK can't bind ligand, MAPK phosphorylation will *decrease/decreased*.\n"
         f"Return as a numbered list of plain lines only."
     )
-
     resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-        temperature=0.3,
+        model="gpt-4o", temperature=0.3,
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}]
     )
     text = resp.choices[0].message.content
-    # Parse numbered lines
     lines = []
     for line in text.splitlines():
         s = line.strip()
         if not s: continue
-        # strip leading numbers like "1) " or "1. "
         s = s.lstrip("0123456789). ").strip()
         if "*" in s:
             lines.append(s)
@@ -111,12 +115,8 @@ def generate_ct_fib_lines_llm(topic: str, difficulty: str, n_items: int = 3) -> 
         "If the inner membrane becomes leaky to H+, ATP synthase output will *decrease/decreased*."
     ]
 
-# -------------------------------
-# Rule-based fallback CT lines
-# -------------------------------
-def ct_fib_lines_rule(topic: str, n_items: int = 3) -> List[str]:
-    t = (topic or "").lower().strip()
-    bank = []
+def ct_fib_lines_rule(topic: str, n_items: int) -> List[str]:
+    t = (topic or "").lower()
     if "electron transport" in t or "etc" in t:
         bank = [
             "If Complex I activity increases, proton pumping and Δp will *increase/increased*.",
@@ -129,12 +129,6 @@ def ct_fib_lines_rule(topic: str, n_items: int = 3) -> List[str]:
             "If Grb2 cannot bind RTK, Ras activation will *decrease/decreased*.",
             "If PI3K is hyperactive, AKT activity will *increase/increased*.",
         ]
-    elif "glycolysis" in t:
-        bank = [
-            "If ATP binds PFK-1’s regulatory site, glycolytic flux will *decrease/decreased*.",
-            "If AMP rises in the cell, PFK-1 activity will *increase/increased*.",
-            "If pyruvate kinase is inhibited, pyruvate output will *decrease/decreased*.",
-        ]
     else:
         bank = [
             "If lysosomal pH rises, hydrolase activity will *decrease/decreased*.",
@@ -143,28 +137,19 @@ def ct_fib_lines_rule(topic: str, n_items: int = 3) -> List[str]:
         ]
     return bank[:n_items]
 
-# -------------------------------
-# Build H5P: FIB from your MASTER (DO NOT change master metadata)
-# - content.json must keep your master shape: text (instructions) + questions (Text blocks)
-# -------------------------------
+# ---------- Build FIB from your MASTER ----------
 def build_fib_from_master(master_path: pathlib.Path, instructions: str, lines: List[str]) -> bytes:
     with zipfile.ZipFile(master_path, "r") as zin:
         files = {name: zin.read(name) for name in zin.namelist()}
-
-    # Your master expects 'content/content.json' with keys:
-    #   text: string (instructions)
-    #   questions: list of HTML strings, each with *answers/variants*
+    # Your master uses content/content.json with "text" and "questions"
     content = json.loads(files["content/content.json"].decode("utf-8"))
     content["text"] = instructions
     content["questions"] = [f"<p>{ln}</p>" for ln in lines]
-
-    # Make answers lenient where supported
     beh = content.get("behaviour", {})
     beh["caseSensitive"] = False
     beh["ignorePunctuation"] = True
     beh["acceptSpellingErrors"] = True
     content["behaviour"] = beh
-
     out_buf = io.BytesIO()
     with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
         for name, data in files.items():
@@ -174,42 +159,8 @@ def build_fib_from_master(master_path: pathlib.Path, instructions: str, lines: L
                 zout.writestr(name, data)
     return out_buf.getvalue()
 
-# -------------------------------
-# Build H5P: DnD from your MASTER (compact style)
-# Assumes your master stores geometry under question.task.elements / dropZones
-# -------------------------------
-def build_dnd_from_master(master_path: pathlib.Path, elements: List[Dict], zones: List[Dict]) -> bytes:
-    with zipfile.ZipFile(master_path, "r") as zin:
-        files = {name: zin.read(name) for name in zin.namelist()}
-
-    content = json.loads(files["content/content.json"].decode("utf-8"))
-    # Map into the master structure
-    content["question"]["task"]["elements"] = [{
-        "x": e["x"], "y": e["y"], "width": e["w"], "height": e["h"],
-        "dropZones": [str(i) for i in range(len(zones))],
-        "backgroundOpacity": 0,
-        "type": {"library": "H5P.AdvancedText 1.1", "params": {"text": f"<span>{e['text']}</span>"}}
-    } for e in elements]
-
-    content["question"]["task"]["dropZones"] = [{
-        "x": zc["x"], "y": zc["y"], "width": zc["w"], "height": zc["h"],
-        "label": f"<div style='text-align:center'>{zc['label']}</div>",
-        "showLabel": True, "backgroundOpacity": 0,
-        "autoAlign": True, "single": False,
-        "correctElements": [str(zc["correct_idx"])]
-    } for zc in zones]
-
-    out_buf = io.BytesIO()
-    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
-        for name, data in files.items():
-            if name == "content/content.json":
-                zout.writestr(name, json.dumps(content, ensure_ascii=False, indent=2))
-            else:
-                zout.writestr(name, data)
-    return out_buf.getvalue()
-
+# ---------- Build DnD from your MASTER ----------
 def default_dnd_geometry():
-    # Use your compact, left/right geometry
     elements = [
         {"text": "Glycolysis", "x": 1.0, "y": 6.5, "w": 8.5, "h": 3.2},
         {"text": "Pyruvate oxidation", "x": 0.8, "y": 24.5, "w": 9.0, "h": 3.2},
@@ -226,9 +177,33 @@ def default_dnd_geometry():
     ]
     return elements, zones
 
-# -------------------------------
-# Adaptive MCQs (short & targeted)
-# -------------------------------
+def build_dnd_from_master(master_path: pathlib.Path, elements: List[Dict], zones: List[Dict]) -> bytes:
+    with zipfile.ZipFile(master_path, "r") as zin:
+        files = {name: zin.read(name) for name in zin.namelist()}
+    content = json.loads(files["content/content.json"].decode("utf-8"))
+    content["question"]["task"]["elements"] = [{
+        "x": e["x"], "y": e["y"], "width": e["w"], "height": e["h"],
+        "dropZones": [str(i) for i in range(len(zones))],
+        "backgroundOpacity": 0,
+        "type": {"library": "H5P.AdvancedText 1.1", "params": {"text": f"<span>{e['text']}</span>"}}
+    } for e in elements]
+    content["question"]["task"]["dropZones"] = [{
+        "x": zc["x"], "y": zc["y"], "width": zc["w"], "height": zc["h"],
+        "label": f"<div style='text-align:center'>{zc['label']}</div>",
+        "showLabel": True, "backgroundOpacity": 0,
+        "autoAlign": True, "single": False,
+        "correctElements": [str(zc["correct_idx"])]
+    } for zc in zones]
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in files.items():
+            if name == "content/content.json":
+                zout.writestr(name, json.dumps(content, ensure_ascii=False, indent=2))
+            else:
+                zout.writestr(name, data)
+    return out_buf.getvalue()
+
+# ---------- MCQs ----------
 MCQ_BANK = {
     "etc": {
         "easy": [
@@ -276,53 +251,46 @@ def ask_mcqs(topic: str):
             st.markdown("✅ Correct!" if correct else "❌ Not quite — review the concept.")
             st.divider()
 
-# -------------------------------
-# UI: student prompt -> activities
-# -------------------------------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Authoring options")
-    st.session_state.use_ai = st.toggle("Use AI to generate items", value=True if client else False,
-                                        help="If off (or no API key), uses built-in rule-based items.")
     st.session_state.n_items = st.slider("Items per activity", 2, 6, 3, 1)
+    if client:
+        st.session_state.use_ai = st.toggle("Use AI to generate items", value=True)
+    else:
+        st.session_state.use_ai = False
 
+# ---------- UI ----------
 topic = st.text_input("What do you want help with? (e.g., “electron transport chain”, “RTK”):", value=st.session_state.topic)
-colA, colB = st.columns([1,1])
-with colA:
-    gen_fib = st.button("Generate Fill-in-the-Blanks")
-with colB:
-    gen_dnd = st.button("Generate Drag-and-Drop")
+generate = st.button("Generate Activity")
 
-# FIB flow
-if gen_fib:
+if generate:
     st.session_state.topic = topic
+
+    # 1) Build items
     try:
-        lines = generate_ct_fib_lines_llm(topic, st.session_state.difficulty, st.session_state.n_items) \
-                if (st.session_state.use_ai and client) else \
-                ct_fib_lines_rule(topic, st.session_state.n_items)
+        if st.session_state.use_ai and client:
+            lines = generate_ct_fib_lines_llm(client, topic, st.session_state.difficulty, st.session_state.n_items)
+        else:
+            lines = ct_fib_lines_rule(topic, st.session_state.n_items)
     except Exception as e:
         st.warning(f"AI generation failed, using fallback. ({e})")
         lines = ct_fib_lines_rule(topic, st.session_state.n_items)
 
-    st.session_state.last_fib_lines = lines
-    instructions = "Predict whether the following situations would increase or decrease protein activity:"
-    fib_bytes = build_fib_from_master(FIB_MASTER, instructions, lines)
-    st.session_state.last_fib_bytes = fib_bytes
+    # 2) Build FIB H5P from your MASTER
+    if not FIB_MASTER.exists():
+        st.error("FIB master not found in templates/. Make sure rtk_fill_in_blanks_FIXED_blocks.h5p is committed.")
+    else:
+        instructions = "Predict whether the following situations would increase or decrease protein activity:"
+        try:
+            fib_bytes = build_fib_from_master(FIB_MASTER, instructions, lines)
+            st.success("Fill-in-the-Blanks activity ready below ⤵")
+            render_h5p_inline(fib_bytes, height=560)
+            st.caption("Tip: if you don’t see the H5P, your network may be blocking the CDN (unpkg).")
+        except Exception as e:
+            st.error("Couldn’t build the FIB H5P from master.")
+            st.caption(f"(Details for admin: {e})")
 
-    st.success("Your Fill-in-the-Blanks activity is ready below ⤵")
-    render_h5p_inline(fib_bytes, height=560)
-
-    st.subheader("Critical Thinking (preview)")
-    st.caption("Same content embedded in the H5P above.")
-    for i, ln in enumerate(lines, 1):
-        st.write(f"{i}) {ln}")
-
+    # 3) Quick MCQs + adapt
     ask_mcqs(topic)
-    st.info(f"Difficulty now set to **{st.session_state.difficulty}** based on your recent answers.")
-
-# DnD flow (optional; keeps your master’s compact layout)
-if gen_dnd:
-    elements, zones = default_dnd_geometry()
-    dnd_bytes = build_dnd_from_master(DND_MASTER, elements, zones)
-    st.session_state.last_dnd_bytes = dnd_bytes
-    st.success("Your Drag-and-Drop activity is ready below ⤵")
-    render_h5p_inline(dnd_bytes, height=520)
+    st.info(f"Difficulty now set to **{st.session_state.difficulty}** based on recent answers.")
