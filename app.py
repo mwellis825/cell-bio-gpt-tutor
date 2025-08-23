@@ -1,4 +1,4 @@
-import os, re, io, json, base64, zipfile, random, textwrap
+import os, re, io, json, base64, zipfile, random
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
@@ -7,8 +7,7 @@ from pypdf import PdfReader
 from openai import OpenAI
 
 # ------------------ CONFIG ------------------
-st.set_page_config(page_title="Cell Bio Tutor — Inline Activities", layout="wide")
-
+st.set_page_config(page_title="Cell Bio Tutor — Inline DnD + Critical FITB", layout="wide")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     st.error("Missing OPENAI_API_KEY in Streamlit secrets or environment.")
@@ -16,54 +15,48 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM = (
     "You are a rigorous, supportive Cell Biology tutor. "
-    "Use ONLY the provided slide excerpts (and OpenStax Biology if slides lack coverage) to create concise, causal, critical-thinking practice."
+    "Use ONLY the provided slide excerpts (and OpenStax Biology if slides lack coverage) "
+    "to create concise, causal, critical-thinking practice (not recall)."
 )
 
-# ------------------ HELPERS ------------------
+# ------------------ UTILITIES ------------------
 def extract_text_from_pdfs(files) -> str:
     chunks = []
     for f in files or []:
         try:
-            reader = PdfReader(f)
-            text = "\n".join((p.extract_text() or "") for p in reader.pages)
+            r = PdfReader(f)
+            text = "\n".join((p.extract_text() or "") for p in r.pages)
             chunks.append(text)
         except Exception as e:
-            st.warning(f"Could not read {getattr(f,'name','(file)')}: {e}")
-    full = "\n\n".join(chunks)
-    # compact whitespace and trim to a reasonable prompt size
-    full = re.sub(r"\s+", " ", full).strip()
+            st.warning(f"Could not read {getattr(f,'name','file')}: {e}")
+    # compact
+    full = re.sub(r"\s+", " ", "\n\n".join(chunks)).strip()
     return full[:20000]
 
-def leve_dist(a: str, b: str) -> int:
-    """Levenshtein distance (small, for typos)."""
+def levenshtein(a: str, b: str) -> int:
     a, b = a.lower(), b.lower()
-    if len(a) < len(b):
-        a, b = b, a
-    previous = list(range(len(b)+1))
+    if len(a) < len(b): a, b = b, a
+    prev = list(range(len(b)+1))
     for i, ca in enumerate(a, start=1):
-        current = [i]
+        curr = [i]
         for j, cb in enumerate(b, start=1):
-            insertions = previous[j] + 1
-            deletions  = current[j-1] + 1
-            subs       = previous[j-1] + (ca != cb)
-            current.append(min(insertions, deletions, subs))
-        previous = current
-    return previous[-1]
+            ins = prev[j] + 1
+            dele = curr[j-1] + 1
+            sub = prev[j-1] + (ca != cb)
+            curr.append(min(ins, dele, sub))
+        prev = curr
+    return prev[-1]
 
 def ok_match(student: str, truth: str) -> bool:
-    if not student.strip():
-        return False
+    if not student.strip(): return False
     s, t = student.strip().lower(), truth.strip().lower()
-    if s == t:
-        return True
-    # minor misspellings tolerated (distance ≤ 1), and ignore plural ‘s’
-    if s.endswith("s") and s[:-1] == t:
-        return True
-    if t.endswith("s") and t[:-1] == s:
-        return True
-    return leve_dist(s, t) <= 1
+    if s == t: return True
+    # tolerate plural s and one edit distance
+    if s.endswith("s") and s[:-1] == t: return True
+    if t.endswith("s") and t[:-1] == s: return True
+    return levenshtein(s, t) <= 1
 
-# ------------------ LLM TEMPLATES ------------------
+# ------------------ LLM PROMPTS ------------------
 CRITICAL_CLOZE_INSTRUCTION = """Return JSON ONLY with:
 {
   "title": "short title",
@@ -77,8 +70,8 @@ CRITICAL_CLOZE_INSTRUCTION = """Return JSON ONLY with:
 
 Rules:
 - Use ONLY slide excerpts; if insufficient, you MAY draw on OpenStax Biology to fill small gaps.
-- Prefer causal predictions and ‘what happens if…’ reasoning over recall.
-- Each **answer** is 1–2 words present in natural course language.
+- Prefer causal predictions and “what happens if…” reasoning over recall.
+- Each **answer** is 1–2 words present in the slides’ phrasing where possible.
 - Keep each sentence short (<= 18 words).
 - Do NOT include extra fields or markdown outside **answer** markers.
 """
@@ -88,80 +81,70 @@ MATCHING_INSTRUCTION = """Return JSON ONLY with:
   "title": "short title",
   "instructions": "explicit task directions for students",
   "pairs": [
-    {"left": "short concept phrase", "right": "correct target category"},
+    {"left": "short causal prompt", "right": "target/category"},
     {"left": "...", "right": "..."}
   ],
-  "right_choices": ["list", "of", "all", "targets", "unique"],
+  "right_choices": ["all", "unique", "targets"],
   "difficulty": "easy|medium|hard"
 }
 
 Rules:
 - Use ONLY the slide excerpts; if insufficient, you MAY draw on OpenStax Biology to fill small gaps.
-- 5–8 pairs total. Make them conceptual (e.g., ‘always-active RTK → increased MAPK output’), not trivia.
-- Keep phrases short (<= 6 words).
+- 6–10 pairs total. Make them conceptual (e.g., “RTK always-active → MAPK output increases”), not trivia.
+- Keep phrases short (<= 6 words) and precise.
 - right_choices must contain every unique target in the pairs.
 """
 
 def ask_llm_for_cloze(topic: str, slides: str, prior_grade: float) -> Dict[str, Any]:
-    # adaptive nudge
-    if prior_grade >= 0.8:
-        diff_hint = "Focus on harder, multi-step causal effects."
-    elif prior_grade <= 0.5:
-        diff_hint = "Prefer foundational, single-step causal effects."
-    else:
-        diff_hint = "Use medium complexity causal effects."
-
+    diff_hint = (
+        "Focus on harder, multi-step causal effects."
+        if prior_grade >= 0.8 else
+        "Prefer foundational, single-step causal effects."
+        if prior_grade <= 0.5 else
+        "Use medium complexity causal effects."
+    )
     user = f"""
 Topic: "{topic}"
 Slides (excerpt; compacted): {slides[:18000]}
 
-Task: Author a concise, causal *fill-in-the-blank* activity (Drag-the-Words style). {diff_hint}
+Task: Author a concise, causal fill-in-the-blank activity (Drag-the-Words style). {diff_hint}
 {CRITICAL_CLOZE_INSTRUCTION}
 """.strip()
-
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,
         max_tokens=900,
         response_format={"type":"json_object"},
-        messages=[
-            {"role":"system","content":SYSTEM},
-            {"role":"user","content":user},
-        ],
+        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":user}],
     )
     return json.loads(resp.choices[0].message.content or "{}")
 
 def ask_llm_for_matching(topic: str, slides: str, prior_grade: float) -> Dict[str, Any]:
-    if prior_grade >= 0.8:
-        diff_hint = "Harder conceptual matches with subtle distractors."
-    elif prior_grade <= 0.5:
-        diff_hint = "Foundational matches with clear differences."
-    else:
-        diff_hint = "Medium complexity matches."
-
+    diff_hint = (
+        "Harder conceptual matches with subtle distractors."
+        if prior_grade >= 0.8 else
+        "Foundational matches with clear differences."
+        if prior_grade <= 0.5 else
+        "Medium complexity matches."
+    )
     user = f"""
 Topic: "{topic}"
 Slides (excerpt; compacted): {slides[:18000]}
 
-Task: Author a concise *matching* activity (concept → target/category). {diff_hint}
+Task: Author a concise drag-and-drop matching activity (concept → correct target). {diff_hint}
 {MATCHING_INSTRUCTION}
 """.strip()
-
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,
         max_tokens=900,
         response_format={"type":"json_object"},
-        messages=[
-            {"role":"system","content":SYSTEM},
-            {"role":"user","content":user},
-        ],
+        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":user}],
     )
     return json.loads(resp.choices[0].message.content or "{}")
 
-# ------------------ BUILD H5P ZIP (download only) ------------------
+# ------------------ H5P ZIPS (download only) ------------------
 def build_h5p_dragtext_zip(title: str, instructions: str, clozes_markdown: List[str]) -> bytes:
-    # Convert **answer** → *answer* for H5P DragText
     text_lines = [re.sub(r"\*\*(.+?)\*\*", r"*\1*", s) for s in clozes_markdown]
     content_json = {
         "taskDescription": instructions,
@@ -181,18 +164,17 @@ def build_h5p_dragtext_zip(title: str, instructions: str, clozes_markdown: List[
         ],
     }
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         z.writestr("h5p.json", json.dumps(h5p_json, ensure_ascii=False))
         z.writestr("content/content.json", json.dumps(content_json, ensure_ascii=False))
     return buf.getvalue()
 
 def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[str,str]]) -> bytes:
-    # Represent matching as Multiple Choice within Question Set for portability
+    # Represent matching as MCQs inside a QuestionSet for portability
     questions = []
+    all_rights = sorted(list({p["right"] for p in pairs}))
     for p in pairs:
         left, right = p["left"], p["right"]
-        # build a small MCQ where only right is correct; add 3 distractors sampled from other rights
-        all_rights = list({q["right"] for q in pairs})
         distractors = [r for r in all_rights if r != right]
         random.shuffle(distractors)
         opts = [right] + distractors[:3]
@@ -205,7 +187,6 @@ def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[s
             },
             "library": "H5P.MultiChoice 1.14"
         })
-
     qs_content = {
         "introPage": {"showIntroPage": False, "startButtonText": "Start"},
         "title": title,
@@ -227,21 +208,19 @@ def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[s
         ],
     }
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         z.writestr("h5p.json", json.dumps(h5p_json, ensure_ascii=False))
         z.writestr("content/content.json", json.dumps(qs_content, ensure_ascii=False))
     return buf.getvalue()
 
-# ------------------ INLINE RENDERERS (no H5P) ------------------
+# ------------------ INLINE RENDERERS ------------------
 def render_inline_cloze(title: str, instructions: str, clozes: List[str], key_prefix: str) -> Tuple[int,int]:
     st.subheader(f"🧠 {title}")
     st.write(instructions)
-    total = len(clozes)
-    correct = 0
+    total = len(clozes); correct = 0
     with st.form(key=f"{key_prefix}_form"):
         answers: Dict[int,str] = {}
         for i, s in enumerate(clozes, start=1):
-            # show sentence with ___ and input
             parts = re.split(r"\*\*(.+?)\*\*", s)
             if len(parts) >= 3:
                 before, truth, after = parts[0], parts[1], "".join(parts[2:])
@@ -261,55 +240,191 @@ def render_inline_cloze(title: str, instructions: str, clozes: List[str], key_pr
         st.info(f"Score: {correct}/{total}")
     return correct, total
 
-def render_inline_matching(title: str, instructions: str, pairs: List[Dict[str,str]], right_choices: List[str], key_prefix: str) -> Tuple[int,int]:
-    st.subheader(f"🧩 {title}")
-    st.write(instructions)
-    total = len(pairs)
-    correct = 0
-    # left column words; each row gets a selectbox of right choices
-    with st.form(key=f"{key_prefix}_form"):
-        cols = st.columns([2,1.5])
-        with cols[0]:
-            st.markdown("**Prompt/Concept**")
-        with cols[1]:
-            st.markdown("**Match**")
-        shuffled_rights = list(right_choices)
-        for i, p in enumerate(pairs, start=1):
-            left, right = p["left"], p["right"]
-            with cols[0]:
-                st.markdown(f"{i}. {left}")
-            with cols[1]:
-                st.selectbox("",
-                             options=["(choose)"] + shuffled_rights,
-                             key=f"{key_prefix}_sel{i}",
-                             index=0)
-        submitted = st.form_submit_button("Submit matches")
-    if submitted:
-        for i, p in enumerate(pairs, start=1):
-            truth = p["right"]
-            student = st.session_state.get(f"{key_prefix}_sel{i}", "(choose)")
-            ok = (student == truth)
-            correct += int(ok)
-            st.write(f"{'✅' if ok else '❌'} {i}. {p['left']} → **{truth}** (yours: _{student}_)")
-        st.info(f"Score: {correct}/{total}")
-    return correct, total
+def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,str]], right_choices: List[str], key_prefix: str, height: int = 520):
+    """
+    True HTML5 drag-and-drop:
+      - Draggables (left) are compact pills (text sized to content)
+      - Drop zones (right) are compact, accept many items
+      - Center-aligned placement in zones; one-click check + reset
+    """
+    # Prepare payload for the component
+    rights = sorted(list({p["right"] for p in pairs})) or right_choices
+    data = {
+        "title": title,
+        "instructions": instructions,
+        "pairs": pairs,
+        "rights": rights
+    }
+    payload = json.dumps(data)
+
+    html = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, sans-serif; margin:0; padding:12px; }}
+  .wrap {{ display:flex; gap:16px; align-items:flex-start; }}
+  .col {{ flex:1; min-width: 260px; }}
+  h2 {{ margin: 0 0 6px 0; font-size: 18px; }}
+  .instructions {{ margin: 4px 0 12px 0; color:#333; font-size: 14px; }}
+  .bank, .zone {{ border:1px solid #d0d7de; border-radius:10px; padding:8px; background:#fff; }}
+  .bank {{ min-height: 64px; display:flex; flex-wrap:wrap; gap:8px; align-content:flex-start; }}
+  .pill {{
+    display:inline-block; padding:4px 8px; border-radius:999px;
+    border:1px solid #c7c7c7; background:#f7f7f8; cursor:grab;
+    font-size:14px; line-height:1.2; white-space:nowrap; user-select:none;
+  }}
+  .pill:active {{ cursor:grabbing; }}
+  .zones {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap:10px; }}
+  .zone {{ min-height: 60px; display:flex; flex-direction:column; gap:6px; }}
+  .zlabel {{ font-size:13px; color:#222; }}
+  .dropbox {{
+    min-height: 38px; display:flex; flex-wrap:wrap; justify-content:center; align-items:center;
+    gap:6px; border:1px dashed #c7c7c7; border-radius:8px; padding:6px; background:#fafafa;
+  }}
+  .over {{ background:#eef7ff; border-color:#8bb6ff; }}
+  .ok {{ border-color:#3fb950; background:#eaffea; }}
+  .bad {{ border-color:#f85149; background:#fff0f0; }}
+  .buttons {{ margin-top: 12px; display:flex; gap:8px; }}
+  .btn {{
+    appearance:none; border:1px solid #d0d7de; background:#fff; padding:6px 10px; border-radius:8px; cursor:pointer;
+    font-size:14px;
+  }}
+  .btn:hover {{ background:#f3f4f6; }}
+  .score {{ margin-top:8px; font-size:14px; }}
+</style>
+</head>
+<body>
+  <h2>🧩 {title}</h2>
+  <div class="instructions">{instructions}</div>
+  <div class="wrap">
+    <div class="col">
+      <div class="zlabel"><b>Draggables</b></div>
+      <div id="bank" class="bank" aria-label="Draggables bank"></div>
+      <div class="buttons">
+        <button id="reset" class="btn">Reset</button>
+        <button id="check" class="btn">Check answers</button>
+      </div>
+      <div id="score" class="score"></div>
+    </div>
+    <div class="col">
+      <div class="zlabel"><b>Drop zones</b></div>
+      <div id="zones" class="zones"></div>
+    </div>
+  </div>
+
+  <script id="data" type="application/json">{payload}</script>
+  <script>
+    const data = JSON.parse(document.getElementById('data').textContent);
+    const pairs = data.pairs;
+    const rights = data.rights;
+
+    const bank = document.getElementById('bank');
+    const zones = document.getElementById('zones');
+    const scoreBox = document.getElementById('score');
+
+    // Build draggables (left)
+    pairs.forEach((p, i) => {{
+      const pill = document.createElement('div');
+      pill.className = 'pill';
+      pill.textContent = p.left;
+      pill.setAttribute('draggable', 'true');
+      pill.id = 'drag_' + i;
+      pill.dataset.answer = p.right;
+      pill.addEventListener('dragstart', ev => {{
+        ev.dataTransfer.setData('text/plain', pill.id);
+      }});
+      bank.appendChild(pill);
+    }});
+
+    // Build drop zones (right)
+    rights.forEach((r, j) => {{
+      const z = document.createElement('div');
+      z.className = 'zone';
+      z.dataset.target = r;
+
+      const lab = document.createElement('div');
+      lab.className = 'zlabel';
+      lab.textContent = r;
+
+      const box = document.createElement('div');
+      box.className = 'dropbox';
+      box.addEventListener('dragover', ev => {{ ev.preventDefault(); box.classList.add('over'); }});
+      box.addEventListener('dragleave', () => box.classList.remove('over'));
+      box.addEventListener('drop', ev => {{
+        ev.preventDefault(); box.classList.remove('over');
+        const id = ev.dataTransfer.getData('text/plain');
+        const el = document.getElementById(id);
+        if (el) {{
+          el.classList.remove('ok','bad');
+          box.appendChild(el);
+        }}
+      }});
+
+      z.appendChild(lab);
+      z.appendChild(box);
+      zones.appendChild(z);
+    }});
+
+    // Allow dropping back to bank
+    bank.addEventListener('dragover', ev => {{ ev.preventDefault(); bank.classList.add('over'); }});
+    bank.addEventListener('dragleave', () => bank.classList.remove('over'));
+    bank.addEventListener('drop', ev => {{
+      ev.preventDefault(); bank.classList.remove('over');
+      const id = ev.dataTransfer.getData('text/plain');
+      const el = document.getElementById(id);
+      if (el) {{ el.classList.remove('ok','bad'); bank.appendChild(el); }}
+    }});
+
+    // Reset
+    document.getElementById('reset').addEventListener('click', () => {{
+      scoreBox.textContent = '';
+      document.querySelectorAll('.pill').forEach(el => bank.appendChild(el));
+      document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
+    }});
+
+    // Check answers
+    document.getElementById('check').addEventListener('click', () => {{
+      let correct = 0, total = pairs.length;
+      // clear styles
+      document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
+      // score: each pill in correct target zone counts +1
+      document.querySelectorAll('.zone').forEach(zone => {{
+        const target = zone.dataset.target;
+        zone.querySelectorAll('.pill').forEach(pill => {{
+          const ok = pill.dataset.answer === target;
+          pill.classList.add(ok ? 'ok' : 'bad');
+          if (ok) correct += 1;
+        }});
+      }});
+      // pills still in bank count as incorrect
+      scoreBox.textContent = `Score: ${correct}/${total}`;
+    }});
+  </script>
+</body>
+</html>
+    """.strip()
+
+    st.components.v1.html(html, height=height, scrolling=True)
 
 # ------------------ APP UI ------------------
-if "history" not in st.session_state:
-    st.session_state.history = []  # [(kind, score, total)]
 if "running_grade" not in st.session_state:
     st.session_state.running_grade = 0.7  # start medium
+if "history" not in st.session_state:
+    st.session_state.history = []
 
-st.title("🧬 Cell Bio Tutor — Inline, Adaptive Activities (H5P download optional)")
+st.title("🧬 Cell Bio Tutor — True Drag-and-Drop + Critical FITB (inline)")
 with st.expander("1) Upload your course slides (PDF)"):
     slides = st.file_uploader("Upload 1–10 PDFs", type=["pdf"], accept_multiple_files=True)
 
 topic = st.text_input("2) Topic (e.g., 'RTK signaling', 'Electron transport chain')")
 colA, colB, colC = st.columns(3)
 with colA:
-    want_cloze = st.checkbox("Generate Fill-in-the-Blank (critical thinking)", True)
+    want_cloze = st.checkbox("Generate Critical FITB", True)
 with colB:
-    want_match = st.checkbox("Generate Matching (concept → target)", True)
+    want_dnd = st.checkbox("Generate True Drag-and-Drop", True)
 with colC:
     gen = st.button("Generate Activities")
 
@@ -321,8 +436,7 @@ if gen:
 
     grade_hint = st.session_state.running_grade
 
-    # CLOZE
-    cloze_data = {}
+    # --------- FITB (critical thinking) ----------
     if want_cloze:
         cloze_data = ask_llm_for_cloze(topic, slide_text, grade_hint)
         c_title = cloze_data.get("title","Causal fill-in-the-blank")
@@ -335,46 +449,40 @@ if gen:
             c_ok, c_total = render_inline_cloze(c_title, c_instr, clozes, key_prefix="cloze")
             if c_total > 0:
                 st.session_state.history.append(("cloze", c_ok, c_total))
+                # Update adaptivity from FITB only (stable)
+                total_correct = sum(s for _, s, _ in st.session_state.history)
+                total_items = sum(t for _, _, t in st.session_state.history)
+                st.session_state.running_grade = total_correct / max(1, total_items)
+                st.info(f"Adaptive level updated (from FITB). Running accuracy: {st.session_state.running_grade:.0%}")
 
-            # H5P download for the same content
+            # H5P export (DragText)
             try:
                 h5p_bytes = build_h5p_dragtext_zip(c_title, c_instr, clozes)
-                st.download_button("⬇️ Download as H5P (DragText)", data=h5p_bytes,
+                st.download_button("⬇️ Download FITB as H5P (DragText)", data=h5p_bytes,
                                    file_name=re.sub(r'[^a-z0-9]+','_',c_title.lower())+".h5p",
-                                   mime="application/zip", key="dl_dragtext")
+                                   mime="application/zip", key="dl_dragtext_fitb")
             except Exception as e:
-                st.warning(f"Could not build H5P for cloze: {e}")
+                st.warning(f"Could not build H5P for FITB: {e}")
 
-    # MATCHING
-    match_data = {}
-    if want_match:
+    # --------- True Drag-and-Drop (matching) ----------
+    if want_dnd:
         match_data = ask_llm_for_matching(topic, slide_text, grade_hint)
-        m_title = match_data.get("title","Concept matching")
-        m_instr = match_data.get("instructions","Match each prompt to the correct target.")
+        m_title = match_data.get("title","Concept → Target (Drag-and-Drop)")
+        m_instr = match_data.get("instructions","Drag each prompt to the correct target.")
         pairs = match_data.get("pairs", [])
         right_choices = match_data.get("right_choices", [])
-        # sanity filters
         pairs = [p for p in pairs if isinstance(p, dict) and p.get("left") and p.get("right")]
         rights = sorted(list({p["right"] for p in pairs})) or right_choices
         if not pairs or not rights:
-            st.warning("Matching generation returned no valid items.")
+            st.warning("Drag-and-drop generation returned no valid items.")
         else:
-            m_ok, m_total = render_inline_matching(m_title, m_instr, pairs, rights, key_prefix="match")
-            if m_total > 0:
-                st.session_state.history.append(("match", m_ok, m_total))
+            render_inline_dragdrop(m_title, m_instr, pairs, rights, key_prefix="dnd", height=560)
 
-            # H5P QuestionSet download (MCQ representation of matches)
+            # Optional H5P export (QuestionSet with MCQ stand-ins)
             try:
                 qs_bytes = build_h5p_question_set_zip(m_title, m_instr, pairs)
-                st.download_button("⬇️ Download as H5P (QuestionSet/MCQ)", data=qs_bytes,
+                st.download_button("⬇️ Download DnD as H5P (QuestionSet)", data=qs_bytes,
                                    file_name=re.sub(r'[^a-z0-9]+','_',m_title.lower())+"_qs.h5p",
-                                   mime="application/zip", key="dl_qs")
+                                   mime="application/zip", key="dl_qs_dnd")
             except Exception as e:
-                st.warning(f"Could not build H5P for matching: {e}")
-
-    # Update running grade for adaptivity
-    if st.session_state.history:
-        total_correct = sum(s for _, s, _ in st.session_state.history)
-        total_items = sum(t for _, _, t in st.session_state.history)
-        st.session_state.running_grade = total_correct / max(1, total_items)
-        st.info(f"Adaptive level updated. Running accuracy: {st.session_state.running_grade:.0%}")
+                st.warning(f"Could not build H5P for DnD: {e}")
