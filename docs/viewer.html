@@ -2,9 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>H5P Viewer (AMD-safe)</title>
+  <title>H5P Viewer (UMD-shimmed)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- Local CSS (fonts 404s are harmless) -->
   <link rel="stylesheet" href="./h5p.css" />
   <style>
     html,body{margin:0;height:100%;background:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
@@ -32,59 +31,88 @@
       contents: {}
     };
 
-    // 2) Helpers
+    // 2) UMD shims: capture AMD or CJS export and pin it to window
+    (function installUmdShims(){
+      // Keep any originals so we can restore if needed
+      const original = {
+        define:  ('define'  in window) ? window.define  : undefined,
+        require: ('require' in window) ? window.require : undefined,
+        module:  ('module'  in window) ? window.module  : undefined,
+        exports: ('exports' in window) ? window.exports : undefined,
+      };
+
+      // CommonJS shim
+      const cjsModule  = { exports: {} };
+      const cjsExports = cjsModule.exports;
+      Object.defineProperty(window, 'module',  { configurable: true, writable: true, value: cjsModule });
+      Object.defineProperty(window, 'exports', { configurable: true, writable: true, value: cjsExports });
+
+      // AMD shim: accept all common call signatures and capture factory return
+      function captureExport(res){
+        if (res && typeof res === 'object' || typeof res === 'function') {
+          window.H5PStandalone = res;
+          window['h5p-standalone'] = res;
+        }
+        return res;
+      }
+      function amdDefine(name, deps, factory){
+        // normalize args
+        if (typeof name === 'function') { factory = name; deps = []; }
+        else if (Array.isArray(name))   { factory = deps; deps = name; name = undefined; }
+        else if (typeof deps === 'function') { factory = deps; deps = []; }
+        // very permissive resolve of deps to pass something in
+        let resolved = [];
+        if (Array.isArray(deps)) {
+          resolved = deps.map(d => {
+            if (d === 'exports') return cjsExports;
+            if (d === 'module')  return cjsModule;
+            if (d === 'require') return function(){};
+            // some UMDs request their own name; return current captured if any
+            if (d === 'h5p-standalone' || d === 'H5PStandalone') return window.H5PStandalone || window['h5p-standalone'];
+            return {};
+          });
+        }
+        // run factory and capture result
+        let out;
+        if (typeof factory === 'function') out = factory.apply(null, resolved);
+        else out = factory; // object literal define
+        return captureExport(out);
+      }
+      amdDefine.amd = {}; // signal AMD present
+      Object.defineProperty(window, 'define',  { configurable: true, writable: true, value: amdDefine });
+      // Provide a minimal require to satisfy UMD checks (not used)
+      Object.defineProperty(window, 'require', { configurable: true, writable: true, value: function(){ return {}; } });
+
+      // After bundles load, finalize: if CJS export was used, capture it
+      window.__finalizeH5PStandalone__ = function(){
+        if (!window.H5PStandalone && cjsModule.exports && (typeof cjsModule.exports === 'object' || typeof cjsModule.exports === 'function')) {
+          window.H5PStandalone = cjsModule.exports;
+          window['h5p-standalone'] = cjsModule.exports;
+        }
+        // We intentionally leave the shims in place; they’re harmless for this viewer.
+        // If you need to restore originals later, you could do it here.
+      };
+    })();
+
+    // Helpers
     function qp(n){ const u=new URL(location.href); return u.searchParams.get(n); }
     function loadScript(src){
       return new Promise((resolve,reject)=>{
         const s=document.createElement('script');
-        s.src = src;               // keep URLs clean to avoid double loads
+        s.src = src; s.async = false; // keep order
         s.onload = ()=>{ console.log('Loaded', src); resolve(); };
         s.onerror = ()=>reject(new Error('Failed to load: '+src));
         document.head.appendChild(s);
       });
     }
 
-    // 3) Temporarily neutralize AMD/CJS so UMD attaches to window
-    function neutralizeModuleGlobals(){
-      const stash = {
-        define:    Object.prototype.hasOwnProperty.call(window,'define')    ? window.define    : undefined,
-        require:   Object.prototype.hasOwnProperty.call(window,'require')   ? window.require   : undefined,
-        module:    Object.prototype.hasOwnProperty.call(window,'module')    ? window.module    : undefined,
-        exports:   Object.prototype.hasOwnProperty.call(window,'exports')   ? window.exports   : undefined
-      };
-      // Only undefine if functions/objects that could trick UMD:
-      if (typeof window.define  !== 'undefined') { try{ delete window.define; }  catch{} window.define  = undefined; }
-      if (typeof window.require !== 'undefined') { try{ delete window.require; } catch{} window.require = undefined; }
-      if (typeof window.module  !== 'undefined') { try{ delete window.module; }  catch{} window.module  = undefined; }
-      if (typeof window.exports !== 'undefined') { try{ delete window.exports; } catch{} window.exports = undefined; }
-      return stash;
-    }
-    function restoreModuleGlobals(stash){
-      if (stash.define  !== undefined) window.define  = stash.define;  else try{ delete window.define; }  catch{}
-      if (stash.require !== undefined) window.require = stash.require; else try{ delete window.require; } catch{}
-      if (stash.module  !== undefined) window.module  = stash.module;  else try{ delete window.module; }  catch{}
-      if (stash.exports !== undefined) window.exports = stash.exports; else try{ delete window.exports; } catch{}
-    }
-
-    // Loud error capture
     window.addEventListener('error', e => console.error('Window error:', e.error || e.message || e));
     window.addEventListener('unhandledrejection', e => console.error('Unhandled promise rejection:', e.reason || e));
   </script>
 
-  <!-- 4) Load bundles in document order (main first, then frame) -->
-  <script>
-    (async function preloadBundles(){
-      const stash = neutralizeModuleGlobals();
-      try {
-        await loadScript('./main.bundle.js');
-        await loadScript('./frame.bundle.js');
-      } catch (e) {
-        console.error(e);
-      } finally {
-        restoreModuleGlobals(stash);
-      }
-    })();
-  </script>
+  <!-- Load in order -->
+  <script src="./main.bundle.js"></script>
+  <script src="./frame.bundle.js"></script>
 </head>
 <body>
   <div id="app"></div>
@@ -92,10 +120,15 @@
   <script>
     (function boot(){
       const app = document.getElementById('app');
-      const src = qp('src'); // URL or data:application/zip;base64,... to a .h5p
+      const src = qp('src');
       if (!src) {
         app.innerHTML = '<div class="hint">No H5P source. Use <code>?src=&lt;url-to-your.h5p&gt;</code> (or a data: URL).</div>';
         return;
+      }
+
+      // Finalize capture from CJS, if that’s how it registered
+      if (typeof window.__finalizeH5PStandalone__ === 'function') {
+        try { window.__finalizeH5PStandalone__(); } catch {}
       }
 
       let tries = 0;
@@ -107,11 +140,11 @@
           try { HS.display('#app', { h5pContent: src }); }
           catch(e){ app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>'; }
         } else if (tries < 240) {
-          setTimeout(waitReady, 50); // wait up to ~12s
+          setTimeout(waitReady, 50); // ~12s total
         } else {
           console.log('typeof H5PStandalone =', typeof window.H5PStandalone);
           console.log('typeof window["h5p-standalone"] =', typeof window['h5p-standalone']);
-          app.innerHTML = '<p class="err">H5P API not ready. The bundles likely registered as AMD/CommonJS modules instead of a window global. The viewer now neutralizes AMD/CJS during load. If this persists, double-check the two JS files are the <em>standalone dist</em> files from <code>h5p-standalone@1.3.0/dist</code> (not HTML, not source builds).</p>';
+          app.innerHTML = '<p class="err">H5P API not ready. The bundles did not expose a browser global even with AMD/CJS shims. Re-verify the two files are <em>exactly</em> from <code>h5p-standalone@1.3.0/dist</code>.</p>';
         }
       })();
     })();
