@@ -1,17 +1,18 @@
 # app.py
-# Prompt + Slides → (1) 4× Fill‑in‑the‑Blank (application, lenient) + (2) Drag into Topic‑Specific Bins
-# ----------------------------------------------------------------------------------------------------
+# Prompt + Slides → (1) 4× Fill‑in‑the‑Blank (application, lenient, randomized) + (2) Drag into Topic‑Specific Bins (HTML5 DnD)
+# -----------------------------------------------------------------------------------------------------------------------------
 # No student installs. Drag/drop implemented with pure HTML5 inside a Streamlit component.
 # Activities are generated from your prompt and mined slide text; topic bins change with the prompt.
+# Repeated runs vary items via random sampling.
 #
 # Run:
 #   pip install streamlit
 #   # PDF parser (choose one):
 #   pip install PyPDF2    # or: pip install pypdf
 #   streamlit run app.py
-# ----------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------------------------------------------
 
-import os, re, json, pathlib, random
+import os, re, json, pathlib, random, time
 import streamlit as st
 from typing import List, Tuple, Dict
 
@@ -19,6 +20,10 @@ from typing import List, Tuple, Dict
 st.set_page_config(page_title="Study Mode", page_icon="📘", layout="wide")
 SLIDES_DIR = os.path.join(os.getcwd(), "slides")
 SUPPORTED_TEXT_EXTS = {".txt", ".md", ".mdx", ".html", ".htm"}
+
+# Seed randomness differently on each Generate click
+def new_seed():
+    return int(time.time() * 1000) ^ random.randint(0, 1_000_000)
 
 # ---------------- PDF backends (optional) ----------------
 PDF_BACKEND = None
@@ -122,7 +127,6 @@ def relevance(sent: str, q_tokens: List[str]) -> int:
         score += 2
     return score
 
-# Higher-level biology patterns (surface-level causality)
 CAUSE_EFFECT_PATTERNS = [
     (r"\b(increase|elevat\w*|upregulat\w*|enhanc\w*|stabiliz\w*)\b.+\b(rate|level|amount|production|flux|stability|binding|interaction)\b", "increase"),
     (r"\b(decrease|reduc\w*|downregulat\w*|destabiliz\w*|impair\w*|inhibit\w*)\b.+\b(rate|level|amount|production|flux|stability|binding|interaction)\b", "decrease"),
@@ -140,7 +144,6 @@ def extract_relations_from_sentence(sent: str) -> List[Tuple[str,str,str]]:
             if m: noun = m.group(0)
             stem = re.sub(r"\s+", " ", sent).strip()
             if not stem.endswith((".", "?")): stem += "."
-            # Friendly prediction format
             stem = f"When this condition holds: {stem} What would you expect to happen?"
             outs.append((stem, key if key in {"increase","decrease","accumulate"} else "no_change", noun))
     if re.search(r"\bleads? to\b|\bresults? in\b|\bcauses?\b", s_low):
@@ -150,10 +153,9 @@ def extract_relations_from_sentence(sent: str) -> List[Tuple[str,str,str]]:
         outs.append((stem, "increase", ""))
     return outs
 
-def mine_prompted_relations(all_text: List[str], prompt: str, max_items=8) -> List[Tuple[str,str,str]]:
+def mine_prompted_relations(all_text: List[str], prompt: str, max_items=12) -> List[Tuple[str,str,str]]:
     q = tokenize(prompt)
     if not q: return []
-    # rank documents
     doc_scores = []
     for doc in all_text:
         sents = split_sentences(doc)
@@ -161,7 +163,6 @@ def mine_prompted_relations(all_text: List[str], prompt: str, max_items=8) -> Li
         if sc > 0:
             doc_scores.append((sc, sents))
     doc_scores.sort(reverse=True, key=lambda x: x[0])
-
     relations = []
     for _, sents in doc_scores[:5]:
         for s in sents[:400]:
@@ -172,8 +173,6 @@ def mine_prompted_relations(all_text: List[str], prompt: str, max_items=8) -> Li
                 break
         if len(relations) >= max_items:
             break
-
-    # dedupe by stem
     seen = set(); uniq = []
     for stem, key, noun in relations:
         k = stem.lower()
@@ -219,86 +218,92 @@ def topic_bins(topic: str):
         return ["Entry/Commitment", "Checkpoint hold", "Transition", "Exit/Completion"]
     return ["Increase", "Decrease", "No change", "Accumulates"]
 
-# ---------------- Build content from slides with surface-level application ----------------
-def build_fitb(topic: str, mined: List[Tuple[str,str,str]], vocab: set) -> List[Dict[str,str]]:
-    # Prefer mined stems; keep them warm and application focused
-    items = []
-    for (stem, key, noun) in mined:
-        items.append({"stem": stem, "key": key, "noun": noun})
-        if len(items) == 4: break
-
-    if len(items) >= 4:
-        return items[:4]
-
-    # Topic-appropriate, surface-level backfill (no niche factors; filter by slide vocab)
-    candidates_by_topic = {
+# ---------------- Build content (application-only, randomized) ----------------
+def build_fitb(topic: str, mined: List[Tuple[str,str,str]], vocab: set, rng: random.Random) -> List[Dict[str,str]]:
+    pool = list(mined)
+    # Topic backfill (beginner, application tone)
+    backfill = {
         "protein_structure": [
             ("When hydrophobic side chains are buried more effectively, overall folding stability would ______.","increase",""),
             ("When many prolines interrupt an alpha helix, helix stability would ______.","decrease",""),
             ("When correct disulfide bonds form within one chain, tertiary structure stability would ______.","increase",""),
             ("When subunits fail to assemble, quaternary structure formation would ______.","decrease",""),
+            ("When salt bridges form at the core, tertiary stability would ______.","increase",""),
+            ("When side chains clash in the core, tertiary stability would ______.","decrease",""),
         ],
         "transcription": [
             ("When promoter access improves, the rate of transcription initiation would ______.","increase",""),
             ("When elongation is slowed by pausing, overall mRNA output would ______.","decrease",""),
             ("When termination is inefficient, unprocessed transcripts would ______.","accumulate","transcripts"),
             ("When RNA processing is efficient, mature mRNA levels would ______.","increase",""),
+            ("When promoter binding is weaker, initiation frequency would ______.","decrease",""),
         ],
         "translation": [
             ("When start-site recognition improves, initiation frequency would ______.","increase",""),
             ("When elongation is hindered, protein synthesis rate would ______.","decrease",""),
             ("When termination is delayed, stalled ribosome–nascent chains would ______.","accumulate","nascent"),
             ("When quality control is active, misincorporation errors would ______.","decrease",""),
+            ("When tRNA charging is limited, elongation speed would ______.","decrease",""),
         ],
         "replication": [
             ("When origin firing is reduced, DNA synthesis initiation events would ______.","decrease",""),
             ("When fork progression is supported, time to complete replication would ______.","decrease",""),
             ("When ligation is impaired, short DNA fragments would ______.","accumulate","fragments"),
             ("When ssDNA is protected, unwanted re-annealing would ______.","decrease",""),
+            ("When primer supply increases, lagging-strand starts would ______.","increase",""),
         ],
         "microscopy": [
             ("When numerical aperture increases, the minimum resolvable distance would ______.","decrease",""),
             ("When wavelength is shorter, the resolution limit would ______.","decrease",""),
             ("When aberrations grow, image sharpness would ______.","decrease",""),
             ("When optical sectioning improves, out-of-focus blur would ______.","decrease",""),
+            ("When exposure is raised too high, bleaching would ______.","increase",""),
         ],
         "signaling": [
             ("When a receptor is more active, downstream pathway output would ______.","increase",""),
             ("When a pathway inhibitor is present, downstream activation would ______.","decrease",""),
             ("When feedback removal occurs, the pathway's output would ______.","increase",""),
             ("When a key phosphatase increases, the level of phosphorylation would ______.","decrease",""),
+            ("When ligand availability drops, downstream output would ______.","decrease",""),
         ],
         "cell_cycle": [
             ("When a checkpoint engages, the next cell-cycle transition would ______.","decrease",""),
             ("When cyclin activity rises, entry into the next phase would ______.","increase",""),
             ("When damage is unresolved, progression to the next phase would ______.","decrease",""),
             ("When cohesion removal is delayed, time spent before separation would ______.","increase",""),
+            ("When growth signals rise, commitment to the next phase would ______.","increase",""),
         ],
         "generic": [
             ("When a rate-limiting step is helped, the amount of product formed would ______.","increase",""),
             ("When a core step is hindered, throughput would ______.","decrease",""),
             ("When a late processing step is blocked, intermediates would ______.","accumulate","intermediates"),
             ("When a parallel backup route is strong, the net change would be ______.","no_change",""),
+            ("When the final assembly is efficient, finished output would ______.","increase",""),
         ],
     }
-    # Filter overly specific stems if their keywords aren't in slide vocab (keep beginner tone)
+    # Filter backfill by corpus vocab (keep beginner tone, avoid niche terms not present)
     def ok_for_vocab(stem: str) -> bool:
         toks = [t for t in tokenize(stem) if len(t) > 3]
         hits = sum(1 for t in toks if t in vocab)
-        return hits >= max(1, len(toks)//12)  # very lenient
+        return hits >= max(1, len(toks)//12)
 
-    for stem, key, noun in candidates_by_topic.get(topic, candidates_by_topic["generic"]):
+    for item in backfill.get(topic, backfill["generic"]):
+        stem, key, noun = item
         if ok_for_vocab(stem):
-            items.append({"stem": stem, "key": key, "noun": noun})
-        if len(items) == 4:
-            break
-    while len(items) < 4:
-        items.append({"stem":"When the helpful step improves, the immediate output would ______.","key":"increase","noun":""})
-    return items[:4]
+            pool.append((stem, key, noun))
 
-def build_drag(topic: str, mined: List[Tuple[str,str,str]]) -> Tuple[List[str], List[str], Dict[str,str]]:
+    # Dedupe, shuffle, sample 4
+    seen = set(); uniq = []
+    for stem, key, noun in pool:
+        k = stem.lower()
+        if k not in seen:
+            uniq.append((stem,key,noun)); seen.add(k)
+    rng.shuffle(uniq)
+    pick = uniq[:4] if len(uniq) >= 4 else (uniq + [("When the helpful step improves, the immediate output would ______.","increase","")])[:4]
+    return [{"stem": s, "key": k, "noun": n} for (s,k,n) in pick]
+
+def build_drag(topic: str, mined: List[Tuple[str,str,str]], rng: random.Random) -> Tuple[List[str], List[str], Dict[str,str]]:
     labels = topic_bins(topic)
-    # Domain seed statements (beginner-friendly)
     seeds = {
         "protein_structure": [
             ("Amino‑acid sequence (order of residues)", "Primary"),
@@ -307,79 +312,70 @@ def build_drag(topic: str, mined: List[Tuple[str,str,str]]) -> Tuple[List[str], 
             ("Disulfide bonds within one chain", "Tertiary"),
             ("Subunit–subunit association", "Quaternary"),
             ("Hemoglobin α2β2 assembly", "Quaternary"),
+            ("Salt bridges in the core", "Tertiary"),
         ],
         "transcription": [
             ("Promoter access", "Initiation"),
             ("Pause‑release during elongation", "Elongation"),
             ("Transcript termination", "Termination"),
             ("mRNA processing (capping/splicing/polyA)", "Processing"),
+            ("Enhancer–promoter contact", "Initiation"),
         ],
         "translation": [
             ("Start‑site recognition", "Initiation"),
             ("Elongation speed", "Elongation"),
             ("Release‑factor‑mediated termination", "Termination"),
             ("Quality control of misfolded products", "Quality control"),
+            ("tRNA charging level", "Elongation"),
         ],
         "replication": [
             ("Origin firing", "Initiation"),
             ("Fork progression", "Elongation"),
             ("Okazaki fragment joining", "Ligation"),
             ("Fork re‑annealing prevention", "Fork stability"),
+            ("Primer availability", "Initiation"),
         ],
         "microscopy": [
             ("Minimum resolvable distance (d)", "Resolution"),
             ("Optical sectioning", "Contrast"),
             ("Spherical aberration", "Artifacts"),
             ("Nyquist sampling", "Sampling"),
+            ("Signal‑to‑noise ratio", "Contrast"),
         ],
         "signaling": [
             ("Receptor activation", "Upstream activation"),
             ("Inhibitor action on pathway", "Pathway inhibition"),
             ("Downstream target output", "Downstream output"),
             ("Negative feedback", "Feedback"),
+            ("Ligand availability", "Upstream activation"),
         ],
         "cell_cycle": [
             ("Entry into next phase", "Entry/Commitment"),
             ("Checkpoint engagement", "Checkpoint hold"),
             ("Transition to anaphase", "Transition"),
             ("Completion of division", "Exit/Completion"),
+            ("Growth signal strength", "Entry/Commitment"),
         ],
         "generic": [
             ("Product formation rate", "Increase"),
             ("Core step throughput", "Decrease"),
             ("Intermediate species", "Accumulates"),
             ("Immediate off‑pathway effects", "No change"),
+            ("Final assembly efficiency", "Increase"),
         ],
     }
     pairs = list(seeds.get(topic, seeds["generic"]))
 
-    if topic == "generic":
-        generic_bins = {"increase":"Increase","decrease":"Decrease","no_change":"No change","accumulate":"Accumulates"}
-        for stem, key, noun in mined:
-            label = generic_bins.get(key, "No change")
-            short = re.sub(r"^When this.*?:\s*", "", stem, flags=re.IGNORECASE)
-            short = re.sub(r"\s+What would you expect.*$", "", short, flags=re.IGNORECASE)
-            short = short.strip(". ")
-            if len(short) > 90: short = short[:87] + "…"
-            pairs.append((short, label))
-
+    # Deduplicate, shuffle, sample 6–8
     seen = set(); uniq = []
     for s, lbl in pairs:
         k = (s.lower(), lbl.lower())
         if k not in seen:
             uniq.append((s,lbl)); seen.add(k)
-    random.shuffle(uniq)
-    if len(uniq) < 6:
-        pad = [("Immediate product output", labels[0]),
-               ("Processing intermediates", labels[-1] if "Accumulates" in labels else labels[0]),
-               ("Core step throughput", labels[1] if len(labels)>1 else labels[0]),
-               ("Non‑target side effects", labels[2] if len(labels)>2 else labels[0])]
-        for s,lbl in pad:
-            if (s.lower(), lbl.lower()) not in seen:
-                uniq.append((s,lbl))
-            if len(uniq) >= 6: break
 
-    bank_pairs = uniq[:8]
+    rng.shuffle(uniq)
+    k = 8 if len(uniq) >= 8 else max(6, len(uniq))
+    bank_pairs = uniq[:k]
     bank = [s for (s,_) in bank_pairs]
     answers = {s:lbl for (s,lbl) in bank_pairs}
     return labels, bank, answers
@@ -400,11 +396,15 @@ if st.button("Generate"):
 
     texts = st.session_state.corpus
     topic = detect_topic(prompt)
-    mined = mine_prompted_relations(texts, prompt, max_items=10) if topic != "protein_structure" else []
+    mined = mine_prompted_relations(texts, prompt, max_items=12) if topic != "protein_structure" else []
     vocab = corpus_vocab(texts)
 
-    st.session_state.fitb = build_fitb(topic, mined, vocab)
-    st.session_state.drag_labels, st.session_state.drag_bank, st.session_state.drag_answer = build_drag(topic, mined)
+    # per-click RNG to vary activities each run even for same prompt
+    seed = new_seed()
+    rng = random.Random(seed)
+
+    st.session_state.fitb = build_fitb(topic, mined, vocab, rng)
+    st.session_state.drag_labels, st.session_state.drag_bank, st.session_state.drag_answer = build_drag(topic, mined, rng)
 
     st.success(f"Generated fresh activities for **{topic.replace('_',' ').title()}**.")
 
@@ -430,27 +430,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
     bank   = st.session_state.drag_bank
     answer = st.session_state.drag_answer
 
-    # Ensure ≥6 cards
-    if len(bank) < 6:
-        filler = ["Amino‑acid sequence","Alpha‑helix content","Hydrophobic core packing",
-                  "Subunit interface contacts","Disulfide bonds (intra‑chain)","Beta‑sheet registry"]
-        for f in filler:
-            if f not in bank:
-                if "Primary" in labels:
-                    mapping = {
-                        "Amino‑acid sequence":"Primary",
-                        "Alpha‑helix content":"Secondary",
-                        "Beta‑sheet registry":"Secondary",
-                        "Hydrophobic core packing":"Tertiary",
-                        "Disulfide bonds (intra‑chain)":"Tertiary",
-                        "Subunit interface contacts":"Quaternary",
-                    }
-                    answer[f] = mapping.get(f, labels[0])
-                else:
-                    answer[f] = labels[0]
-                bank.append(f)
-
-    # Build HTML (drop targets only on inner holders to avoid mis-drops)
+    # Build bins HTML (drop handlers on the exact targets; use ev.currentTarget)
     bins_html = "".join([
         f"""
         <div class="bin">
@@ -509,10 +489,8 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
           ev.preventDefault();
           const id = ev.dataTransfer.getData("text/plain");
           const card = document.getElementById(id);
-          const target = ev.target;
-          if (target.classList.contains('holder') || target.id === 'bank') {{
-            target.appendChild(card);
-          }}
+          const target = ev.currentTarget; // exact drop zone (holder or bank)
+          if (target) {{ target.appendChild(card); }}
         }}
         function renderBank() {{
           const b = document.getElementById("bank");
