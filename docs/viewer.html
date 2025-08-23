@@ -4,124 +4,56 @@
   <meta charset="utf-8" />
   <title>H5P Viewer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-
-  <!-- CSP: allow local + blob/data for H5P -->
-  <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self' data: blob:;
-                 script-src  'self' 'unsafe-inline' 'unsafe-eval' data: blob:;
-                 style-src   'self' 'unsafe-inline' data: blob:;
-                 img-src     'self' data: blob:;
-                 font-src    'self' data:;
-                 connect-src 'self' data: blob:;
-                 worker-src  'self' blob:;">
-
-  <!-- Local H5P CSS -->
-  <link rel="stylesheet" href="./h5p.css?v=4" />
-
+  <!-- No CSP while debugging to rule it out; add later if you like -->
+  <link rel="stylesheet" href="./h5p.css" />
   <style>
-    :root { color-scheme: light; }
-    html, body { height: 100%; margin: 0; background: #fff; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
-    #app { min-height: 100vh; }
-    .err { color: #b00; padding: 1rem; line-height: 1.4; }
-    .muted { color: #666; }
-    .hint { padding: .75rem 1rem; background: #f6f8fa; border: 1px solid #e5e7eb; border-radius: .5rem; margin: 1rem; }
-    code { background: #f3f4f6; padding: 0 .25rem; border-radius: .25rem; }
+    html, body { margin:0; height:100%; background:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+    #app { min-height:100vh; }
+    .err { color:#b00; padding:1rem; }
+    .hint { padding:.75rem 1rem; background:#f6f8fa; border:1px solid #e5e7eb; border-radius:.5rem; margin:1rem; }
+    code { background:#f3f4f6; padding:0 .25rem; border-radius:.25rem; }
   </style>
-
   <script>
-    // Define minimal H5PIntegration BEFORE any bundles (some builds read it)
-    window.H5PIntegration = {
-      baseUrl: window.location.origin + window.location.pathname.replace(/\/[^\/]*$/, ''),
-      url: window.location.href,
-      hubIsEnabled: false,
-      saveFreq: false,
-      ajax: { setFinished: "", contentUserData: "" },
-      siteUrl: window.location.origin,
-      l10n: { H5P: { fullscreen: "Fullscreen", exitFullscreen: "Exit fullscreen" } },
-      libraryUrl: "./",
-      postUserStatistics: false,
-      disableHub: true,
-      core: { scripts: [], styles: [] },
-      loadedJs: [], loadedCss: [],
-      contents: {}
-    };
-
-    function qp(name) {
-      const u = new URL(location.href);
-      return u.searchParams.get(name);
-    }
-    function loadScript(src) {
-      return new Promise((resolve, reject) => {
-        const s = document.createElement('script');
-        s.src = src;
-        s.async = true;
+    function qp(name){ const u=new URL(location.href); return u.searchParams.get(name); }
+    function loadScript(src){
+      return new Promise((resolve,reject)=>{
+        const s=document.createElement('script');
+        s.src = src;            // <-- single, fixed URL (no extra query)
         s.onload = () => { console.log('Loaded', src); resolve(); };
         s.onerror = () => reject(new Error('Failed to load: ' + src));
         document.head.appendChild(s);
       });
     }
-
-    async function boot() {
+    async function boot(){
       const app = document.getElementById('app');
-      const src = qp('src'); // absolute URL or data: URL to the .h5p
-
-      if (!src) {
-        app.innerHTML = [
-          '<div class="hint">',
-          '  <div><strong>No H5P source.</strong> Append <code>?src=&lt;url-to-your.h5p&gt;</code> or a <code>data:application/zip;base64,...</code> URL.</div>',
-          '  <div class="muted" style="margin-top:.5rem">Example: ',
-          '    <code>?src=https%3A%2F%2Fraw.githubusercontent.com%2F&lt;user&gt;%2F&lt;repo&gt;%2Fmain%2Fdocs%2Fgenerated%2Ffile.h5p</code>',
-          '  </div>',
-          '</div>'
-        ].join('');
+      const src = qp('src'); // URL or data:application/zip;base64,...
+      if(!src){
+        app.innerHTML = '<div class="hint">No H5P source. Use <code>?src=&lt;url-to-your.h5p&gt;</code> (or a data: URL).</div>';
         return;
       }
-
-      // Load local standalone bundles (order matters)
       try {
-        await loadScript('./main.bundle.js?v=4');
-        await loadScript('./frame.bundle.js?v=4');
-      } catch (e) {
-        app.innerHTML = '<p class="err">' + e.message + '</p>';
-        return;
-      }
+        await loadScript('./main.bundle.js');
+        await loadScript('./frame.bundle.js');
+      } catch(e) { app.innerHTML = '<p class="err">'+e.message+'</p>'; return; }
+
+      // Accept either global name the bundle may expose
+      const HS = window.H5PStandalone || window['h5p-standalone'];
+      console.log('typeof H5PStandalone =', typeof window.H5PStandalone);
+      console.log('typeof window["h5p-standalone"] =', typeof window['h5p-standalone']);
 
       let tries = 0;
-      (function waitReady() {
+      (function waitReady(){
         tries++;
-        const HS = window.H5PStandalone || window['h5p-standalone'];
-        console.log('Detected H5P global =', HS ? (window.H5PStandalone ? 'H5PStandalone' : 'h5p-standalone') : 'none');
-
-        if (HS && typeof HS.display === 'function') {
-          console.log('H5PStandalone ready; rendering content…');
-          try {
-            HS.display('#app', { h5pContent: src });
-          } catch (e) {
-            app.innerHTML = '<p class="err">Could not initialize H5P: ' +
-              (e && e.message ? e.message : e) + '</p>';
-          }
-        } else if (tries < 240) { // ~12s
-          setTimeout(waitReady, 50);
-        } else {
-          app.innerHTML = [
-            '<p class="err">H5P API not ready.</p>',
-            '<div class="hint">',
-            '  <div>Check that <code>main.bundle.js</code>, <code>frame.bundle.js</code>, and <code>h5p.css</code> are the real ',
-            '  <strong>h5p-standalone</strong> files in <code>/docs</code> (not HTML placeholders). Open each directly in a tab:</div>',
-            '  <ul>',
-            '    <li><code>' + location.origin + location.pathname.replace(/\/[^\/]*$/, "/main.bundle.js?v=4") + '</code></li>',
-            '    <li><code>' + location.origin + location.pathname.replace(/\/[^\/]*$/, "/frame.bundle.js?v=4") + '</code></li>',
-            '    <li><code>' + location.origin + location.pathname.replace(/\/[^\/]*$/, "/h5p.css?v=4") + '</code></li>',
-            '  </ul>',
-            '  <div>In the console, run <code>typeof H5PStandalone</code> and ',
-            '  <code>typeof window["h5p-standalone"]</code>. At least one should be <code>"function"</code> or <code>"object"</code>.</div>',
-            '</div>'
-          ].join('');
+        const H = window.H5PStandalone || window['h5p-standalone'];
+        if (H && typeof H.display === 'function') {
+          try { H.display('#app', { h5pContent: src }); }
+          catch(e){ app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>'; }
+        } else if (tries < 240) { setTimeout(waitReady, 50); }
+        else {
+          app.innerHTML = '<p class="err">H5P API not ready. If both globals are "undefined", your JS files aren’t the h5p-standalone runtime or failed to execute (check Console/Network).</p>';
         }
       })();
     }
-
     document.addEventListener('DOMContentLoaded', boot);
   </script>
 </head>
