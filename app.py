@@ -19,8 +19,8 @@ SYSTEM = (
     "Use ONLY the provided slide excerpts (and OpenStax Biology if slides lack coverage) "
     "to create concise, causal, critical-thinking practice. "
     "Never invent placeholder entities like 'protein X' or 'protein Z'. "
-    "Always use concrete, named entities found in the slides or OpenStax (e.g., 'ATP synthase', 'complex I'). "
-    "Write in plain language; if a technical term is required, add a parenthetical clarifier (e.g., 'cathode (negative end)')."
+    "Use concrete, named entities (e.g., ATP synthase, Complex I). "
+    "Write in plain language; if a technical term appears, add a small parenthetical clarifier."
 )
 
 SLIDES_DIR = Path(__file__).parent / "slides"  # put PDFs here so students never re-upload
@@ -39,7 +39,7 @@ def extract_text_from_repo_slides() -> str:
         except Exception as e:
             st.warning(f"Could not read {Path(path).name}: {e}")
     full = re.sub(r"\s+", " ", "\n\n".join(chunks)).strip()
-    return full[:25000]
+    return full[:24000]
 
 def levenshtein(a: str, b: str) -> int:
     a, b = a.lower(), b.lower()
@@ -56,32 +56,41 @@ def levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 def ok_match(student: str, truth: str) -> bool:
-    if not student.strip(): return False
+    if not isinstance(student, str) or not isinstance(truth, str):
+        return False
     s, t = student.strip().lower(), truth.strip().lower()
-    if s == t: return True
-    # tolerate plural s and one edit distance
-    if s.endswith("s") and s[:-1] == t: return True
-    if t.endswith("s") and t[:-1] == s: return True
+    if not s or not t:
+        return False
+    if s == t:
+        return True
+    # tolerate plural “s” and one edit distance
+    if s.endswith("s") and s[:-1] == t:
+        return True
+    if t.endswith("s") and t[:-1] == s:
+        return True
     return levenshtein(s, t) <= 1
 
 # ------------------ LLM PROMPTS ------------------
+# Softer, less specific, focus on observable outcomes.
 CRITICAL_CLOZE_INSTRUCTION = """Return JSON ONLY with:
 {
   "title": "short title",
   "instructions": "explicit task directions for students",
   "clozes": [
     "Short causal sentence with **answer**",
-    "… 4–7 total items"
+    "… 4–6 total items"
   ],
   "difficulty": "easy|medium|hard"
 }
 
 Rules:
 - Use ONLY slide excerpts; if insufficient, you MAY draw on OpenStax Biology to fill small gaps.
-- Prefer causal predictions and “what happens if…” reasoning over recall.
-- Each **answer** is 1–2 words present in the slides’ phrasing where possible.
-- Keep each sentence short (<= 18 words).
-- Use plain language; add parenthetical clarifiers when a technical term appears.
+- Prefer approachable causal predictions students can reason about from class:
+  e.g., “If Complex IV is inhibited, **oxygen consumption** decreases.”
+- Avoid obscure subunits, rare cofactors, or exact numbers.
+- Each **answer** is 1–2 common course words (e.g., “ATP production”, “proton gradient”).
+- Keep each sentence short (≤ 16 words).
+- Use plain language with small clarifiers (e.g., “cathode (negative end)”).
 - Do NOT include extra fields or markdown outside **answer** markers.
 - Never invent placeholders like “protein X/Z”. Use concrete names from slides or OpenStax only.
 """
@@ -100,20 +109,20 @@ MATCHING_INSTRUCTION = """Return JSON ONLY with:
 
 Rules:
 - Use ONLY the slide excerpts; if insufficient, you MAY draw on OpenStax Biology to fill small gaps.
-- 6–10 pairs total. Make them conceptual (e.g., “RTK always-active → MAPK output increases”), not trivia.
-- Keep phrases short (<= 6 words) and precise.
-- Use plain language with parenthetical clarifiers for jargon when needed.
+- 6–8 pairs total. Conceptual, not trivia. Example: “RTK always-active → MAPK output increases”.
+- Keep phrases short (≤ 6 words) and precise.
+- Use plain language with brief clarifiers for jargon when needed.
 - right_choices must contain every unique target in the pairs.
 - Never invent placeholders like “protein X/Z”. Use concrete names from slides or OpenStax only.
 """
 
 def ask_llm_for_cloze(topic: str, slides: str, prior_grade: float) -> Dict[str, Any]:
     diff_hint = (
-        "Focus on harder, multi-step causal effects."
-        if prior_grade >= 0.8 else
-        "Prefer foundational, single-step causal effects."
-        if prior_grade <= 0.5 else
-        "Use medium complexity causal effects."
+        "Focus on approachable, single- or two-step causal effects."
+        if prior_grade <= 0.6 else
+        "Use medium complexity causal effects with two steps."
+        if prior_grade <= 0.85 else
+        "Use harder multi-step causal effects, but stay in plain language."
     )
     user = f"""
 Topic: "{topic}"
@@ -124,8 +133,8 @@ Task: Author a concise, causal fill-in-the-blank activity (Drag-the-Words style)
 """.strip()
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.2,
-        max_tokens=900,
+        temperature=0.15,
+        max_tokens=800,
         response_format={"type":"json_object"},
         messages=[{"role":"system","content":SYSTEM},{"role":"user","content":user}],
     )
@@ -133,11 +142,11 @@ Task: Author a concise, causal fill-in-the-blank activity (Drag-the-Words style)
 
 def ask_llm_for_matching(topic: str, slides: str, prior_grade: float) -> Dict[str, Any]:
     diff_hint = (
-        "Harder conceptual matches with subtle distractors."
-        if prior_grade >= 0.8 else
         "Foundational matches with clear differences."
-        if prior_grade <= 0.5 else
-        "Medium complexity matches."
+        if prior_grade <= 0.6 else
+        "Medium complexity matches with subtle distractors."
+        if prior_grade <= 0.85 else
+        "Harder conceptual matches (multi-step), in plain language."
     )
     user = f"""
 Topic: "{topic}"
@@ -148,8 +157,8 @@ Task: Author a concise drag-and-drop matching activity (concept → correct targ
 """.strip()
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.2,
-        max_tokens=900,
+        temperature=0.15,
+        max_tokens=800,
         response_format={"type":"json_object"},
         messages=[{"role":"system","content":SYSTEM},{"role":"user","content":user}],
     )
@@ -213,9 +222,9 @@ def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[s
         "mainLibrary": "H5P.QuestionSet",
         "embedTypes": ["div"],
         "preloadedDependencies": [
-                {"machineName":"H5P.QuestionSet","majorVersion":1,"minorVersion":17},
-                {"machineName":"H5P.MultiChoice","majorVersion":1,"minorVersion":14},
-                {"machineName":"H5P.JoubelUI","majorVersion":1,"minorVersion":3},
+            {"machineName":"H5P.QuestionSet","majorVersion":1,"minorVersion":17},
+            {"machineName":"H5P.MultiChoice","majorVersion":1,"minorVersion":14},
+            {"machineName":"H5P.JoubelUI","majorVersion":1,"minorVersion":3},
         ],
     }
     buf = io.BytesIO()
@@ -229,8 +238,9 @@ def render_inline_cloze(title: str, instructions: str, clozes: List[str], key_pr
     st.subheader(f"🧠 {title}")
     st.write(instructions)
     total = len(clozes); n_correct = 0
-    with st.form(key=f"{key_prefix}_form"):
-        answers: Dict[int,str] = {}
+
+    form_key = f"{key_prefix}_form_{hash(title) % 10_000_000}"
+    with st.form(key=form_key, clear_on_submit=False):
         for i, s in enumerate(clozes, start=1):
             parts = re.split(r"\*\*(.+?)\*\*", s)
             if len(parts) >= 3:
@@ -238,16 +248,17 @@ def render_inline_cloze(title: str, instructions: str, clozes: List[str], key_pr
             else:
                 before, truth, after = s, "", ""
             st.markdown(f"{i}. {before} **____** {after}")
-            answers[i] = st.text_input(f"Your answer for {i}", key=f"{key_prefix}_a{i}")
+            st.text_input(f"Your answer for {i}", key=f"{key_prefix}_a_{i}")
         submitted = st.form_submit_button("Submit answers")
+
     if submitted:
         for i, s in enumerate(clozes, start=1):
-            truth = re.findall(r"\*\*(.+?)\*\*", s)
-            truth = truth[0] if truth else ""
-            student = st.session_state.get(f"{key_prefix}_a{i}","")
+            truths = re.findall(r"\*\*(.+?)\*\*", s)
+            truth = truths[0] if truths else ""
+            student = st.session_state.get(f"{key_prefix}_a_{i}", "")
             ok = ok_match(student, truth)
             n_correct += int(ok)
-            st.write(f"{'✅' if ok else '❌'} {i}. Correct: **{truth}** — Yours: _{student or '(blank)'}_")
+            st.write(f"{'✅' if ok else '❌'} {i}. Correct: **{truth or '(no key provided)'}** — Yours: _{(student or '(blank)')}_")
         st.info(f"Score: {n_correct}/{total}")
     return n_correct, total
 
@@ -317,8 +328,8 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
   <script id="data" type="application/json">{payload}</script>
   <script>
     const data = JSON.parse(document.getElementById('data').textContent);
-    const pairs = data.pairs;
-    const rights = data.rights;
+    const pairs = Array.isArray(data.pairs) ? data.pairs : [];
+    const rights = Array.isArray(data.rights) ? data.rights : [];
 
     const bank = document.getElementById('bank');
     const zones = document.getElementById('zones');
@@ -326,6 +337,7 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
 
     // Build draggables (left)
     pairs.forEach((p, i) => {{
+      if (!p || !p.left || !p.right) return;
       const pill = document.createElement('div');
       pill.className = 'pill';
       pill.textContent = p.left;
@@ -340,6 +352,7 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
 
     // Build drop zones (right)
     rights.forEach((r) => {{
+      if (!r) return;
       const z = document.createElement('div');
       z.className = 'zone';
       z.dataset.target = r;
@@ -384,19 +397,19 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
       document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
     }});
 
-    // Check answers
+    // Check answers (all client-side; no Python variables)
     document.getElementById('check').addEventListener('click', () => {{
-      let got = 0, total = pairs.length;
+      let scoreGot = 0, total = pairs.length;
       document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
       document.querySelectorAll('.zone').forEach(zone => {{
         const target = zone.dataset.target;
         zone.querySelectorAll('.pill').forEach(pill => {{
-          const ok = pill.dataset.answer === target;
+          const ok = (pill.dataset.answer === target);
           pill.classList.add(ok ? 'ok' : 'bad');
-          if (ok) got += 1;
+          if (ok) scoreGot += 1;
         }});
       }});
-      scoreBox.textContent = `Score: ${got}/${total}`;
+      scoreBox.textContent = `Score: ${scoreGot}/${total}`;
     }});
   </script>
 </body>
@@ -439,16 +452,24 @@ if gen:
     if want_cloze:
         cloze_data = ask_llm_for_cloze(topic, slide_text, grade_hint)
         c_title = cloze_data.get("title","Causal fill-in-the-blank")
-        c_instr = cloze_data.get("instructions","Predict the missing term using plain language (with clarifiers).")
-        clozes_raw = cloze_data.get("clozes", [])
-        # filter: keep only sentences with **answer**, forbid placeholders
-        clozes = []
-        for s in clozes_raw:
-            if isinstance(s, str) and "**" in s and not re.search(r"\bprotein [xz]\b", s, re.I):
-                clozes.append(s)
-        clozes = clozes[:7]
+        c_instr = cloze_data.get("instructions","Predict the missing term in plain language (with brief clarifiers).")
+        raw_clozes = cloze_data.get("clozes", [])
+        # filter: require **answer**, no placeholders, keep it short-ish
+        clozes: List[str] = []
+        for s in raw_clozes or []:
+            if not isinstance(s, str):
+                continue
+            if "**" not in s:
+                continue
+            if re.search(r"\bprotein [xz]\b", s, re.I):
+                continue
+            if len(s) > 140:
+                s = s[:140].rstrip(". ") + "..."
+            clozes.append(s)
+        clozes = clozes[:6]
+
         if not clozes:
-            st.warning("Cloze generation returned no valid items (likely placeholders or no blanks). Try a more specific topic.")
+            st.warning("Cloze generation returned no valid items (likely too specific). Try a narrower topic.")
         else:
             c_ok, c_total = render_inline_cloze(c_title, c_instr, clozes, key_prefix="cloze")
             if c_total > 0:
@@ -458,7 +479,7 @@ if gen:
                 st.session_state.running_grade = total_correct / max(1, total_items)
                 st.info(f"Adaptive level updated (from FITB). Running accuracy: {st.session_state.running_grade:.0%}")
 
-            # H5P export (DragText)
+            # Optional H5P export (DragText)
             try:
                 h5p_bytes = build_h5p_dragtext_zip(c_title, c_instr, clozes)
                 st.download_button("⬇️ Download FITB as H5P (DragText)", data=h5p_bytes,
@@ -472,18 +493,29 @@ if gen:
         match_data = ask_llm_for_matching(topic, slide_text, grade_hint)
         m_title = match_data.get("title","Concept → Target (Drag-and-Drop)")
         m_instr = match_data.get("instructions","Drag each prompt to the correct target category (plain language with clarifiers).")
-        pairs = match_data.get("pairs", [])
-        right_choices = match_data.get("right_choices", [])
+        pairs = match_data.get("pairs", []) or []
+        right_choices = match_data.get("right_choices", []) or []
+
         # filter invalid/placeholder
         clean_pairs = []
         for p in pairs:
-            if isinstance(p, dict) and p.get("left") and p.get("right"):
-                if not re.search(r"\bprotein [xz]\b", p["left"], re.I) and not re.search(r"\bprotein [xz]\b", p["right"], re.I):
-                    clean_pairs.append({"left": p["left"], "right": p["right"]})
-        pairs = clean_pairs[:10]
+            if not isinstance(p, dict):
+                continue
+            left, right = p.get("left"), p.get("right")
+            if not left or not right:
+                continue
+            if re.search(r"\bprotein [xz]\b", left, re.I) or re.search(r"\bprotein [xz]\b", right, re.I):
+                continue
+            if len(left) > 40:
+                left = left[:40].rstrip() + "…"
+            if len(right) > 40:
+                right = right[:40].rstrip() + "…"
+            clean_pairs.append({"left": left, "right": right})
+        pairs = clean_pairs[:8]
         rights = sorted(list({p["right"] for p in pairs})) or right_choices
+
         if not pairs or not rights:
-            st.warning("Drag-and-drop generation returned no valid items. Try a narrower topic or check slides.")
+            st.warning("Drag-and-drop generation returned no valid items. Try a narrower topic.")
         else:
             render_inline_dragdrop(m_title, m_instr, pairs, rights, key_prefix="dnd", height=560)
 
