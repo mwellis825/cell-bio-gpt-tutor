@@ -1,19 +1,18 @@
 # app.py
 # Prompt + Slides → (1) 4× Fill-in-the-Blank (prediction) + (2) Drag-into-Bins
 # ---------------------------------------------------------------------------------
-# What it does
+# How it works
 # - User types a topic prompt (no defaults).
-# - App searches ./slides (PDF/txt/md/html) for relevant content.
-# - Extracts candidate entities (proteins/enzymes/factors/process words).
-# - Builds 4 SHORT prediction prompts (perturbation → predicted change), graded leniently.
-# - Shows Drag-and-Drop with labeled bins. If 'streamlit-sortables' is installed, uses real
-#   drag across multiple lists. Otherwise, falls back to a click-to-assign UI.
+# - App searches ./slides (PDF / txt / md / html) for relevant content.
+# - Extracts topical terms and builds:
+#     (1) FOUR prediction-style fill-in-the-blank items (lenient grading; friendly language)
+#     (2) TRUE drag-and-drop: draggable bank → titled bins (requires streamlit-sortables)
 #
 # Install
 #   pip install streamlit
-#   # For PDFs:
+#   # for PDFs:
 #   pip install PyPDF2    # or: pip install pypdf
-#   # Optional for true drag:
+#   # for true drag & drop:
 #   pip install streamlit-sortables
 #
 # Run
@@ -38,16 +37,16 @@ except Exception:
     except Exception:
         PDF_BACKEND = None
 
-# Optional drag component
-DRAG_AVAILABLE = False
+# Optional drag component (required for true drag & drop)
+DRAG_OK = False
 try:
-    from streamlit_sortables import sort_items, sort_multiple
-    DRAG_AVAILABLE = True
+    from streamlit_sortables import sort_multiple
+    DRAG_OK = True
 except Exception:
-    DRAG_AVAILABLE = False
+    DRAG_OK = False
 
 # -------------------- File IO --------------------
-def read_text_file(path: str) -> str:
+def _read_text(path: str) -> str:
     for enc in ("utf-8", "latin-1"):
         try:
             with open(path, "r", encoding=enc) as f:
@@ -56,7 +55,7 @@ def read_text_file(path: str) -> str:
             continue
     return ""
 
-def read_pdf_file(path: str) -> str:
+def _read_pdf(path: str) -> str:
     if PDF_BACKEND == "PyPDF2":
         try:
             with open(path, "rb") as f:
@@ -83,317 +82,209 @@ def load_corpus(slides_dir: str):
         rel = str(p.relative_to(base))
         text = ""
         if ext in SUPPORTED_TEXT_EXTS:
-            text = read_text_file(str(p))
+            text = _read_text(str(p))
         elif ext == ".pdf":
-            text = read_pdf_file(str(p))
+            text = _read_pdf(str(p))
         if text and len(text.strip()) > 20:
             corpus[rel] = text
     return corpus
 
 # -------------------- Search helpers --------------------
-def tokenize(s: str):
+def _tok(s: str):
     return re.findall(r"[A-Za-z0-9']+", (s or "").lower())
 
-def score(text: str, q_tokens):
-    toks = tokenize(text)
+def _score(text: str, q_tokens):
+    toks = _tok(text)
     if not toks: return 0
     freq = {}
     for t in toks: freq[t] = freq.get(t, 0) + 1
     return sum(freq.get(q, 0) for q in q_tokens)
 
-# -------------------- Entity / process mining --------------------
-ENTITY_HINTS = [
-    r"[A-Z][a-z]+(?:-[A-Z][a-z]+)?",             # Proper-like (Cyclin, Ras, Myosin)
-    r"[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)*kinase",  # *kinase
-    r"[A-Za-z0-9]+ polymerase(?:\s*[IVX0-9]+)?", # DNA polymerase III, RNA polymerase II
-    r"helicase|primase|ligase|topoisomerase|ssb|gyrase|clamp loader|cohesin|separase",
-    r"ribosome|ribosomal subunit|tRNA|rRNA|EF[- ]?Tu|EF[- ]?G|release factor",
-    r"cyclin ?[A-E]|cdk\d?|p53|rb|apc/c|mcm|origin recognition complex",
-    r"receptor tyrosine kinase|rtk|gpcr|pi3k|akt|mapk|mek|erk|ras|raf|mTOR",
+# -------------------- Term mining (proteins/processes) --------------------
+ENTITY_PATTERNS = [
+    r"\b[A-Z][a-z]+(?:-[A-Z][a-z]+)?\b",      # Cyclin, Ras, Myosin
+    r"\b[AA-Za-z0-9]+(?:[-/][A-Za-z0-9]+)*kinase\b",
+    r"\bdna polymerase(?:\s*[ivx0-9]+)?\b|\brna polymerase(?:\s*[ivx0-9]+)?\b",
+    r"\bhelicase\b|\bprimase\b|\bligase\b|\btopoisomerase\b|\bssb\b|\bgyrase\b",
+    r"\bribosome\b|\btRNA\b|\brRNA\b|\bEF[- ]?Tu\b|\bEF[- ]?G\b|\brelease factor\b",
+    r"\bcyclin ?[A-E]\b|\bcdk\d?\b|\bp53\b|\brb\b|\bapc/c\b|\bmcm\b",
+    r"\breceptor tyrosine kinase\b|\brtk\b|\bgpcr\b|\bpi3k\b|\bakt\b|\bmapk\b|\bmek\b|\berk\b|\bras\b|\braf\b|\bmtor\b",
+]
+PROCESS_PATTERNS = [
+    r"\binitiation\b|\belongation\b|\btermination\b|\bfidelity\b|\bproofreading\b",
+    r"\bleading strand\b|\blagging strand\b|\bokazaki fragments\b|\borigin of replication\b|\breplication fork\b",
+    r"\boxidative phosphorylation\b|\belectron transport\b|\btca cycle\b|\bglycolysis\b",
+    r"\bspindle assembly checkpoint\b|\bg1/s\b|\bg2/m\b|\bmetaphase\b|\banaphase\b",
 ]
 
-PROCESS_HINTS = [
-    r"initiation|elongation|termination|fidelity|proofreading",
-    r"leading strand|lagging strand|okazaki fragments|origin of replication|replication fork",
-    r"oxidative phosphorylation|electron transport|tca cycle|glycolysis",
-    r"spindle assembly checkpoint|g1/s|g2/m|metaphase/anaphase",
-]
-
-def mine_terms(text: str, max_terms=10):
+def mine_terms(text: str, max_terms=12):
     found = []
-    for pat in ENTITY_HINTS + PROCESS_HINTS:
+    for pat in ENTITY_PATTERNS + PROCESS_PATTERNS:
         for m in re.finditer(pat, text, flags=re.IGNORECASE):
-            term = m.group(0).strip()
-            if len(term) < 3: continue
-            found.append(term)
-    # de-dupe and normalize whitespace/case style
-    clean = []
-    seen = set()
+            term = re.sub(r"\s+", " ", m.group(0).strip())
+            if len(term) >= 3:
+                found.append(term)
+    seen = set(); clean = []
     for t in found:
-        tt = re.sub(r"\s+", " ", t).strip()
-        key = tt.lower()
+        key = t.lower()
         if key not in seen:
-            clean.append(tt)
+            clean.append(t)
             seen.add(key)
     return clean[:max_terms]
 
-# -------------------- Prompt builders (prediction, not trivia) --------------------
-UP = {"↑","increase","increases","increased","up","higher","activates","activation","faster","more"}
-DOWN = {"↓","decrease","decreases","decreased","down","lower","inhibits","inhibition","slower","less"}
-NOCHANGE = {"nc","no change","unchanged","same","neutral","~"}
-ACCUM = {"accumulate","accumulates","accumulated","builds up","pile up","↑ [x]","more [x]"}
+# -------------------- FITB (prediction style) --------------------
+UP = {"increase","increases","increased","up","higher","activates","activation","faster","more","↑"}
+DOWN = {"decrease","decreases","decreased","down","lower","inhibits","inhibition","slower","less","↓"}
+NOCHANGE = {"no change","unchanged","same","neutral","nc","~"}
+ACCUM = {"accumulate","accumulates","accumulated","builds up","pile up"}
 
-def normalize(s: str):
+def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+"," ", s)
     s = s.replace("’","'")
     return s
 
-def matches_pred(user_text: str, canonical: str):
-    u = normalize(user_text)
-    if canonical == "increase":
-        return any(tok in u for tok in UP)
-    if canonical == "decrease":
-        return any(tok in u for tok in DOWN)
-    if canonical == "no_change":
-        return any(tok in u for tok in NOCHANGE)
-    if canonical.startswith("accumulate"):
-        # accept "accumulate", "builds up", or name mention
-        base = canonical.replace("accumulate:", "").strip()
-        return (any(tok in u for tok in ACCUM) and (base=="" or base in u)) or (base and base in u)
-    # fallback: substring
-    return canonical in u
+def match_pred(user_text: str, canonical: str, noun: str = "") -> bool:
+    u = _norm(user_text)
+    c = canonical
+    if c == "increase":   return any(x in u for x in UP)
+    if c == "decrease":   return any(x in u for x in DOWN)
+    if c == "no_change":  return any(x in u for x in NOCHANGE)
+    if c == "accumulate": return (any(x in u for x in ACCUM) or (noun and noun in u))
+    return c in u
 
-def build_fitb_predictions(terms):
-    """
-    Build 4 perturbation→prediction items from discovered terms/processes.
-    Each item = {stem, answer_key('increase'/'decrease'/'no_change'/'accumulate:XYZ')}
-    """
-    items = []
-    # Heuristic pairings for common topics
+def fitb_from_terms(terms):
+    """Return 4 friendly, prediction-style items: stem (string) + key ('increase'/'decrease'/...)"""
     tset = {t.lower() for t in terms}
-    # 1 helicase/primase/ligase/EF-Tu/EF-G etc.
-    if any(k in tset for k in ["helicase","primase","dna ligase","ligase","ef-tu","ef tu","ef-g","ef g","release factor"]):
-        if "helicase" in tset:
-            items.append({
-                "stem": "You add a potent helicase inhibitor. Predict replication fork progression rate.",
-                "key": "decrease"
-            })
-        if "primase" in tset:
-            items.append({
-                "stem": "Primase activity drops 80% due to nucleotide scarcity. Predict lagging-strand initiation frequency.",
-                "key": "decrease"
-            })
-        if "dna ligase" in tset or "ligase" in tset:
-            items.append({
-                "stem": "DNA ligase is temperature-sensitive and becomes inactive. Predict the immediate fate of Okazaki fragments.",
-                "key": "accumulate:okazaki fragments"
-            })
-        if "release factor" in tset:
-            items.append({
-                "stem": "Release factor is depleted. Predict effect on termination-time per protein.",
-                "key": "increase"
-            })
-    # 2 translation factors
-    if any(k in tset for k in ["ribosome","ef-tu","ef g","ef-g","trna"]):
-        items.append({
-            "stem": "EF-Tu binding to aminoacyl-tRNA is blocked. Predict elongation rate.",
-            "key": "decrease"
-        })
-    # 3 signaling generic
-    if any(k in tset for k in ["rtk","pi3k","akt","mapk","erk","ras","raf","mtor"]):
-        items.append({
-            "stem": "A small-molecule locks the RTK in its active dimer state (ligand-independent). Predict downstream ERK phosphorylation.",
-            "key": "increase"
-        })
-    # 4 cell-cycle
-    if any(k in tset for k in ["cyclin", "cdk", "p53", "apc/c", "apc c"]):
-        items.append({
-            "stem": "APC/C activity is inhibited by a spindle checkpoint signal. Predict separase activation at metaphase.",
-            "key": "decrease"
-        })
+    items = []
 
-    # Backfill if we have <4
-    generic_pool = [
-        {"stem": "You overexpress a rate-limiting enzyme in this pathway. Predict pathway flux.", "key": "increase"},
-        {"stem": "A competitive inhibitor binds the active site of the key catalyst. Predict product formation rate.", "key": "decrease"},
-        {"stem": "A feedback inhibitor is deleted. Predict steady-state level of the regulated metabolite.", "key": "increase"},
-        {"stem": "Chaperone assisting complex assembly is removed. Predict assembly efficiency.", "key": "decrease"},
-        {"stem": "Signal is present but receptor is nonfunctional. Predict downstream target activation.", "key": "decrease"},
-    ]
-    i = 0
-    while len(items) < 4 and i < len(generic_pool):
-        items.append(generic_pool[i]); i += 1
+    if "helicase" in tset:
+        items.append({
+            "stem": "When helicase activity is inhibited, the rate of replication-fork progression would ______.",
+            "key": "decrease", "noun": ""
+        })
+    if "primase" in tset:
+        items.append({
+            "stem": "If primase activity drops sharply, the number of new lagging-strand starts would ______.",
+            "key": "decrease", "noun": ""
+        })
+    if "dna ligase" in tset or "ligase" in tset:
+        items.append({
+            "stem": "If DNA ligase is inactivated, unjoined Okazaki fragments would ______.",
+            "key": "accumulate", "noun": "okazaki"
+        })
+    if {"rtk","erk","mapk","ras","raf"}.intersection(tset):
+        items.append({
+            "stem": "If an RTK is locked ON, the level of ERK phosphorylation would ______.",
+            "key": "increase", "noun": ""
+        })
+    if not items:
+        items = [
+            {"stem": "When a rate-limiting enzyme is overexpressed, the amount of product formation would ______.", "key": "increase", "noun": ""},
+            {"stem": "If a competitive inhibitor occupies the active site, the reaction rate would ______.", "key": "decrease", "noun": ""},
+            {"stem": "If a feedback inhibitor is removed, the steady-state level of the controlled metabolite would ______.", "key": "increase", "noun": ""},
+            {"stem": "If assembly chaperones are depleted, the efficiency of complex assembly would ______.", "key": "decrease", "noun": ""},
+        ]
     return items[:4]
 
-def build_drag_bins(terms):
-    """
-    Build labeled bins plus a bank of statements to classify.
-    Prefer bins: Increase / Decrease / No change / Accumulates.
-    """
-    bins = [("Increase", "increase"), ("Decrease", "decrease"), ("No change", "no_change"), ("Accumulates", "accumulate")]
-    # make 6–8 statements influenced by terms
-    statements = []
+# -------------------- Drag into bins --------------------
+def build_bins_and_bank(terms):
+    """Return bins (labels), bank (draggable items), and answer map for scoring."""
+    labels = ["Increase", "Decrease", "No change", "Accumulates"]
     tset = {t.lower() for t in terms}
+
+    statements = []
     if "helicase" in tset:
-        statements.append(("Fork progression rate", "decrease"))
+        statements.append(("Replication-fork progression rate", "Decrease"))
     if "primase" in tset:
-        statements.append(("Lagging-strand initiation events", "decrease"))
+        statements.append(("Lagging-strand initiation events", "Decrease"))
     if "dna ligase" in tset or "ligase" in tset:
-        statements.append(("Okazaki fragments", "accumulate"))
-    if "ribosome" in tset or "ef-tu" in tset or "ef g" in tset or "ef-g" in tset:
-        statements.append(("Elongation speed", "decrease"))
-        statements.append(("Ribosome stalling frequency", "increase"))
-    if any(k in tset for k in ["rtk","pi3k","akt","mapk","erk","ras","raf"]):
-        statements.append(("ERK phosphorylation", "increase"))
-        statements.append(("Pro-survival signaling", "increase"))
+        statements.append(("Okazaki fragments", "Accumulates"))
+    if {"rtk","erk","mapk","ras","raf"}.intersection(tset):
+        statements.append(("ERK phosphorylation", "Increase"))
+
     if not statements:
         statements = [
-            ("Pathway flux", "increase"),
-            ("Product formation rate", "decrease"),
-            ("Feedback-regulated metabolite", "increase"),
-            ("Assembly efficiency", "decrease"),
-            ("Off-pathway byproducts", "no_change"),
+            ("Product formation rate", "Increase"),
+            ("Reaction rate with active-site inhibitor", "Decrease"),
+            ("Controlled metabolite level without feedback", "Increase"),
+            ("Off-pathway byproducts (immediate)", "No change"),
         ]
-    # bank is just the left column words
+
     bank = [s for (s, _) in statements]
-    answer_map = {s:k for (s,k) in statements}
-    return bins, bank, answer_map
+    answer = {s:k for (s,k) in statements}
+    return labels, bank, answer
 
 # -------------------- UI --------------------
 st.set_page_config(layout="wide")
 st.title("📘 Prompt → Critical-Thinking Activities")
 
-prompt = st.text_input("Enter a topic prompt (e.g., 'translation fidelity', 'RTK to ERK', 'replication fork dynamics')", value="", placeholder="Type your topic…")
+# No default topic
+prompt = st.text_input("Enter a topic (e.g., translation fidelity, RTK→ERK, replication fork dynamics)", value="", placeholder="Type your topic…")
+
 if st.button("Generate"):
-    # load slides once
+    # Load slides once
     if "corpus" not in st.session_state:
         st.session_state.corpus = load_corpus(SLIDES_DIR)
 
     corpus = st.session_state.corpus
     if not corpus:
-        st.error("No slides found or PDFs unreadable. Add slides to ./slides and/or install PyPDF2 or pypdf.")
+        st.error("No slides found or PDFs not parsable. Add slide files to ./slides and/or install PyPDF2/pypdf.")
     else:
-        q = tokenize(prompt)
-        ranked = sorted(corpus.items(), key=lambda kv: score(kv[1], q), reverse=True)
+        q = _tok(prompt)
+        ranked = sorted(corpus.items(), key=lambda kv: _score(kv[1], q), reverse=True)
         best_text = ranked[0][1] if ranked else ""
-        # mine terms from the best match + prompt
         terms = mine_terms((best_text + " " + prompt) if best_text else prompt, max_terms=12)
-        if not terms:
-            st.warning("Didn’t detect many topic terms; generating generic prediction activities.")
-        # Build activities
-        fitb_items = build_fitb_predictions(terms)
-        bins, bank, ansmap = build_drag_bins(terms)
 
-        # store in session
-        st.session_state["fitb_items"] = fitb_items
-        st.session_state["bins"] = bins
-        st.session_state["bank"] = bank
-        st.session_state["ansmap"] = ansmap
-        st.session_state["drag_state"] = {"Increase": [], "Decrease": [], "No change": [], "Accumulates": []}
+        st.session_state.fitb = fitb_from_terms(terms)
+        st.session_state.labels, st.session_state.bank, st.session_state.answer = build_bins_and_bank(terms)
+        # initialize drag state (multi-list order: [bank] + each bin list)
+        st.session_state.drag_lists = [list(st.session_state.bank)] + [[] for _ in st.session_state.labels]
+        st.success("Activities generated.")
 
-# ----- Render Activity 1: 4× Fill-in-the-Blank (prediction) -----
-if "fitb_items" in st.session_state:
+# -------------------- Activity 1: 4× FITB (prediction) --------------------
+if "fitb" in st.session_state:
     st.markdown("## Activity 1 — Predict the immediate effect")
-    st.caption("Answer with terms like: increase / decrease / no change / accumulate X. Lenient matching accepted.")
-    for i, item in enumerate(st.session_state["fitb_items"], start=1):
+    st.caption("Answer with simple words like **increase**, **decrease**, **no change**, or **accumulates**. I’ll grade leniently.")
+    for i, item in enumerate(st.session_state.fitb, start=1):
         stem = item["stem"]
-        key = item["key"]           # canonical
-        u = st.text_input(f"{i}. {stem}", key=f"fitb_{i}")
+        key  = item["key"]
+        noun = item.get("noun","")
+        user = st.text_input(f"{i}. {stem}", key=f"fitb_{i}")
         if st.button(f"Check {i}", key=f"check_{i}"):
-            ok = matches_pred(u, key)
-            st.success("Correct.") if ok else st.error("Not quite — think causally about immediate effects.")
+            if match_pred(user, key, noun):
+                st.success("Correct.")
+            else:
+                st.error("Not quite — think about the **immediate** effect of that perturbation.")
 
-# ----- Render Activity 2: Drag into labeled bins -----
-if all(k in st.session_state for k in ["bins","bank","ansmap","drag_state"]):
+# -------------------- Activity 2: TRUE Drag-and-Drop --------------------
+if all(k in st.session_state for k in ["labels","bank","answer","drag_lists"]):
     st.markdown("---")
     st.markdown("## Activity 2 — Drag statements into the correct bin")
-    st.caption("Bins: Increase / Decrease / No change / Accumulates")
+    st.caption("Bins: **Increase** • **Decrease** • **No change** • **Accumulates**")
 
-    labels = [b[0] for b in st.session_state["bins"]]
-    # If true drag available, show multi-list drag; else fallback to click-assign UI
-    if DRAG_AVAILABLE:
-        left_col, right_col = st.columns([1, 2])
-        with left_col:
-            st.subheader("Word bank")
-            bank = sort_items(st.session_state["bank"], key="bank")
-            st.session_state["bank"] = bank
-
-        with right_col:
-            st.subheader("Bins")
-            lists = [st.session_state["drag_state"].get(lbl, []) for lbl in labels]
-            updated = sort_multiple(lists, labels=labels, key="bins_multi")
-            for lbl, lst in zip(labels, updated):
-                st.session_state["drag_state"][lbl] = lst
+    if DRAG_OK:
+        labels = ["Bank"] + st.session_state.labels
+        # keep list of lists stable across reruns
+        lists = st.session_state.drag_lists
+        updated = sort_multiple(lists, labels=labels, key="drag-multi")
+        st.session_state.drag_lists = updated
 
         if st.button("Check bins"):
-            correct = 0; total = 0
-            for lbl, lst in st.session_state["drag_state"].items():
-                for s in lst:
+            # updated[0] is bank; bins start at index 1
+            total = 0; correct = 0
+            for bin_idx, bin_label in enumerate(st.session_state.labels, start=1):
+                for item in updated[bin_idx]:
                     total += 1
-                    want = st.session_state["ansmap"].get(s, "no_change")
-                    got = "accumulate" if lbl.lower().startswith("accum") else lbl.lower()
-                    if got == want:
+                    want = st.session_state.answer.get(item, "No change")
+                    got  = bin_label
+                    if want == got:
                         correct += 1
             if total == 0:
-                st.warning("Drag items into bins first.")
+                st.warning("Drag items from the bank into the bins first.")
             elif correct == total:
                 st.success("All bins correct! 🎉")
             else:
                 st.warning(f"{correct}/{total} correct — adjust and try again.")
-
     else:
-        # Click-to-assign fallback (stable)
-        left, right = st.columns([1, 2])
-        with left:
-            st.subheader("Word bank")
-            chosen = st.session_state.get("chosen_item")
-            for idx, s in enumerate(st.session_state["bank"]):
-                if st.button(("🔘 " if chosen == s else "⚪ ") + s, key=f"bank_{idx}"):
-                    st.session_state["chosen_item"] = s
-            if st.button("Reset"):
-                # put everything back
-                st.session_state["bank"] = list(st.session_state["ansmap"].keys())
-                st.session_state["drag_state"] = {lbl: [] for lbl in labels}
-                st.session_state["chosen_item"] = None
-
-        with right:
-            st.subheader("Bins")
-            cols = st.columns(2)
-            for i, lbl in enumerate(labels):
-                col = cols[i % 2]
-                with col:
-                    st.write(f"**{lbl}**")
-                    # placement button
-                    if st.button("Place here", key=f"place_{lbl}"):
-                        sel = st.session_state.get("chosen_item")
-                        if sel:
-                            # remove from bank
-                            st.session_state["bank"] = [x for x in st.session_state["bank"] if x != sel]
-                            # place in bin
-                            st.session_state["drag_state"][lbl].append(sel)
-                            st.session_state["chosen_item"] = None
-                    # show contents + remove buttons
-                    for j, s in enumerate(list(st.session_state["drag_state"][lbl])):
-                        cols2 = st.columns([3,1])
-                        cols2[0].write(f"- {s}")
-                        if cols2[1].button("✖", key=f"rm_{lbl}_{j}"):
-                            # remove and return to bank
-                            st.session_state["drag_state"][lbl].pop(j)
-                            st.session_state["bank"].append(s)
-
-            if st.button("Check bins"):
-                correct = 0; total = 0
-                for lbl, lst in st.session_state["drag_state"].items():
-                    for s in lst:
-                        total += 1
-                        want = st.session_state["ansmap"].get(s, "no_change")
-                        got = "accumulate" if lbl.lower().startswith("accum") else lbl.lower()
-                        if got == want:
-                            correct += 1
-                if total == 0:
-                    st.warning("Assign items to bins first.")
-                elif correct == total:
-                    st.success("All bins correct! 🎉")
-                else:
-                    st.warning(f"{correct}/{total} correct — adjust and try again.")
+        st.info("To enable **true drag-and-drop**, install the optional component:\n\n`pip install streamlit-sortables`\n\nThen restart the app.")
