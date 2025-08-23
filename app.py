@@ -1,4 +1,4 @@
-import os, re, io, json, zipfile, random, glob, string
+import os, re, io, json, random, glob, string
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
@@ -7,7 +7,7 @@ from pypdf import PdfReader
 from openai import OpenAI
 
 # ================== CONFIG ==================
-st.set_page_config(page_title="Cell Bio Tutor — Inline DnD + Critical FITB", layout="wide")
+st.set_page_config(page_title="Cell Bio Tutor — Objectives-First FITB + DnD", layout="wide")
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -18,11 +18,11 @@ SLIDES_DIR = Path(__file__).parent / "slides"   # put your PDFs here
 
 SYSTEM = (
     "You are a rigorous, supportive Cell Biology tutor. "
-    "Use ONLY the provided slide excerpts (and OpenStax Biology if slides lack coverage) "
-    "to create concise, causal, critical-thinking practice. "
-    "Never invent placeholders like 'protein X' or 'protein Z'. "
-    "Use concrete names (e.g., ATP synthase, Complex I). "
-    "Write in plain language; if jargon appears, add a brief parenthetical clarifier."
+    "Use ONLY the provided slide excerpts as the outer boundary of scope. "
+    "If objectives are unclear, infer concise, standard learning objectives that are consistent with typical Cell Biology coverage, "
+    "but do not go deeper than the slides’ level of detail. "
+    "Favor conceptual, causal reasoning over recall. "
+    "Never invent placeholders like 'protein X/Z'. Use concrete names seen in slides or standard general terms."
 )
 
 # ================== UTILITIES ==================
@@ -38,9 +38,13 @@ def extract_text_from_repo_slides() -> str:
                 chunks.append(text)
         except Exception as e:
             st.warning(f"Could not read {Path(path).name}: {e}")
-    full = re.sub(r"\s+", " ", "\n\n".join(chunks)).strip()
+    full = "\n\n".join(chunks)
+    # compact whitespace
+    full = re.sub(r"[ \t]+", " ", full)
+    full = re.sub(r"\n{3,}", "\n\n", full)
     return full[:24000]
 
+# Lenient string match helpers
 def levenshtein(a: str, b: str) -> int:
     a, b = a.lower(), b.lower()
     if len(a) < len(b): a, b = b, a
@@ -58,20 +62,13 @@ def levenshtein(a: str, b: str) -> int:
 _PUNCT = str.maketrans("", "", string.punctuation + "–—-")
 STOP = {"the","a","an","to","of","in","on","for","and","or"}
 SYN = {
-    "oxygen consumption":"oxygen use",
-    "oxygen use":"oxygen consumption",
-    "o2 consumption":"oxygen consumption",
-    "o2 use":"oxygen consumption",
-    "atp production":"atp synthesis",
-    "atp synthesis":"atp production",
-    "proton gradient":"pmf",
-    "pmf":"proton gradient",
-    "electron transport chain":"etc",
-    "etc":"electron transport chain",
-    "activation":"increased activity",
-    "increased activity":"activation",
-    "inhibition":"decreased activity",
-    "decreased activity":"inhibition",
+    "oxygen consumption":"oxygen use","oxygen use":"oxygen consumption",
+    "o2 consumption":"oxygen consumption","o2 use":"oxygen consumption",
+    "atp production":"atp synthesis","atp synthesis":"atp production",
+    "proton gradient":"pmf","pmf":"proton gradient",
+    "electron transport chain":"etc","etc":"electron transport chain",
+    "activation":"increased activity","increased activity":"activation",
+    "inhibition":"decreased activity","decreased activity":"inhibition",
 }
 
 def normalize(s: str) -> str:
@@ -85,190 +82,123 @@ def jaccard(a: set, b: set) -> float:
     return len(a & b) / max(1, len(a | b))
 
 def ok_match(student: str, truth: str) -> bool:
-    """Lenient match: case/punct-insensitive, minor typos, synonyms, and token overlap."""
+    """Lenient: case/punct-insensitive, minor typos, synonyms, token overlap."""
     if not isinstance(student, str) or not isinstance(truth, str):
         return False
     s, t = normalize(student), normalize(truth)
     if not s or not t: return False
     if s == t: return True
-
-    # synonyms mapping (both ways)
     if SYN.get(s) == t or SYN.get(t) == s: return True
-
-    # substring acceptance for short targets
     if len(t) <= 10 and (s in t or t in s): return True
-
-    # edit distance threshold scales with length
     dist = levenshtein(s, t)
     thr = 1 if max(len(s), len(t)) <= 6 else 2
     if dist <= thr: return True
+    return jaccard(token_set(s), token_set(t)) >= 0.6
 
-    # token overlap
-    js = jaccard(token_set(s), token_set(t))
-    return js >= 0.6
+# ================== LLM HELPERS ==================
+@st.cache_data(show_spinner=False)
+def derive_objectives(topic: str, slides: str) -> Dict[str, Any]:
+    """
+    Extract or synthesize concise learning objectives for the topic from slide text.
+    No deeper than slides; broad conceptual outcomes (not micro-trivia).
+    """
+    prompt = f"""
+Slides (condensed excerpt):
+{slides[:18000]}
 
-# ================== LLM PROMPTS ==================
-CRITICAL_CLOZE_INSTRUCTION = """Return JSON ONLY with:
-{
+Topic: "{topic}"
+
+Task: Identify 3–6 concise learning objectives that are appropriate for this topic and consistent with the slide scope.
+- Favor conceptual outcomes (e.g., causal predictions, flow of information/energy, regulation effects).
+- Avoid slide-specific minutiae, numbers, or rare subunits.
+- Output JSON ONLY:
+{{ "objectives": ["...", "...", ...] }}
+""".strip()
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.1,
+        max_tokens=300,
+        response_format={"type":"json_object"},
+        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":prompt}],
+    )
+    return json.loads(resp.choices[0].message.content or "{}")
+
+@st.cache_data(show_spinner=False)
+def build_fitb_from_objectives(topic: str, objectives: List[str], slides: str, difficulty_bucket: str) -> Dict[str, Any]:
+    """
+    Produce 4–6 causal FITB items with **answers** based on the objectives.
+    """
+    diff_hint = {"low":"approachable one-step effects","mid":"two-step causal effects","high":"multi-step yet plain"}[difficulty_bucket]
+    prompt = f"""
+Slides (condensed excerpt):
+{slides[:18000]}
+
+Topic: "{topic}"
+Learning objectives: {json.dumps(objectives, ensure_ascii=False)}
+
+Task: Write a concise fill-in-the-blank (Drag-the-Words style) activity aligned to these objectives.
+- 4–6 items, each one short sentence (≤16 words) with **answer** between double asterisks.
+- Conceptual and causal (e.g., “If Complex IV is inhibited, **oxygen consumption** decreases.”).
+- Use concrete names from slides or general standard terms; no “protein X/Z”.
+- Plain language; if jargon appears, add a brief parenthetical clarifier.
+- Do NOT include any extra fields or commentary.
+
+Return JSON ONLY:
+{{
   "title": "short title",
-  "instructions": "explicit task directions for students",
-  "clozes": [
-    "Short causal sentence with **answer**",
-    "… 4–6 total items"
-  ],
+  "instructions": "explicit task directions",
+  "clozes": ["sentence with **answer**", ...],
   "difficulty": "easy|medium|hard"
-}
+}}
+""".strip()
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.15,
+        max_tokens=900,
+        response_format={"type":"json_object"},
+        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":prompt}],
+    )
+    return json.loads(resp.choices[0].message.content or "{}")
 
-Rules:
-- Use ONLY slide excerpts; if insufficient, you MAY draw on OpenStax Biology to fill small gaps.
-- Prefer approachable causal predictions students can reason about from class:
-  e.g., “If Complex IV is inhibited, **oxygen consumption** decreases.”
-- Avoid obscure subunits, rare cofactors, or exact numbers.
-- Each **answer** is 1–2 common course words (e.g., “ATP production”, “proton gradient”).
-- Keep each sentence short (≤ 16 words).
-- Use plain language with brief clarifiers (e.g., “cathode (negative end)”).
-- Do NOT include extra fields or markdown outside **answer** markers.
-- Never invent placeholders like “protein X/Z”. Use concrete names from slides or OpenStax only.
-"""
+@st.cache_data(show_spinner=False)
+def build_matching_from_objectives(topic: str, objectives: List[str], slides: str, difficulty_bucket: str) -> Dict[str, Any]:
+    """
+    Produce 6–8 pairs (left→right) for drag-and-drop concept matching.
+    """
+    diff_hint = {"low":"foundational matches","mid":"medium matches with subtle distractors","high":"harder multi-step (still plain)"}[difficulty_bucket]
+    prompt = f"""
+Slides (condensed excerpt):
+{slides[:18000]}
 
-MATCHING_INSTRUCTION = """Return JSON ONLY with:
-{
+Topic: "{topic}"
+Learning objectives: {json.dumps(objectives, ensure_ascii=False)}
+
+Task: Create a concise drag-and-drop matching activity (concept → correct target).
+- 6–8 pairs total. Keep phrases short (≤6 words).
+- Conceptual, not trivia (e.g., “RTK always-active → MAPK output increases”).
+- Use concrete names from slides or general standard terms; no “protein X/Z”.
+- Plain language with brief clarifiers if needed.
+
+Return JSON ONLY:
+{{
   "title": "short title",
-  "instructions": "explicit task directions for students",
-  "pairs": [
-    {"left": "short causal prompt", "right": "target/category"},
-    {"left": "...", "right": "..."}
-  ],
+  "instructions": "explicit task directions",
+  "pairs": [{{"left":"...", "right":"..."}}, ...],
   "right_choices": ["all", "unique", "targets"],
   "difficulty": "easy|medium|hard"
-}
-
-Rules:
-- Use ONLY the slide excerpts; if insufficient, you MAY draw on OpenStax Biology to fill small gaps.
-- 6–8 pairs total. Conceptual, not trivia. Example: “RTK always-active → MAPK output increases”.
-- Keep phrases short (≤ 6 words) and precise.
-- Use plain language with brief clarifiers when needed.
-- right_choices must contain every unique target in the pairs.
-- Never invent placeholders like “protein X/Z”. Use concrete names from slides or OpenStax only.
-"""
-
-@st.cache_data(show_spinner=False)
-def ask_llm_for_cloze_cached(topic: str, slides: str, grade_bucket: str) -> Dict[str, Any]:
-    diff_hint = {
-        "low":  "Focus on approachable, single- or two-step causal effects.",
-        "mid":  "Use medium complexity causal effects with two steps.",
-        "high": "Use harder multi-step causal effects, but stay in plain language.",
-    }[grade_bucket]
-    user = f"""
-Topic: "{topic}"
-Slides (excerpt; compacted): {slides[:18000]}
-
-Task: Author a concise, causal fill-in-the-blank activity (Drag-the-Words style). {diff_hint}
-{CRITICAL_CLOZE_INSTRUCTION}
+}}
 """.strip()
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.15,
-        max_tokens=800,
+        max_tokens=900,
         response_format={"type":"json_object"},
-        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":user}],
+        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":prompt}],
     )
     return json.loads(resp.choices[0].message.content or "{}")
 
-@st.cache_data(show_spinner=False)
-def ask_llm_for_matching_cached(topic: str, slides: str, grade_bucket: str) -> Dict[str, Any]:
-    diff_hint = {
-        "low":  "Foundational matches with clear differences.",
-        "mid":  "Medium complexity matches with subtle distractors.",
-        "high": "Harder conceptual matches (multi-step), in plain language.",
-    }[grade_bucket]
-    user = f"""
-Topic: "{topic}"
-Slides (excerpt; compacted): {slides[:18000]}
-
-Task: Author a concise drag-and-drop matching activity (concept → correct target). {diff_hint}
-{MATCHING_INSTRUCTION}
-""".strip()
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.15,
-        max_tokens=800,
-        response_format={"type":"json_object"},
-        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":user}],
-    )
-    return json.loads(resp.choices[0].message.content or "{}")
-
-# ================== H5P (optional downloads) ==================
-def build_h5p_dragtext_zip(title: str, instructions: str, clozes_markdown: List[str]) -> bytes:
-    text_lines = [re.sub(r"\*\*(.+?)\*\*", r"*\1*", s) for s in clozes_markdown]
-    content_json = {
-        "taskDescription": instructions,
-        "textField": "\n".join(text_lines),
-        "overallFeedback": [{"from": 0, "to": 100, "feedback": "Nice work!"}],
-        "behaviour": {"enableRetry": True, "enableSolutionsButton": True, "instantFeedback": True, "caseSensitive": False}
-    }
-    h5p_json = {
-        "title": title,
-        "language": "en",
-        "mainLibrary": "H5P.DragText",
-        "embedTypes": ["div"],
-        "preloadedDependencies": [
-            {"machineName":"H5P.DragText","majorVersion":1,"minorVersion":8},
-            {"machineName":"H5P.JoubelUI","majorVersion":1,"minorVersion":3},
-            {"machineName":"H5P.Transition","majorVersion":1,"minorVersion":0},
-        ],
-    }
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
-        z.writestr("h5p.json", json.dumps(h5p_json, ensure_ascii=False))
-        z.writestr("content/content.json", json.dumps(content_json, ensure_ascii=False))
-    return buf.getvalue()
-
-def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[str,str]]) -> bytes:
-    questions = []
-    all_rights = sorted(list({p["right"] for p in pairs}))
-    for p in pairs:
-        left, right = p["left"], p["right"]
-        distractors = [r for r in all_rights if r != right]
-        random.shuffle(distractors)
-        opts = [right] + distractors[:3]
-        random.shuffle(opts)
-        questions.append({
-            "params": {
-                "question": f"{instructions}<br><b>{left}</b>",
-                "answers": [{"text": o, "correct": o==right, "feedback": ""} for o in opts],
-                "behaviour": {"enableRetry": True, "showSolutionsButton": True}
-            },
-            "library": "H5P.MultiChoice 1.14"
-        })
-    qs_content = {
-        "introPage": {"showIntroPage": False, "startButtonText": "Start"},
-        "title": title,
-        "passPercentage": 0,
-        "behaviour": {"enableRetry": True, "enableSolutionsButton": True},
-        "texts": {"finishButton": "Finish"},
-        "questionSets": [],
-        "questions": questions
-    }
-    h5p_json = {
-        "title": title,
-        "language": "en",
-        "mainLibrary": "H5P.QuestionSet",
-        "embedTypes": ["div"],
-        "preloadedDependencies": [
-            {"machineName":"H5P.QuestionSet","majorVersion":1,"minorVersion":17},
-            {"machineName":"H5P.MultiChoice","majorVersion":1,"minorVersion":14},
-            {"machineName":"H5P.JoubelUI","majorVersion":1,"minorVersion":3},
-        ],
-    }
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
-        z.writestr("h5p.json", json.dumps(h5p_json, ensure_ascii=False))
-        z.writestr("content/content.json", json.dumps(qs_content, ensure_ascii=False))
-    return buf.getvalue()
-
-# ================== INLINE RENDERERS ==================
-def render_inline_cloze(title: str, instructions: str, clozes: List[str], ns: str = "fitb") -> Tuple[int,int]:
+# ================== INLINE RENDERERS (no H5P) ==================
+def render_inline_cloze_typing(title: str, instructions: str, clozes: List[str], ns: str = "fitb") -> Tuple[int,int]:
     state = st.session_state.setdefault(ns, {"answers": {}, "checked": {}, "score": (0, len(clozes))})
     st.subheader(f"🧠 {title}")
     st.write(instructions)
@@ -300,7 +230,7 @@ def render_inline_cloze(title: str, instructions: str, clozes: List[str], ns: st
 
         if i in state["checked"]:
             ok, tshow = state["checked"][i]
-            st.caption(f"Correct: **{tshow or '(no key)'}** — Yours: _{state['answers'].get(i) or '(blank)'}_")
+            st.caption(f"Answer: **{tshow or '(no key)'}** — Yours: _{state['answers'].get(i) or '(blank)'}_")
 
         st.divider()
 
@@ -325,7 +255,6 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
     data = {"title": title, "instructions": instructions, "pairs": pairs, "rights": rights}
     payload = json.dumps(data)
 
-    # IMPORTANT: escape all `${...}` inside f-string -> use ${{...}}
     html = f"""
 <!doctype html>
 <html>
@@ -463,7 +392,6 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
           if (ok) score += 1;
         }});
       }});
-      // Escape ${...} in f-string: use ${{...}}
       scoreBox.textContent = `Score: ${{score}}/${{total}}`;
     }});
   </script>
@@ -480,30 +408,38 @@ if "fitb_state" not in st.session_state:
     st.session_state.fitb_state = None
 if "dnd_state" not in st.session_state:
     st.session_state.dnd_state = None
+if "objectives" not in st.session_state:
+    st.session_state.objectives = []
 
-st.title("🧬 Cell Bio Tutor — Inline DnD + Critical FITB (fast, lenient)")
+st.title("🧬 Cell Bio Tutor — Objectives-First Activities (Inline)")
 
 slides_ok = SLIDES_DIR.exists() and any(Path(p).suffix.lower()==".pdf" for p in glob.glob(str(SLIDES_DIR / "*.pdf")))
 if not slides_ok:
     st.warning("No PDFs found in ./slides. Add your lecture PDFs to a 'slides' folder in the repo.")
 slide_text = extract_text_from_repo_slides() if slides_ok else ""
 
-topic = st.text_input("Topic (e.g., 'RTK signaling', 'Electron transport chain')", value="")
+topic = st.text_input("What topic do you want help with? (e.g., 'RTK signaling', 'Electron transport chain')", value="")
 colA, colB, colC = st.columns(3)
 with colA:
-    want_cloze = st.checkbox("Generate Critical FITB", True)
+    want_fitb = st.checkbox("Lenient Fill-in-the-Blank (typing)", True)   # FIRST activity
 with colB:
-    want_dnd = st.checkbox("Generate True Drag-and-Drop", True)
+    want_dnd = st.checkbox("Concept Matching (drag-and-drop)", True)
 with colC:
-    if st.button("Generate / Refresh Activities"):
+    if st.button("Generate / Refresh"):
         if not slide_text:
             st.error("No slide text detected in ./slides.")
         else:
+            # 1) derive objectives from slides (or sensible general ones within scope)
+            obj = derive_objectives(topic, slide_text).get("objectives", [])[:6]
+            st.session_state.objectives = obj
+
+            # set difficulty from running grade
             g = st.session_state.running_grade
             bucket = "low" if g <= 0.6 else "mid" if g <= 0.85 else "high"
 
-            if want_cloze:
-                cdata = ask_llm_for_cloze_cached(topic, slide_text, bucket)
+            # 2) FITB (lenient typing)
+            if want_fitb:
+                cdata = build_fitb_from_objectives(topic, obj, slide_text, bucket)
                 cl_raw = cdata.get("clozes", []) or []
                 clozes = []
                 for s in cl_raw:
@@ -512,14 +448,15 @@ with colC:
                 clozes = clozes[:6]
                 st.session_state.fitb_state = {
                     "title": cdata.get("title","Causal fill-in-the-blank"),
-                    "instructions": cdata.get("instructions","Predict the missing term in plain language (with brief clarifiers)."),
+                    "instructions": cdata.get("instructions","Predict the missing term in plain language."),
                     "clozes": clozes
                 }
             else:
                 st.session_state.fitb_state = None
 
+            # 3) DnD (concept matching)
             if want_dnd:
-                mdata = ask_llm_for_matching_cached(topic, slide_text, bucket)
+                mdata = build_matching_from_objectives(topic, obj, slide_text, bucket)
                 pairs_raw = mdata.get("pairs", []) or []
                 cleaned = []
                 for p in pairs_raw:
@@ -533,41 +470,32 @@ with colC:
                 rights = sorted(list({p["right"] for p in pairs})) or mdata.get("right_choices", [])
                 st.session_state.dnd_state = {
                     "title": mdata.get("title","Concept → Target (Drag-and-Drop)"),
-                    "instructions": mdata.get("instructions","Drag each prompt to the correct target category (plain language with clarifiers)."),
+                    "instructions": mdata.get("instructions","Drag each prompt to the correct target category."),
                     "pairs": pairs,
                     "rights": rights
                 }
             else:
                 st.session_state.dnd_state = None
 
-# --------- RENDER FITB (from state) ----------
+# --------- SHOW derived objectives (for transparency) ----------
+if st.session_state.objectives:
+    with st.expander("Learning objectives used (from your slides' scope)"):
+        st.markdown("\n".join([f"• {o}" for o in st.session_state.objectives]))
+
+# --------- RENDER FITB FIRST ----------
 if st.session_state.fitb_state:
     fs = st.session_state.fitb_state
     if fs["clozes"]:
-        n_ok, total = render_inline_cloze(fs["title"], fs["instructions"], fs["clozes"], ns="fitb_ns")
+        n_ok, total = render_inline_cloze_typing(fs["title"], fs["instructions"], fs["clozes"], ns="fitb_typing")
         if total > 0:
             st.session_state.running_grade = max(0.0, min(1.0, n_ok/total))
-        try:
-            h5p_bytes = build_h5p_dragtext_zip(fs["title"], fs["instructions"], fs["clozes"])
-            st.download_button("⬇️ Download FITB as H5P (DragText)", data=h5p_bytes,
-                               file_name=re.sub(r'[^a-z0-9]+','_',fs["title"].lower())+".h5p",
-                               mime="application/zip", key="dl_dragtext_fitb_ok")
-        except Exception as e:
-            st.warning(f"Could not build H5P for FITB: {e}")
     else:
         st.warning("No valid FITB items were generated for that topic.")
 
-# --------- RENDER DnD (from state) ----------
+# --------- RENDER DnD SECOND ----------
 if st.session_state.dnd_state:
     ds = st.session_state.dnd_state
     if ds["pairs"] and (ds["rights"] or {p["right"] for p in ds["pairs"]}):
         render_inline_dragdrop(ds["title"], ds["instructions"], ds["pairs"], ds["rights"], height=560)
-        try:
-            qs_bytes = build_h5p_question_set_zip(ds["title"], ds["instructions"], ds["pairs"])
-            st.download_button("⬇️ Download DnD as H5P (QuestionSet)", data=qs_bytes,
-                               file_name=re.sub(r'[^a-z0-9]+','_',ds["title"].lower())+"_qs.h5p",
-                               mime="application/zip", key="dl_qs_dnd_ok")
-        except Exception as e:
-            st.warning(f"Could not build H5P for DnD: {e}")
     else:
-        st.warning("No valid DnD items were generated for that topic.")
+        st.warning("No valid Concept Matching items were generated for that topic.")
