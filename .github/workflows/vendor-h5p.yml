@@ -1,0 +1,58 @@
+name: Vendor H5P runtime into docs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "h5p-standalone version (e.g. 1.4.0 or latest)"
+        required: true
+        default: "1.4.0"
+
+permissions:
+  contents: write   # <-- lets the workflow commit to your repo
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Fetch h5p-standalone tarball
+        run: |
+          set -euo pipefail
+          V="${{ github.event.inputs.version }}"
+          echo "Fetching h5p-standalone@$V from npm registry…"
+          curl -fsSL "https://registry.npmjs.org/h5p-standalone/-/h5p-standalone-${V}.tgz" -o h5p.tgz
+          tar -xzf h5p.tgz
+
+      - name: Copy dist files into docs/
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          test -d package/dist || (echo "No dist/ in tarball" && exit 1)
+          cp package/dist/main.bundle.js docs/main.bundle.js
+          cp package/dist/frame.bundle.js docs/frame.bundle.js
+          if [ -f package/dist/styles/h5p.css ]; then
+            cp package/dist/styles/h5p.css docs/h5p.css
+          elif [ -f package/dist/h5p.css ]; then
+            cp package/dist/h5p.css docs/h5p.css
+          else
+            echo "h5p.css not found in dist" && exit 1
+          fi
+          echo "Staged files:" && ls -l docs
+
+      - name: Commit files to main
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/main.bundle.js docs/frame.bundle.js docs/h5p.css
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Vendor h5p-standalone into docs (CI)"
+            git push origin main
+          fi
