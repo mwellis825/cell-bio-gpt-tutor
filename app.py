@@ -1,501 +1,513 @@
-import os, re, io, json, random, glob, string
-from pathlib import Path
-from typing import List, Dict, Any, Tuple
+# app.py
+# Streamlit prompt-based critical thinking question generator
+# -----------------------------------------------------------------------------
+# IMPORTANT: This app is designed for instructors. It *never* exposes or uses
+# your private exam questions. It only uses in-code templates + your typed prompts.
+#
+# How to run:
+#   1) pip install streamlit
+#   2) streamlit run app.py
+#
+# What it does:
+#   - Accept a topic prompt and learning objectives
+#   - Generate original, exam-style critical thinking questions (MCQ, open, diagram)
+#   - Hide answers in "Student preview" mode
+#   - Export as JSON/CSV for easy reuse (Canvas/H5P prep)
+#
+# No internet calls, no external models.
+# -----------------------------------------------------------------------------
 
 import streamlit as st
-from pypdf import PdfReader
-from openai import OpenAI
+import random, uuid, json, csv, io, datetime, re
+from typing import List, Dict, Any
 
-# ================== CONFIG ==================
-st.set_page_config(page_title="Cell Bio Tutor — Objectives-First FITB + DnD", layout="wide")
+# --------------------------- App Config --------------------------------------
+st.set_page_config(page_title="Critical Thinking Question Generator", page_icon="🧠", layout="wide")
 
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("Missing OPENAI_API_KEY in secrets/environment.")
-client = OpenAI(api_key=OPENAI_API_KEY)
+# --------------------------- Helpers -----------------------------------------
+def new_id(prefix: str = "q") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
-SLIDES_DIR = Path(__file__).parent / "slides"   # put your PDFs here
+def sanitize_lo_text(text: str) -> List[str]:
+    # Split by lines, strip, drop empties
+    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
+    return [x for x in lines if x]
 
-SYSTEM = (
-    "You are a rigorous, supportive Cell Biology tutor. "
-    "Use ONLY the provided slide excerpts as the outer boundary of scope. "
-    "If objectives are unclear, infer concise, standard learning objectives that are consistent with typical Cell Biology coverage, "
-    "but do not go deeper than the slides’ level of detail. "
-    "Favor conceptual, causal reasoning over recall. "
-    "Never invent placeholders like 'protein X/Z'. Use concrete names seen in slides or standard general terms."
-)
+def now_iso() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
 
-# ================== UTILITIES ==================
-@st.cache_data(show_spinner=False)
-def extract_text_from_repo_slides() -> str:
-    pdf_paths = sorted(glob.glob(str(SLIDES_DIR / "*.pdf")))
-    chunks = []
-    for path in pdf_paths:
-        try:
-            with open(path, "rb") as f:
-                r = PdfReader(f)
-                text = "\n".join((p.extract_text() or "") for p in r.pages)
-                chunks.append(text)
-        except Exception as e:
-            st.warning(f"Could not read {Path(path).name}: {e}")
-    full = "\n\n".join(chunks)
-    # compact whitespace
-    full = re.sub(r"[ \t]+", " ", full)
-    full = re.sub(r"\n{3,}", "\n\n", full)
-    return full[:24000]
+def pick_bloom_level() -> str:
+    return random.choice(["apply", "analyze", "evaluate", "create"])
 
-# Lenient string match helpers
-def levenshtein(a: str, b: str) -> int:
-    a, b = a.lower(), b.lower()
-    if len(a) < len(b): a, b = b, a
-    prev = list(range(len(b)+1))
-    for i, ca in enumerate(a, start=1):
-        curr = [i]
-        for j, cb in enumerate(b, start=1):
-            ins = prev[j] + 1
-            dele = curr[j-1] + 1
-            sub = prev[j-1] + (ca != cb)
-            curr.append(min(ins, dele, sub))
-        prev = curr
-    return prev[-1]
+def choice_shuffle(choices: List[str], answer_index: int):
+    order = list(range(len(choices)))
+    random.shuffle(order)
+    new_choices = [choices[i] for i in order]
+    new_answer_index = order.index(answer_index)
+    return new_choices, new_answer_index
 
-_PUNCT = str.maketrans("", "", string.punctuation + "–—-")
-STOP = {"the","a","an","to","of","in","on","for","and","or"}
-SYN = {
-    "oxygen consumption":"oxygen use","oxygen use":"oxygen consumption",
-    "o2 consumption":"oxygen consumption","o2 use":"oxygen consumption",
-    "atp production":"atp synthesis","atp synthesis":"atp production",
-    "proton gradient":"pmf","pmf":"proton gradient",
-    "electron transport chain":"etc","etc":"electron transport chain",
-    "activation":"increased activity","increased activity":"activation",
-    "inhibition":"decreased activity","decreased activity":"inhibition",
-}
+def export_json(questions: List[Dict[str, Any]]) -> bytes:
+    return json.dumps({"generated_at": now_iso(), "questions": questions}, indent=2).encode("utf-8")
 
-def normalize(s: str) -> str:
-    return (s or "").strip().lower().translate(_PUNCT)
+def export_csv(questions: List[Dict[str, Any]]) -> bytes:
+    # Flatten to CSV; choices joined with " || "
+    headers = ["id", "type", "prompt", "choices", "answer_index", "answer_text", "rationale", "los", "cognitive_level", "tags"]
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    for q in questions:
+        choices = " || ".join(q.get("choices", [])) if q.get("choices") else ""
+        answer_idx = q.get("answer_index", "")
+        answer_text = ""
+        if q.get("type") == "mcq" and q.get("choices") and isinstance(answer_idx, int) and 0 <= answer_idx < len(q["choices"]):
+            answer_text = q["choices"][answer_idx]
+        row = [
+            q.get("id",""),
+            q.get("type",""),
+            q.get("prompt","").replace("\n"," ").strip(),
+            choices,
+            answer_idx,
+            answer_text,
+            q.get("rationale","").replace("\n"," ").strip(),
+            " | ".join(q.get("los", [])),
+            q.get("cognitive_level",""),
+            " | ".join(q.get("tags", [])),
+        ]
+        writer.writerow(row)
+    return output.getvalue().encode("utf-8")
 
-def token_set(s: str) -> set:
-    return {w for w in normalize(s).split() if w and w not in STOP}
+# --------------------------- Template Engines --------------------------------
+# Each module returns lists of questions (dicts). We mix MCQ / open / diagram.
+def mk_mcq(prompt: str, choices: List[str], correct_idx: int, rationale: str, los: List[str], tags: List[str]) -> Dict[str, Any]:
+    c, ci = choice_shuffle(choices, correct_idx)
+    return {
+        "id": new_id("mcq"),
+        "type": "mcq",
+        "prompt": prompt.strip(),
+        "choices": c,
+        "answer_index": ci,
+        "rationale": rationale.strip(),
+        "los": los,
+        "cognitive_level": pick_bloom_level(),
+        "tags": tags,
+    }
 
-def jaccard(a: set, b: set) -> float:
-    if not a and not b: return 1.0
-    return len(a & b) / max(1, len(a | b))
+def mk_open(prompt: str, rubric: str, los: List[str], tags: List[str]) -> Dict[str, Any]:
+    return {
+        "id": new_id("open"),
+        "type": "open",
+        "prompt": prompt.strip(),
+        "rationale": rubric.strip(),  # Store suggested rubric in rationale field
+        "los": los,
+        "cognitive_level": pick_bloom_level(),
+        "tags": tags,
+    }
 
-def ok_match(student: str, truth: str) -> bool:
-    """Lenient: case/punct-insensitive, minor typos, synonyms, token overlap."""
-    if not isinstance(student, str) or not isinstance(truth, str):
-        return False
-    s, t = normalize(student), normalize(truth)
-    if not s or not t: return False
-    if s == t: return True
-    if SYN.get(s) == t or SYN.get(t) == s: return True
-    if len(t) <= 10 and (s in t or t in s): return True
-    dist = levenshtein(s, t)
-    thr = 1 if max(len(s), len(t)) <= 6 else 2
-    if dist <= thr: return True
-    return jaccard(token_set(s), token_set(t)) >= 0.6
+def mk_diagram(prompt: str, rubric: str, los: List[str], tags: List[str]) -> Dict[str, Any]:
+    return {
+        "id": new_id("diagram"),
+        "type": "diagram",
+        "prompt": prompt.strip(),
+        "rationale": rubric.strip(),
+        "los": los,
+        "cognitive_level": pick_bloom_level(),
+        "tags": tags,
+    }
 
-# ================== LLM HELPERS ==================
-@st.cache_data(show_spinner=False)
-def derive_objectives(topic: str, slides: str) -> Dict[str, Any]:
-    """
-    Extract or synthesize concise learning objectives for the topic from slide text.
-    No deeper than slides; broad conceptual outcomes (not micro-trivia).
-    """
-    prompt = f"""
-Slides (condensed excerpt):
-{slides[:18000]}
+# --------------------------- Module: Metabolism -------------------------------
+def module_metabolism(lo: List[str], topic: str, n_mcq: int, n_open: int, n_diag: int) -> List[Dict[str, Any]]:
+    qs: List[Dict[str, Any]] = []
+    tags = ["metabolism","mitochondria","glycolysis","TCA","ETC","OxPhos"]
 
-Topic: "{topic}"
+    mcq_templates = [
+        lambda: mk_mcq(
+            prompt=("A cell line shows normal glycolysis but low ATP output despite abundant O₂. "
+                    "Pyruvate accumulates in the cytosol. Which defect best explains this?"),
+            choices=[
+                "Phosphofructokinase-1 is inactive, stopping glycolysis entirely",
+                "The mitochondrial pyruvate carrier is defective",
+                "Complex II cannot oxidize FADH₂",
+                "ATP synthase is hyperactive"
+            ],
+            correct_idx=1,
+            rationale=("Cytosolic pyruvate accumulation with normal glycolysis points to failed mitochondrial import; "
+                       "a defective pyruvate carrier prevents TCA entry and downstream OxPhos."),
+            los=lo, tags=tags),
+        lambda: mk_mcq(
+            prompt=("A drug raises the redox potential of Complex I above that of O₂. Predict the most direct impact."),
+            choices=[
+                "NADH electrons still transfer normally to coenzyme Q",
+                "Electron flow accelerates through the ETC",
+                "NADH electrons cannot pass forward at Complex I, reducing proton pumping",
+                "FADH₂ oxidation at Complex II is also blocked"
+            ],
+            correct_idx=2,
+            rationale=("If Complex I has a higher redox potential than downstream carriers, "
+                       "it cannot donate electrons efficiently; proton pumping from Complex I falls."),
+            los=lo, tags=tags),
+        lambda: mk_mcq(
+            prompt=("A student replaces most carbohydrates with fats; glycolysis rate declines. "
+                    "What happens to oxidative phosphorylation?"),
+            choices=[
+                "Stops entirely because acetyl‑CoA cannot be made without glycolysis",
+                "Continues because β‑oxidation supplies acetyl‑CoA to the TCA cycle",
+                "Continues only if glycolysis supplies NADH",
+                "Slows because fats bypass ATP synthase"
+            ],
+            correct_idx=1,
+            rationale=("β‑oxidation yields acetyl‑CoA that feeds the TCA cycle; ETC/OxPhos can continue using reducing equivalents from fat metabolism."),
+            los=lo, tags=tags),
+        lambda: mk_mcq(
+            prompt=("A protonophore (H⁺ ionophore) is added to cells. Which outcome is MOST likely?"),
+            choices=[
+                "ATP production increases because the gradient forms faster",
+                "Heat production increases as the proton gradient is dissipated",
+                "Electron flow stops immediately at Complex IV",
+                "Glycolysis halts due to excess NAD⁺"
+            ],
+            correct_idx=1,
+            rationale=("Uncouplers collapse ΔpH/Δψ; energy of the gradient is released as heat, reducing ATP synthesis via ATP synthase."),
+            los=lo, tags=tags),
+        lambda: mk_mcq(
+            prompt=("Under low ATP and high O₂, what happens to phosphofructokinase‑1 (PFK‑1) activity and why?"),
+            choices=[
+                "PFK‑1 increases to produce lactate as an alternative energy source",
+                "PFK‑1 increases to keep feeding OxPhos with intermediates",
+                "PFK‑1 decreases because the ATP‑consuming step is restrained when ATP is limited",
+                "PFK‑1 decreases because it is the TCA cycle rate‑limiter"
+            ],
+            correct_idx=2,
+            rationale=("PFK‑1 consumes ATP; when ATP is scarce, PFK‑1 activity is curtailed to conserve ATP, even if O₂ is abundant."),
+            los=lo, tags=tags),
+    ]
 
-Task: Identify 3–6 concise learning objectives that are appropriate for this topic and consistent with the slide scope.
-- Favor conceptual outcomes (e.g., causal predictions, flow of information/energy, regulation effects).
-- Avoid slide-specific minutiae, numbers, or rare subunits.
-- Output JSON ONLY:
-{{ "objectives": ["...", "...", ...] }}
-""".strip()
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.1,
-        max_tokens=300,
-        response_format={"type":"json_object"},
-        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":prompt}],
-    )
-    return json.loads(resp.choices[0].message.content or "{}")
+    open_templates = [
+        lambda: mk_open(
+            prompt=("You disrupt Complex IV completely. Predict effects on: (a) O₂ consumption, "
+                    "(b) proton gradient magnitude, and (c) ATP yield; justify mechanistically."),
+            rubric=("O₂ consumption falls to ~0 as it is the terminal acceptor at Complex IV; "
+                    "proton gradient collapses without continued pumping; ATP via OxPhos drops sharply; "
+                    "cells may rely more on glycolysis/fermentation."),
+            los=lo, tags=tags),
+        lambda: mk_open(
+            prompt=("Cells are supplied abundant glucose, but NAD⁺ regeneration is blocked. "
+                    "Explain what happens to glycolysis and ATP yield. How would enhancing lactate "
+                    "dehydrogenase activity change the outcome?"),
+            rubric=("Without NAD⁺ recycling, GAPDH stalls → glycolysis slows/stops → ATP yield falls. "
+                    "LDH restores NAD⁺ by reducing pyruvate to lactate, permitting glycolysis to continue anaerobically."),
+            los=lo, tags=tags),
+        lambda: mk_open(
+            prompt=("Complex I is mislocalized to the cytosol due to loss of its mitochondrial targeting sequence. "
+                    "Predict consequences for electron flow and ATP synthesis."),
+            rubric=("Mislocalized Complex I cannot contribute to the ETC; fewer protons pumped; Δp declines; "
+                    "ATP synthase output falls; upstream NADH accumulates; potential metabolic rerouting."),
+            los=lo, tags=tags),
+    ]
 
-@st.cache_data(show_spinner=False)
-def build_fitb_from_objectives(topic: str, objectives: List[str], slides: str, difficulty_bucket: str) -> Dict[str, Any]:
-    """
-    Produce 4–6 causal FITB items with **answers** based on the objectives.
-    """
-    diff_hint = {"low":"approachable one-step effects","mid":"two-step causal effects","high":"multi-step yet plain"}[difficulty_bucket]
-    prompt = f"""
-Slides (condensed excerpt):
-{slides[:18000]}
+    diagram_templates = [
+        lambda: mk_diagram(
+            prompt=("On a mitochondrion diagram, (1) indicate where protons accumulate during normal ETC, "
+                    "(2) redraw distribution if ATP synthase is inhibited, and (3) predict NADH oxidation rate."),
+            rubric=("Normal: H⁺ accumulates in the intermembrane space; inhibition increases gradient back‑pressure → "
+                    "ETC slows; NADH oxidation rate decreases due to elevated proton motive force opposing pumping."),
+            los=lo, tags=tags),
+        lambda: mk_diagram(
+            prompt=("Sketch how a protonophore affects the proton gradient across the inner membrane "
+                    "and annotate expected changes in heat vs. ATP output."),
+            rubric=("Gradient is dissipated (similar [H⁺] across membrane); ATP output drops; heat output rises due to uncoupling."),
+            los=lo, tags=tags),
+    ]
 
-Topic: "{topic}"
-Learning objectives: {json.dumps(objectives, ensure_ascii=False)}
+    # Sample seeding quantity
+    for _ in range(min(n_mcq, len(mcq_templates))):
+        qs.append(random.choice(mcq_templates)())
+    for _ in range(min(n_open, len(open_templates))):
+        qs.append(random.choice(open_templates)())
+    for _ in range(min(n_diag, len(diagram_templates))):
+        qs.append(random.choice(diagram_templates)())
 
-Task: Write a concise fill-in-the-blank (Drag-the-Words style) activity aligned to these objectives.
-- 4–6 items, each one short sentence (≤16 words) with **answer** between double asterisks.
-- Conceptual and causal (e.g., “If Complex IV is inhibited, **oxygen consumption** decreases.”).
-- Use concrete names from slides or general standard terms; no “protein X/Z”.
-- Plain language; if jargon appears, add a brief parenthetical clarifier.
-- Do NOT include any extra fields or commentary.
+    return qs
 
-Return JSON ONLY:
-{{
-  "title": "short title",
-  "instructions": "explicit task directions",
-  "clozes": ["sentence with **answer**", ...],
-  "difficulty": "easy|medium|hard"
-}}
-""".strip()
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.15,
-        max_tokens=900,
-        response_format={"type":"json_object"},
-        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":prompt}],
-    )
-    return json.loads(resp.choices[0].message.content or "{}")
+# --------------------------- Module: Cytoskeleton -----------------------------
+def module_cytoskeleton(lo: List[str], topic: str, n_mcq: int, n_open: int, n_diag: int) -> List[Dict[str, Any]]:
+    qs: List[Dict[str, Any]] = []
+    tags = ["cytoskeleton","actin","microtubules","motility","kinesin","dynein"]
 
-@st.cache_data(show_spinner=False)
-def build_matching_from_objectives(topic: str, objectives: List[str], slides: str, difficulty_bucket: str) -> Dict[str, Any]:
-    """
-    Produce 6–8 pairs (left→right) for drag-and-drop concept matching.
-    """
-    diff_hint = {"low":"foundational matches","mid":"medium matches with subtle distractors","high":"harder multi-step (still plain)"}[difficulty_bucket]
-    prompt = f"""
-Slides (condensed excerpt):
-{slides[:18000]}
+    mcq_templates = [
+        lambda: mk_mcq(
+            prompt=("A fibroblast can polymerize actin but cannot depolymerize F‑actin. "
+                    "Which cellular process is MOST impaired?"),
+            choices=["Lamellipodia extension","Filopodia retraction","Stress fiber stability","Directional migration speed"],
+            correct_idx=3,
+            rationale=("Without depolymerization, treadmilling/recycling of G‑actin is limited → slower migration."),
+            los=lo, tags=tags),
+        lambda: mk_mcq(
+            prompt=("Taxol stabilizes microtubules. Which outcome in mitosis is most likely?"),
+            choices=["Accelerated anaphase A","Failure of spindle dynamics and chromosome segregation","Enhanced kinetochore capture","Faster cytokinesis"],
+            correct_idx=1,
+            rationale=("Excess stabilization impairs dynamic instability needed for spindle function and segregation."),
+            los=lo, tags=tags),
+    ]
 
-Topic: "{topic}"
-Learning objectives: {json.dumps(objectives, ensure_ascii=False)}
+    open_templates = [
+        lambda: mk_open(
+            prompt=("A GDP‑dissociation inhibitor (GDI) specific to Rho GTPases is added to migrating cells. "
+                    "Explain effects on actin remodeling and cell movement."),
+            rubric=("GDIs sequester Rho/Rac/Cdc42 in GDP‑bound state → reduced lamellipodia/filopodia dynamics → impaired motility."),
+            los=lo, tags=tags),
+        lambda: mk_open(
+            prompt=("Explain the roles of ATP and Ca²⁺ in skeletal muscle contraction and relaxation."),
+            rubric=("ATP binding releases myosin from actin; hydrolysis cocks head; Pi release drives power stroke; "
+                    "Ca²⁺ binds troponin, moves tropomyosin to expose sites; Ca²⁺ reuptake promotes relaxation."),
+            los=lo, tags=tags),
+    ]
 
-Task: Create a concise drag-and-drop matching activity (concept → correct target).
-- 6–8 pairs total. Keep phrases short (≤6 words).
-- Conceptual, not trivia (e.g., “RTK always-active → MAPK output increases”).
-- Use concrete names from slides or general standard terms; no “protein X/Z”.
-- Plain language with brief clarifiers if needed.
+    diagram_templates = [
+        lambda: mk_diagram(
+            prompt=("Draw focal adhesions and indicate: integrin‑ECM link, actin stress fibers, and direction of traction force "
+                    "during cell migration."),
+            rubric=("Integrins link ECM to actin; acto‑myosin pulls cell body; leading edge protrusion + rear retraction."),
+            los=lo, tags=tags),
+    ]
 
-Return JSON ONLY:
-{{
-  "title": "short title",
-  "instructions": "explicit task directions",
-  "pairs": [{{"left":"...", "right":"..."}}, ...],
-  "right_choices": ["all", "unique", "targets"],
-  "difficulty": "easy|medium|hard"
-}}
-""".strip()
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.15,
-        max_tokens=900,
-        response_format={"type":"json_object"},
-        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":prompt}],
-    )
-    return json.loads(resp.choices[0].message.content or "{}")
+    for _ in range(min(n_mcq, len(mcq_templates))):
+        qs.append(random.choice(mcq_templates)())
+    for _ in range(min(n_open, len(open_templates))):
+        qs.append(random.choice(open_templates)())
+    for _ in range(min(n_diag, len(diagram_templates))):
+        qs.append(random.choice(diagram_templates)())
 
-# ================== INLINE RENDERERS (no H5P) ==================
-def render_inline_cloze_typing(title: str, instructions: str, clozes: List[str], ns: str = "fitb") -> Tuple[int,int]:
-    state = st.session_state.setdefault(ns, {"answers": {}, "checked": {}, "score": (0, len(clozes))})
-    st.subheader(f"🧠 {title}")
-    st.write(instructions)
+    return qs
 
-    for i, s in enumerate(clozes, start=1):
-        parts = re.split(r"\*\*(.+?)\*\*", s)
-        if len(parts) >= 3:
-            before, truth, after = parts[0], parts[1], "".join(parts[2:])
-        else:
-            before, truth, after = s, "", ""
-        st.markdown(f"{i}. {before} **____** {after}")
+# --------------------------- Module: Cell Cycle -------------------------------
+def module_cell_cycle(lo: List[str], topic: str, n_mcq: int, n_open: int, n_diag: int) -> List[Dict[str, Any]]:
+    qs: List[Dict[str, Any]] = []
+    tags = ["cell-cycle","cyclin","cdk","p53","mitosis","meiosis"]
 
-        k_ans = f"{ns}_ans_{i}"
-        k_chk = f"{ns}_chk_{i}"
+    mcq_templates = [
+        lambda: mk_mcq(
+            prompt=("Cyclin E is absent in a cell line. Which checkpoint transition is MOST directly affected?"),
+            choices=["G₂/M","G₁/S","Metaphase/Anaphase","G₀ to G₁ reentry"],
+            correct_idx=1,
+            rationale=("Cyclin E‑CDK2 promotes G₁→S transition; absence arrests before DNA replication."),
+            los=lo, tags=tags),
+        lambda: mk_mcq(
+            prompt=("A nondisjunction event in meiosis I typically results in which gamete outcome?"),
+            choices=["All gametes euploid","Half aneuploid, half euploid","All gametes aneuploid","Only two gametes affected"],
+            correct_idx=2,
+            rationale=("MI nondisjunction missegregates homologs → all four gametes abnormal following meiosis II."),
+            los=lo, tags=tags),
+    ]
 
-        default_val = state["answers"].get(i, "")
-        state["answers"][i] = st.text_input("Your answer:", value=default_val, key=k_ans, label_visibility="collapsed")
+    open_templates = [
+        lambda: mk_open(
+            prompt=("Explain why p53 is called the 'guardian of the genome' with reference to checkpoints and DNA damage responses."),
+            rubric=("p53 halts cycle with damage (e.g., p21 induction), facilitates repair; can trigger apoptosis if damage severe."),
+            los=lo, tags=tags),
+    ]
 
-        cols = st.columns([1,1,6])
-        with cols[0]:
-            if st.button("Check", key=k_chk):
-                student = state["answers"].get(i, "")
-                ok = ok_match(student, truth)
-                state["checked"][i] = (ok, truth)
-        with cols[1]:
-            if i in state["checked"]:
-                ok, _ = state["checked"][i]
-                st.markdown("✅" if ok else "❌")
+    diagram_templates = [
+        lambda: mk_diagram(
+            prompt=("Draw the APC/C activation timeline and annotate how securin degradation triggers separase activation and chromatid separation."),
+            rubric=("APC/C tags securin → separase active → cohesin cleavage → anaphase onset; spindle checkpoint ensures proper attachment."),
+            los=lo, tags=tags),
+    ]
 
-        if i in state["checked"]:
-            ok, tshow = state["checked"][i]
-            st.caption(f"Answer: **{tshow or '(no key)'}** — Yours: _{state['answers'].get(i) or '(blank)'}_")
+    for _ in range(min(n_mcq, len(mcq_templates))):
+        qs.append(random.choice(mcq_templates)())
+    for _ in range(min(n_open, len(open_templates))):
+        qs.append(random.choice(open_templates)())
+    for _ in range(min(n_diag, len(diagram_templates))):
+        qs.append(random.choice(diagram_templates)())
 
-        st.divider()
+    return qs
 
-    if st.button("Check all", key=f"{ns}_check_all"):
-        n_ok = 0
-        for i, s in enumerate(clozes, start=1):
-            truths = re.findall(r"\*\*(.+?)\*\*", s)
-            truth = truths[0] if truths else ""
-            student = state["answers"].get(i, "")
-            ok = ok_match(student, truth)
-            state["checked"][i] = (ok, truth)
-            n_ok += int(ok)
-        state["score"] = (n_ok, len(clozes))
+# --------------------------- Module: Signaling --------------------------------
+def module_signaling(lo: List[str], topic: str, n_mcq: int, n_open: int, n_diag: int) -> List[Dict[str, Any]]:
+    qs: List[Dict[str, Any]] = []
+    tags = ["signaling","RTK","GPCR","PI3K","AKT","MAPK"]
 
-    n_ok, total = state["score"]
-    if state["checked"]:
-        st.info(f"Score: {n_ok}/{total}")
-    return n_ok, total
+    mcq_templates = [
+        lambda: mk_mcq(
+            prompt=("A receptor tyrosine kinase (RTK) dimerizes and autophosphorylates in the absence of ligand. "
+                    "Which downstream effect is MOST consistent?"),
+            choices=[
+                "Transient growth arrest via p53",
+                "Constitutive MAPK activation promoting proliferation",
+                "Increased apoptosis via BAD activation",
+                "Suppressed PI3K‑AKT signaling"
+            ],
+            correct_idx=1,
+            rationale=("Ligand‑independent RTK activation drives Ras/MAPK cascades → pro‑growth signaling."),
+            los=lo, tags=tags),
+        lambda: mk_mcq(
+            prompt=("A mutation renders AKT catalytically inactive. Which effect on cell fate is MOST likely?"),
+            choices=["Enhanced cell survival signaling","Impaired phosphorylation of BAD and increased apoptosis","Constitutive mTOR activation","Unchanged survival pathways"],
+            correct_idx=1,
+            rationale=("AKT normally phosphorylates BAD to inhibit apoptosis; loss of AKT activity tips toward apoptosis."),
+            los=lo, tags=tags),
+    ]
 
-def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,str]], right_choices: List[str], height: int = 560):
-    rights = sorted(list({p["right"] for p in pairs})) or right_choices
-    data = {"title": title, "instructions": instructions, "pairs": pairs, "rights": rights}
-    payload = json.dumps(data)
+    open_templates = [
+        lambda: mk_open(
+            prompt=("Contrast 'fast' vs 'slow' signaling responses with examples of altering protein function vs altering protein abundance."),
+            rubric=("Fast: post‑translational mods/relocation (sec‑min). Slow: transcription/translation (hours). Provide examples."),
+            los=lo, tags=tags),
+    ]
 
-    html = f"""
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<style>
-  body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, sans-serif; margin:0; padding:12px; }}
-  .wrap {{ display:flex; gap:16px; align-items:flex-start; }}
-  .col {{ flex:1; min-width: 260px; }}
-  h2 {{ margin: 0 0 6px 0; font-size: 18px; }}
-  .instructions {{ margin: 4px 0 12px 0; color:#333; font-size: 14px; }}
-  .bank, .zone {{ border:1px solid #d0d7de; border-radius:10px; padding:8px; background:#fff; }}
-  .bank {{ min-height: 64px; display:flex; flex-wrap:wrap; gap:8px; align-content:flex-start; }}
-  .pill {{
-    display:inline-block; padding:4px 8px; border-radius:999px;
-    border:1px solid #c7c7c7; background:#f7f7f8; cursor:grab;
-    font-size:14px; line-height:1.2; white-space:nowrap; user-select:none;
-  }}
-  .pill:active {{ cursor:grabbing; }}
-  .zones {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap:10px; }}
-  .zone {{ min-height: 60px; display:flex; flex-direction:column; gap:6px; }}
-  .zlabel {{ font-size:13px; color:#222; text-align:center; }}
-  .dropbox {{
-    min-height: 38px; display:flex; flex-wrap:wrap; justify-content:center; align-items:center;
-    gap:6px; border:1px dashed #c7c7c7; border-radius:8px; padding:6px; background:#fafafa;
-  }}
-  .over {{ background:#eef7ff; border-color:#8bb6ff; }}
-  .ok {{ border-color:#3fb950; background:#eaffea; }}
-  .bad {{ border-color:#f85149; background:#fff0f0; }}
-  .buttons {{ margin-top: 12px; display:flex; gap:8px; }}
-  .btn {{
-    appearance:none; border:1px solid #d0d7de; background:#fff; padding:6px 10px; border-radius:8px; cursor:pointer;
-    font-size:14px;
-  }}
-  .btn:hover {{ background:#f3f4f6; }}
-  .score {{ margin-top:8px; font-size:14px; }}
-</style>
-</head>
-<body>
-  <h2>🧩 {title}</h2>
-  <div class="instructions">{instructions}</div>
-  <div class="wrap">
-    <div class="col">
-      <div class="zlabel"><b>Draggables</b></div>
-      <div id="bank" class="bank" aria-label="Draggables bank"></div>
-      <div class="buttons">
-        <button id="reset" class="btn">Reset</button>
-        <button id="check" class="btn">Check answers</button>
-      </div>
-      <div id="score" class="score"></div>
-    </div>
-    <div class="col">
-      <div class="zlabel"><b>Drop zones</b></div>
-      <div id="zones" class="zones"></div>
-    </div>
-  </div>
+    diagram_templates = [
+        lambda: mk_diagram(
+            prompt=("Sketch PI3K‑AKT signaling from RTK activation to BAD inhibition and indicate intervention points for targeted therapy."),
+            rubric=("RTK→PI3K→PIP₃→AKT activation→phospho‑BAD→pro‑survival; interventions: RTK inhibitors, PI3K inhibitors, AKT inhibitors."),
+            los=lo, tags=tags),
+    ]
 
-  <script id="data" type="application/json">{payload}</script>
-  <script>
-    const data = JSON.parse(document.getElementById('data').textContent);
-    const pairs = Array.isArray(data.pairs) ? data.pairs : [];
-    const rights = Array.isArray(data.rights) ? data.rights : [];
+    for _ in range(min(n_mcq, len(mcq_templates))):
+        qs.append(random.choice(mcq_templates)())
+    for _ in range(min(n_open, len(open_templates))):
+        qs.append(random.choice(open_templates)())
+    for _ in range(min(n_diag, len(diagram_templates))):
+        qs.append(random.choice(diagram_templates)())
 
-    const bank = document.getElementById('bank');
-    const zones = document.getElementById('zones');
-    const scoreBox = document.getElementById('score');
+    return qs
 
-    pairs.forEach((p, i) => {{
-      if (!p || !p.left || !p.right) return;
-      const pill = document.createElement('div');
-      pill.className = 'pill';
-      pill.textContent = p.left;
-      pill.setAttribute('draggable', 'true');
-      pill.id = 'drag_' + i;
-      pill.dataset.answer = p.right;
-      pill.addEventListener('dragstart', ev => {{
-        ev.dataTransfer.setData('text/plain', pill.id);
-      }});
-      bank.appendChild(pill);
-    }});
+# --------------------------- Router -------------------------------------------
+def route_topic_to_modules(topic: str) -> List[str]:
+    t = topic.lower()
+    modules = []
+    if any(k in t for k in ["glycolysis","mitochond","tca","oxidative","oxphos","electron transport","metab"]):
+        modules.append("metabolism")
+    if any(k in t for k in ["actin","microtubule","kinesin","dynein","cytoskeleton","migration","muscle"]):
+        modules.append("cytoskeleton")
+    if any(k in t for k in ["cell cycle","cyclin","cdk","p53","mitosis","meiosis","checkpoint"]):
+        modules.append("cell_cycle")
+    if any(k in t for k in ["signal","rtk","gpcr","pi3k","akt","mapk","erk","ras"]):
+        modules.append("signaling")
+    # Default: if nothing matches, include metabolism as a safe example
+    if not modules:
+        modules.append("metabolism")
+    return modules
 
-    rights.forEach((r) => {{
-      if (!r) return;
-      const z = document.createElement('div');
-      z.className = 'zone';
-      z.dataset.target = r;
+def build_questions(topic: str, los: List[str], n_mcq: int, n_open: int, n_diag: int, seed: int) -> List[Dict[str, Any]]:
+    random.seed(seed)
+    modules = route_topic_to_modules(topic)
+    per_mod_mcq = max(0, n_mcq // len(modules)) if modules else 0
+    per_mod_open = max(0, n_open // len(modules)) if modules else 0
+    per_mod_diag = max(0, n_diag // len(modules)) if modules else 0
 
-      const lab = document.createElement('div');
-      lab.className = 'zlabel';
-      lab.textContent = r;
+    questions: List[Dict[str, Any]] = []
+    for m in modules:
+        if m == "metabolism":
+            questions.extend(module_metabolism(los, topic, per_mod_mcq, per_mod_open, per_mod_diag))
+        elif m == "cytoskeleton":
+            questions.extend(module_cytoskeleton(los, topic, per_mod_mcq, per_mod_open, per_mod_diag))
+        elif m == "cell_cycle":
+            questions.extend(module_cell_cycle(los, topic, per_mod_mcq, per_mod_open, per_mod_diag))
+        elif m == "signaling":
+            questions.extend(module_signaling(los, topic, per_mod_mcq, per_mod_open, per_mod_diag))
 
-      const box = document.createElement('div');
-      box.className = 'dropbox';
-      box.addEventListener('dragover', ev => {{ ev.preventDefault(); box.classList.add('over'); }});
-      box.addEventListener('dragleave', () => box.classList.remove('over'));
-      box.addEventListener('drop', ev => {{
-        ev.preventDefault(); box.classList.remove('over');
-        const id = ev.dataTransfer.getData('text/plain');
-        const el = document.getElementById(id);
-        if (el) {{
-          el.classList.remove('ok','bad');
-          box.appendChild(el);
-        }}
-      }});
+    # If integer division truncated, top-up with metabolism templates
+    short_mcq = n_mcq - sum(1 for q in questions if q["type"]=="mcq")
+    short_open = n_open - sum(1 for q in questions if q["type"]=="open")
+    short_diag = n_diag - sum(1 for q in questions if q["type"]=="diagram")
+    if short_mcq > 0: questions.extend(module_metabolism(los, topic, short_mcq, 0, 0))
+    if short_open > 0: questions.extend(module_metabolism(los, topic, 0, short_open, 0))
+    if short_diag > 0: questions.extend(module_metabolism(los, topic, 0, 0, short_diag))
 
-      z.appendChild(lab);
-      z.appendChild(box);
-      zones.appendChild(z);
-    }});
+    # Attach topic tag to all
+    for q in questions:
+        q.setdefault("tags", []).append(topic.strip())
+    return questions
 
-    bank.addEventListener('dragover', ev => {{ ev.preventDefault(); bank.classList.add('over'); }});
-    bank.addEventListener('dragleave', () => bank.classList.remove('over'));
-    bank.addEventListener('drop', ev => {{
-      ev.preventDefault(); bank.classList.remove('over');
-      const id = ev.dataTransfer.getData('text/plain');
-      const el = document.getElementById(id);
-      if (el) {{ el.classList.remove('ok','bad'); bank.appendChild(el); }}
-    }});
+# --------------------------- UI ----------------------------------------------
+with st.sidebar:
+    st.title("🧪 Instructor Controls")
+    st.caption("This tool generates **original** critical‑thinking questions from your prompts. "
+               "It never reveals your private exam questions.")
+    instructor_mode = st.toggle("Instructor mode (show answers & rationales)", True)
+    seed = st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1)
+    st.markdown("---")
+    st.markdown("**Export settings**")
+    add_timestamp = st.checkbox("Append timestamp to export filenames", True)
 
-    document.getElementById('reset').addEventListener('click', () => {{
-      scoreBox.textContent = '';
-      document.querySelectorAll('.pill').forEach(el => bank.appendChild(el));
-      document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
-    }});
+st.title("🧠 Critical Thinking Question Generator (Prompt‑based)")
+st.write("Enter a topic and (optionally) learning objectives. Choose quantities for each question type, then **Generate**.")
 
-    document.getElementById('check').addEventListener('click', () => {{
-      let score = 0, total = pairs.length;
-      document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
-      document.querySelectorAll('.zone').forEach(zone => {{
-        const target = zone.dataset.target;
-        zone.querySelectorAll('.pill').forEach(pill => {{
-          const ok = (pill.dataset.answer === target);
-          pill.classList.add(ok ? 'ok' : 'bad');
-          if (ok) score += 1;
-        }});
-      }});
-      scoreBox.textContent = `Score: ${{score}}/${{total}}`;
-    }});
-  </script>
-</body>
-</html>
-    """.strip()
-
-    st.components.v1.html(html, height=height, scrolling=True)
-
-# ================== APP STATE & UI ==================
-if "running_grade" not in st.session_state:
-    st.session_state.running_grade = 0.7
-if "fitb_state" not in st.session_state:
-    st.session_state.fitb_state = None
-if "dnd_state" not in st.session_state:
-    st.session_state.dnd_state = None
-if "objectives" not in st.session_state:
-    st.session_state.objectives = []
-
-st.title("🧬 Cell Bio Tutor — Objectives-First Activities (Inline)")
-
-slides_ok = SLIDES_DIR.exists() and any(Path(p).suffix.lower()==".pdf" for p in glob.glob(str(SLIDES_DIR / "*.pdf")))
-if not slides_ok:
-    st.warning("No PDFs found in ./slides. Add your lecture PDFs to a 'slides' folder in the repo.")
-slide_text = extract_text_from_repo_slides() if slides_ok else ""
-
-topic = st.text_input("What topic do you want help with? (e.g., 'RTK signaling', 'Electron transport chain')", value="")
-colA, colB, colC = st.columns(3)
+colA, colB = st.columns([2,1])
 with colA:
-    want_fitb = st.checkbox("Lenient Fill-in-the-Blank (typing)", True)   # FIRST activity
+    topic = st.text_input("Topic prompt (e.g., 'Glycolysis → TCA → OxPhos' or 'PI3K‑AKT survival signaling')",
+                          value="Glycolysis, TCA cycle, and Oxidative Phosphorylation")
 with colB:
-    want_dnd = st.checkbox("Concept Matching (drag-and-drop)", True)
-with colC:
-    if st.button("Generate / Refresh"):
-        if not slide_text:
-            st.error("No slide text detected in ./slides.")
-        else:
-            # 1) derive objectives from slides (or sensible general ones within scope)
-            obj = derive_objectives(topic, slide_text).get("objectives", [])[:6]
-            st.session_state.objectives = obj
+    st.info("Tip: Include keywords (e.g., 'actin', 'cyclin', 'RTK') to route templates to the right module(s).")
 
-            # set difficulty from running grade
-            g = st.session_state.running_grade
-            bucket = "low" if g <= 0.6 else "mid" if g <= 0.85 else "high"
+lo_text = st.text_area("Learning objectives (optional, one per line)",
+                       value="Predict effects of inhibitors on ETC and ATP synthesis\nConnect substrate flux to redox carriers and ATP yield\nDistinguish fast vs slow signaling responses",
+                       height=120)
+n_mcq = st.number_input("Number of MCQs", min_value=0, max_value=50, value=5, step=1)
+n_open = st.number_input("Number of open responses", min_value=0, max_value=50, value=3, step=1)
+n_diag = st.number_input("Number of diagram/prediction prompts", min_value=0, max_value=50, value=2, step=1)
 
-            # 2) FITB (lenient typing)
-            if want_fitb:
-                cdata = build_fitb_from_objectives(topic, obj, slide_text, bucket)
-                cl_raw = cdata.get("clozes", []) or []
-                clozes = []
-                for s in cl_raw:
-                    if isinstance(s, str) and "**" in s and not re.search(r"\bprotein [xz]\b", s, re.I):
-                        clozes.append(s if len(s) <= 140 else s[:140].rstrip(". ") + "…")
-                clozes = clozes[:6]
-                st.session_state.fitb_state = {
-                    "title": cdata.get("title","Causal fill-in-the-blank"),
-                    "instructions": cdata.get("instructions","Predict the missing term in plain language."),
-                    "clozes": clozes
-                }
-            else:
-                st.session_state.fitb_state = None
+gen_btn = st.button("🚀 Generate Questions")
 
-            # 3) DnD (concept matching)
-            if want_dnd:
-                mdata = build_matching_from_objectives(topic, obj, slide_text, bucket)
-                pairs_raw = mdata.get("pairs", []) or []
-                cleaned = []
-                for p in pairs_raw:
-                    if isinstance(p, dict) and p.get("left") and p.get("right"):
-                        if re.search(r"\bprotein [xz]\b", p["left"], re.I) or re.search(r"\bprotein [xz]\b", p["right"], re.I):
-                            continue
-                        left = p["left"][:40] + ("…" if len(p["left"])>40 else "")
-                        right = p["right"][:40] + ("…" if len(p["right"])>40 else "")
-                        cleaned.append({"left": left, "right": right})
-                pairs = cleaned[:8]
-                rights = sorted(list({p["right"] for p in pairs})) or mdata.get("right_choices", [])
-                st.session_state.dnd_state = {
-                    "title": mdata.get("title","Concept → Target (Drag-and-Drop)"),
-                    "instructions": mdata.get("instructions","Drag each prompt to the correct target category."),
-                    "pairs": pairs,
-                    "rights": rights
-                }
-            else:
-                st.session_state.dnd_state = None
+questions: List[Dict[str, Any]] = []
+if gen_btn:
+    los = sanitize_lo_text(lo_text)
+    questions = build_questions(topic, los, n_mcq, n_open, n_diag, seed)
+    st.success(f"Generated {len(questions)} questions.")
 
-# --------- SHOW derived objectives (for transparency) ----------
-if st.session_state.objectives:
-    with st.expander("Learning objectives used (from your slides' scope)"):
-        st.markdown("\n".join([f"• {o}" for o in st.session_state.objectives]))
+if questions:
+    st.markdown("### Preview")
+    st.caption("Student preview hides answers/rationales unless revealed. Toggle Instructor mode in the sidebar.")
 
-# --------- RENDER FITB FIRST ----------
-if st.session_state.fitb_state:
-    fs = st.session_state.fitb_state
-    if fs["clozes"]:
-        n_ok, total = render_inline_cloze_typing(fs["title"], fs["instructions"], fs["clozes"], ns="fitb_typing")
-        if total > 0:
-            st.session_state.running_grade = max(0.0, min(1.0, n_ok/total))
-    else:
-        st.warning("No valid FITB items were generated for that topic.")
+    for i, q in enumerate(questions, start=1):
+        with st.expander(f"{i}. ({q['type'].upper()}) {q['prompt'][:120]}{'...' if len(q['prompt'])>120 else ''}", expanded=False):
+            st.write(q["prompt"])
+            if q["type"] == "mcq":
+                # Show choices without grading (preview only)
+                st.radio("Choices:", q["choices"], index=None, key=q["id"]+"_choice", label_visibility="collapsed")
+                if instructor_mode:
+                    ans = q["choices"][q["answer_index"]]
+                    st.markdown(f"**Answer:** {ans}")
+                    st.markdown(f"**Rationale:** {q.get('rationale','')}")
+                else:
+                    if st.toggle("Reveal answer", key=q["id"]+"_rev"):
+                        ans = q["choices"][q["answer_index"]]
+                        st.markdown(f"**Answer:** {ans}")
+                        st.markdown(f"**Rationale:** {q.get('rationale','')}")
 
-# --------- RENDER DnD SECOND ----------
-if st.session_state.dnd_state:
-    ds = st.session_state.dnd_state
-    if ds["pairs"] and (ds["rights"] or {p["right"] for p in ds["pairs"]}):
-        render_inline_dragdrop(ds["title"], ds["instructions"], ds["pairs"], ds["rights"], height=560)
-    else:
-        st.warning("No valid Concept Matching items were generated for that topic.")
+            else:  # open or diagram
+                st.text_area("Student response space (preview):", value="", height=100, key=q["id"]+"_resp")
+                if instructor_mode:
+                    st.markdown(f"**Suggested rubric / solution notes:** {q.get('rationale','')}")
+                else:
+                    if st.toggle("Reveal rubric", key=q["id"]+"_rub"):
+                        st.markdown(f"**Suggested rubric / solution notes:** {q.get('rationale','')}")
+
+            # Meta
+            meta_cols = st.columns(3)
+            with meta_cols[0]:
+                st.caption(f"**Bloom:** {q.get('cognitive_level','')}")
+            with meta_cols[1]:
+                st.caption(f"**LOs:** {', '.join(q.get('los', [])) or '—'}")
+            with meta_cols[2]:
+                st.caption(f"**Tags:** {', '.join(q.get('tags', []))}")
+
+    # ------------------- Export -------------------
+    st.markdown("---")
+    st.subheader("Export")
+    fname_base = "question_bank"
+    if add_timestamp:
+        fname_base += "_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_bytes = export_json(questions)
+    csv_bytes = export_csv(questions)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("⬇️ Download JSON", data=json_bytes, file_name=f"{fname_base}.json", mime="application/json")
+    with col2:
+        st.download_button("⬇️ Download CSV", data=csv_bytes, file_name=f"{fname_base}.csv", mime="text/csv")
+
+# --------------------------- Footer ------------------------------------------
+st.markdown("---")
+st.caption("Instructor note: This app uses only on‑device templates + your prompts. "
+           "It does not reveal or reuse private exam content. Customize question text freely.")
