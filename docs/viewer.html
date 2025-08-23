@@ -2,72 +2,77 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>H5P Viewer (multi-source fallback)</title>
+  <title>H5P Viewer (debug eval)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- No CSP while debugging; add later if needed -->
-  <link rel="stylesheet" href="./h5p.css" />
   <style>
     html,body{margin:0;height:100%;background:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
     #app{min-height:100vh}
-    .err{color:#b00;padding:1rem;line-height:1.4}
+    .err{color:#b00;padding:1rem;line-height:1.5}
     .hint{padding:.75rem 1rem;background:#f6f8fa;border:1px solid #e5e7eb;border-radius:.5rem;margin:1rem}
     code{background:#f3f4f6;padding:0 .25rem;border-radius:.25rem}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f9fafb;border:1px solid #e5e7eb;border-radius:.5rem;padding:.75rem;margin:1rem}
   </style>
   <script>
-    // Utility
-    function qp(n){ const u = new URL(location.href); return u.searchParams.get(n); }
-    function loadScript(src){
-      return new Promise((resolve,reject)=>{
-        const s=document.createElement('script');
-        s.src = src + (src.includes('?') ? '&' : '?') + 'cb=' + Date.now(); // cache-bust
-        s.onload=()=>{ console.log('Loaded:', src); resolve(src); };
-        s.onerror=()=>reject(new Error('Failed to load: ' + src));
-        document.head.appendChild(s);
-      });
+    // Loud error reporting
+    window.addEventListener('error', e => {
+      console.error('window.onerror:', e.error || e.message || e);
+      const app = document.getElementById('app');
+      app.innerHTML = '<div class="err">Runtime error: '+(e.message||e)+'</div>';
+    });
+    window.addEventListener('unhandledrejection', e => {
+      console.error('unhandledrejection:', e.reason || e);
+      const app = document.getElementById('app');
+      app.innerHTML = '<div class="err">Unhandled promise rejection: '+(e.reason?.message||e)+'</div>';
+    });
+
+    function qp(n){ const u=new URL(location.href); return u.searchParams.get(n); }
+
+    async function fetchText(url) {
+      const r = await fetch(url + (url.includes('?') ? '&' : '?') + 'cb=' + Date.now(), { cache: 'no-store' });
+      if (!r.ok) throw new Error('Fetch failed: ' + url + ' (' + r.status + ')');
+      const ct = r.headers.get('content-type') || '';
+      console.log('Fetched', url, 'content-type=', ct);
+      const txt = await r.text();
+      console.log('First 80 chars of', url, '=>', JSON.stringify(txt.slice(0,80)));
+      console.log('Length of', url, '=>', txt.length);
+      return txt;
     }
 
-    // Try a list of sources in order until one works
-    async function loadWithFallback(sources, label){
-      let lastErr;
-      for (const src of sources){
-        try { return await loadScript(src); }
-        catch(e){ console.warn(label, e.message); lastErr = e; }
+    function evalGlobal(js, label) {
+      try {
+        // Evaluate in global scope
+        (0, eval)(js);
+        console.log('Eval OK ('+label+')');
+        return true;
+      } catch (e) {
+        console.error('Eval ERROR ('+label+'):', e);
+        const app = document.getElementById('app');
+        app.insertAdjacentHTML('beforeend', '<pre><strong>Eval error in '+label+':</strong>\n'+(e.stack||e)+'</pre>');
+        return false;
       }
-      throw lastErr || new Error('No '+label+' source worked');
     }
 
     async function boot(){
       const app = document.getElementById('app');
-      const src = qp('src'); // .h5p URL (or data:application/zip;base64,...)
-      if(!src){
+      const src = qp('src');
+      if (!src) {
         app.innerHTML = '<div class="hint">No H5P source. Use <code>?src=&lt;url-to-your.h5p&gt;</code> or a <code>data:application/zip;base64,...</code> URL.</div>';
         return;
       }
 
-      // Where to load bundles from (in order)
-      const MAIN_SOURCES = [
-        './main.bundle.js',
-        'https://unpkg.com/h5p-standalone@1.3.0/dist/main.bundle.js',
-        'https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/main.bundle.js',
-        'https://raw.githubusercontent.com/tunapanda/h5p-standalone/1.3.0/dist/main.bundle.js'
-      ];
-      const FRAME_SOURCES = [
-        './frame.bundle.js',
-        'https://unpkg.com/h5p-standalone@1.3.0/dist/frame.bundle.js',
-        'https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/frame.bundle.js',
-        'https://raw.githubusercontent.com/tunapanda/h5p-standalone/1.3.0/dist/frame.bundle.js'
-      ];
-
-      // Load bundles with fallback
+      // 1) Fetch local bundles as text and eval them
+      let mainJs, frameJs;
       try {
-        await loadWithFallback(MAIN_SOURCES, 'main.bundle.js');
-        await loadWithFallback(FRAME_SOURCES, 'frame.bundle.js');
-      } catch(e){
-        app.innerHTML = '<p class="err">'+e.message+'<br/>Check network/CSP and that at least one source is reachable.</p>';
+        mainJs = await fetchText('./main.bundle.js');
+        frameJs = await fetchText('./frame.bundle.js');
+      } catch (e) {
+        app.innerHTML = '<div class="err">'+(e.message||e)+'</div>';
         return;
       }
 
-      // Detect global
+      if (!evalGlobal(mainJs, 'main.bundle.js')) return;
+      if (!evalGlobal(frameJs, 'frame.bundle.js')) return;
+
       console.log('typeof H5PStandalone =', typeof window.H5PStandalone);
       console.log('typeof window["h5p-standalone"] =', typeof window['h5p-standalone']);
 
@@ -81,13 +86,11 @@
           catch(e){ app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>'; }
         } else if (tries < 240) { setTimeout(waitReady, 50); }
         else {
-          app.innerHTML = '<p class="err">H5P API not ready. If both globals are "undefined", all bundle sources failed to execute. Open DevTools → Network to see which loads failed and why.</p>';
+          app.innerHTML = '<p class="err">H5P API not ready. Both globals are undefined after eval; see console output and any eval errors above.</p>';
         }
       })();
     }
 
-    // Catch unhandled errors so they show up clearly
-    window.addEventListener('error', e => console.error('Window error:', e.error || e.message || e));
     document.addEventListener('DOMContentLoaded', boot);
   </script>
 </head>
