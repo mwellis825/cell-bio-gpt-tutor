@@ -1,32 +1,41 @@
 # app.py
-# Study Mode (Slides Auto): Two activities + auto-LOs from ./slides
-# -----------------------------------------------------------------------------
-# Features:
-# - Scans ./slides for text-based slide exports (.txt, .md, .html). Optional .pdf if PyPDF2 available.
-# - Extracts Learning Objectives (LOs) with simple heuristics; no student entry.
-# - Generates two activities: (1) Fill-in-the-Blank (lenient), (2) Drag-the-Words.
-# - Instructor mode toggles answer keys and enables JSON export.
-# - Fully offline; no external calls.
+# Study Mode (Slides from GitHub repo, PDF-friendly)
+# -------------------------------------------------------------------
+# Two activities only:
+#   1) Fill-in-the-Blank (lenient; critical thinking)
+#   2) Drag-the-Words (word bank -> blanks)
+#
+# Automatically uses slides from ./slides (PDF, txt, md, html).
+# Extracts Learning Objectives (LOs) from slide text.
 #
 # Run:
-#   pip install streamlit
+#   pip install streamlit PyPDF2   # or pip install pypdf
 #   streamlit run app.py
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
 
 import streamlit as st
 import os, re, uuid, datetime, json, pathlib
 
-st.set_page_config(page_title="Study Mode (Slides Auto)", page_icon="🗂️", layout="wide")
+st.set_page_config(page_title="Study Mode (Repo Slides)", page_icon="🗂️", layout="wide")
 
 # -------------------------- Config -------------------------------------------
 SLIDES_DIR = os.path.join(os.getcwd(), "slides")
 SUPPORTED_TEXT_EXTS = {".txt", ".md", ".mdx", ".html", ".htm"}
-PDF_ENABLED = False
+
+PDF_BACKEND = None
+PDF_INFO = ""
 try:
-    import PyPDF2  # optional
-    PDF_ENABLED = True
+    import PyPDF2
+    PDF_BACKEND = "PyPDF2"
+    PDF_INFO = "PDF extraction via PyPDF2"
 except Exception:
-    PDF_ENABLED = False
+    try:
+        import pypdf
+        PDF_BACKEND = "pypdf"
+        PDF_INFO = "PDF extraction via pypdf"
+    except Exception:
+        PDF_BACKEND = None
+        PDF_INFO = "No PDF extractor installed (install PyPDF2 or pypdf)"
 
 # -------------------------- Utilities ----------------------------------------
 def new_id(prefix="id"):
@@ -36,34 +45,45 @@ def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def read_text_file(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
+    for enc in ("utf-8", "latin-1"):
         try:
-            with open(path, "r", encoding="latin-1") as f:
+            with open(path, "r", encoding=enc) as f:
                 return f.read()
         except Exception:
-            return ""
+            continue
+    return ""
 
 def read_pdf_file(path: str) -> str:
-    if not PDF_ENABLED:
-        return ""
-    try:
-        text = []
-        with open(path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                try:
-                    text.append(page.extract_text() or "")
-                except Exception:
-                    pass
-        return "\n".join(text)
-    except Exception:
-        return ""
+    if PDF_BACKEND == "PyPDF2":
+        try:
+            text = []
+            with open(path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    try:
+                        text.append(page.extract_text() or "")
+                    except Exception:
+                        text.append("")
+            return "\n".join(text)
+        except Exception:
+            return ""
+    if PDF_BACKEND == "pypdf":
+        try:
+            text = []
+            with open(path, "rb") as f:
+                reader = pypdf.PdfReader(f)
+                for page in reader.pages:
+                    try:
+                        text.append(page.extract_text() or "")
+                    except Exception:
+                        text.append("")
+            return "\n".join(text)
+        except Exception:
+            return ""
+    return ""
 
 def load_slides_corpus(slides_dir: str):
-    corpus = {}  # {relative_path: text}
+    corpus = {}
     if not os.path.isdir(slides_dir):
         return corpus
     base = pathlib.Path(slides_dir)
@@ -76,4 +96,6 @@ def load_slides_corpus(slides_dir: str):
         if ext in SUPPORTED_TEXT_EXTS:
             text = read_text_file(str(p))
         elif ext == ".pdf":
-            text = rea
+            text = read_pdf_file(str(p))
+        if text and len(text.strip()) > 20:
+            corpus[rel] =
