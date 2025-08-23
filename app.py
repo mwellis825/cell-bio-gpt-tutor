@@ -1,46 +1,43 @@
 # app.py
-# Classic Study Mode — Prompt-based, slides-aware (minimal UI)
+# Prompt-based Study Mode — 4x Fill-in-the-Blank + Drag-to-Bins (click assign)
 # -----------------------------------------------------------------------------
-# 1) User enters a topic prompt.
-# 2) App searches ./slides (PDF/txt/md/html) for relevant content.
-# 3) App extracts learning-objective-like lines to drive question generation.
-# 4) App outputs exactly two activities in this order:
-#       (1) Fill-in-the-Blank (lenient)
-#       (2) Drag-and-Drop (click-to-fill word bank)
+# Flow:
+#   1) User enters a topic prompt.
+#   2) App searches ./slides (PDF/txt/md/html) for relevant decks.
+#   3) Generates:
+#       (A) FOUR lenient fill-in-the-blank items (auto-picked stems & answers)
+#       (B) Drag-to-Bins: word bank on LEFT, labeled bins on RIGHT (click-to-assign)
 #
-# Run:
+# Dependencies:
 #   pip install streamlit
-#   # For PDFs, install one of:
-#   pip install PyPDF2
-#   # or
-#   pip install pypdf
+#   # For PDF text extraction:
+#   pip install PyPDF2   # or: pip install pypdf
 #   streamlit run app.py
 # -----------------------------------------------------------------------------
 
 import streamlit as st
-import os, re, uuid, pathlib
+import os, re, pathlib
 
-st.set_page_config(page_title="Study Mode (Prompt + Slides)", page_icon="📘", layout="wide")
+st.set_page_config(page_title="Study Mode", page_icon="📘", layout="wide")
 
-# -------------------- Config --------------------
 SLIDES_DIR = os.path.join(os.getcwd(), "slides")
 SUPPORTED_TEXT_EXTS = {".txt", ".md", ".mdx", ".html", ".htm"}
 
-# Try lightweight PDF backends (optional)
+# Try PDF parser(s)
 PDF_BACKEND = None
 try:
-    import PyPDF2  # common
+    import PyPDF2
     PDF_BACKEND = "PyPDF2"
 except Exception:
     try:
-        import pypdf  # alternative
+        import pypdf
         PDF_BACKEND = "pypdf"
     except Exception:
         PDF_BACKEND = None
 
-# -------------------- IO Helpers ----------------
+# ----------------------- File IO -----------------------
 def read_text_file(path: str) -> str:
-    for enc in ("utf-8", "latin-1"):
+    for enc in ("utf-8","latin-1"):
         try:
             with open(path, "r", encoding=enc) as f:
                 return f.read()
@@ -51,34 +48,26 @@ def read_text_file(path: str) -> str:
 def read_pdf_file(path: str) -> str:
     if PDF_BACKEND == "PyPDF2":
         try:
-            text = []
             with open(path, "rb") as f:
                 reader = PyPDF2.PdfReader(f)
-                for page in reader.pages:
-                    text.append(page.extract_text() or "")
-            return "\n".join(text)
+                return "\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
     if PDF_BACKEND == "pypdf":
         try:
-            text = []
             with open(path, "rb") as f:
                 reader = pypdf.PdfReader(f)
-                for page in reader.pages:
-                    text.append(page.extract_text() or "")
-            return "\n".join(text)
+                return "\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
     return ""
 
 def load_corpus(slides_dir: str):
-    corpus = {}  # {rel_path: text}
-    if not os.path.isdir(slides_dir):
-        return corpus
+    corpus = {}
+    if not os.path.isdir(slides_dir): return corpus
     base = pathlib.Path(slides_dir)
     for p in base.rglob("*"):
-        if not p.is_file():
-            continue
+        if not p.is_file(): continue
         ext = p.suffix.lower()
         rel = str(p.relative_to(base))
         text = ""
@@ -90,29 +79,30 @@ def load_corpus(slides_dir: str):
             corpus[rel] = text
     return corpus
 
-# -------------------- Search & LO extraction ----------------
+# ---------------------- Search & utility ----------------------
 def tokenize(s: str):
     return re.findall(r"[A-Za-z0-9']+", (s or "").lower())
 
-def simple_match_score(text: str, query_tokens):
-    tks = tokenize(text)
-    if not tks: return 0
-    score = 0
-    bag = {}
-    for tk in tks:
-        bag[tk] = bag.get(tk, 0) + 1
-    for q in query_tokens:
-        score += bag.get(q, 0)
-    return score
+def match_score(text: str, query_tokens):
+    tokens = tokenize(text)
+    if not tokens: return 0
+    counts = {}
+    for t in tokens: counts[t] = counts.get(t,0)+1
+    return sum(counts.get(q,0) for q in query_tokens)
 
-VERBS = [
-    "explain","predict","justify","compare","contrast","distinguish","design","interpret",
-    "evaluate","diagnose","infer","propose","calculate","model","identify",
-    "classify","analyze","synthesize","outline","formulate","apply","assess"
-]
+def normalize(s: str):
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+"," ", s)
+    s = s.replace("’","'")
+    return s
+
+# ---------------------- LO extraction ----------------------
+VERBS = ["explain","predict","justify","compare","contrast","distinguish","design","interpret",
+         "evaluate","diagnose","infer","propose","calculate","model","identify","classify",
+         "analyze","synthesize","outline","formulate","apply","assess"]
+
 def extract_los(text: str):
-    # Prefer LO-like bullets or verb-led lines; fallback to long sentences
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+    lines = [re.sub(r"\s+"," ", ln).strip() for ln in text.splitlines()]
     los = []
     for ln in lines:
         low = ln.lower()
@@ -120,152 +110,216 @@ def extract_los(text: str):
             continue
         bullet = low.startswith(("-","•","—","*")) or re.match(r"^\d+[\).\]]\s", low)
         starts_verb = any(re.match(rf"^\s*({v})\b", low) for v in VERBS)
-        mentions_lo = any(k in low for k in ["learning objective", "objective:", "outcome:"])
+        mentions_lo = any(k in low for k in ["learning objective","objective:","outcome:"])
         if bullet or starts_verb or mentions_lo:
-            cleaned = re.sub(r"^(\d+[\).\]]\s*|[-•—*]\s*)", "", ln).strip()
+            cleaned = re.sub(r"^(\d+[\).\]]\s*|[-•—*]\s*)","", ln).strip()
             if len(cleaned) >= 10:
                 los.append(cleaned)
     if not los:
-        # Fallback: long-ish sentences as pseudo-LOs
+        # Fallback: long-ish sentences
         chunks = re.split(r"(?<=[\.\?\!])\s+", text)
-        los = [c.strip() for c in chunks if len(c.strip()) > 50][:6]
-    # dedupe
-    seen = set(); uniq = []
+        los = [c.strip() for c in chunks if len(c.strip()) > 60][:8]
+    # Deduplicate
+    seen=set(); uniq=[]
     for x in los:
-        k = x.lower()
+        k=x.lower()
         if k not in seen:
             uniq.append(x); seen.add(k)
-    return uniq[:8]
+    return uniq[:12]
 
-# -------------------- Generation (exact two activities) ----------------
-DNA_TERMS = ["helicase","primase","leading strand","lagging strand","okazaki fragments","dna ligase","topoisomerase","ssb","rnase h","dna polymerase iii"]
-
-def detect_topic_from_text(text: str):
-    t = text.lower()
-    if any(k in t for k in ["replication","okazaki","helicase","primase","leading strand","lagging strand","ligase"]):
+# ---------------------- Topic detection ----------------------
+def detect_topic(text_or_prompt: str):
+    t = (text_or_prompt or "").lower()
+    if any(k in t for k in ["dna replication","replication fork","okazaki","helicase","primase","ligase","leading strand","lagging strand"]):
         return "dna_replication"
-    if any(k in t for k in ["glycolysis","tca","oxidative phosphorylation","electron transport","mitochond"]):
+    if any(k in t for k in ["glycolysis","tca","mitochond","electron transport","oxidative phosphorylation"]):
         return "metabolism"
-    if any(k in t for k in ["cell cycle","cdk","cyclin","p53","meiosis","mitosis"]):
+    if any(k in t for k in ["cell cycle","cdk","cyclin","p53","meiosis","mitosis","checkpoint"]):
         return "cell_cycle"
-    if any(k in t for k in ["actin","microtubule","kinesin","dynein","focal adhesion"]):
+    if any(k in t for k in ["actin","microtubule","kinesin","dynein","focal adhesion","myosin"]):
         return "cytoskeleton"
-    if any(k in t for k in ["rtk","gpcr","pi3k","akt","mapk"]):
+    if any(k in t for k in ["rtk","gpcr","pi3k","akt","mapk","erk","ras","second messenger"]):
         return "signaling"
     return "generic"
 
-def make_fitb(lo: str, topic: str):
-    # Lean, specific, lenient answer check; prefer DNA terms if detected.
-    ans = "mechanism"
+# ---------------------- Generators ----------------------
+def make_fitb_set(topic: str):
+    # Return 4 (prompt, accepted_answers[]) items, tailored when possible
+    items = []
     if topic == "dna_replication":
-        low = lo.lower()
-        for term in DNA_TERMS:
-            if term in low:
-                ans = term
-                break
-        if ans == "mechanism":
-            ans = "dna ligase"
-    prompt = f"{lo} — What is the **single most specific factor/mechanism** involved?"
-    return {"prompt": prompt, "answer": ans, "accepted": [ans, ans.lower(), ans.title()]}
+        items = [
+            ("Enzyme that unwinds the parental DNA duplex at the replication fork:", ["helicase"]),
+            ("Enzyme that synthesizes short RNA primers to initiate DNA synthesis:", ["primase","rna primase"]),
+            ("Fragments produced on the lagging strand during discontinuous synthesis:", ["okazaki fragments","okazaki"]),
+            ("Enzyme that seals nicks between adjacent DNA fragments:", ["dna ligase","ligase"]),
+        ]
+    elif topic == "metabolism":
+        items = [
+            ("Complex that accepts electrons from NADH at the start of the ETC:", ["complex i","nadH dehydrogenase","nadh dehydrogenase"]),
+            ("Ion whose gradient powers ATP synthase in mitochondria:", ["proton","h+","hydrogen ion"]),
+            ("Cycle that oxidizes acetyl‑coa to co2 in mitochondria:", ["tca cycle","citric acid cycle","krebs cycle"]),
+            ("Mitochondrial enzyme that synthesizes ATP using the proton-MOTIVE force:", ["atp synthase","f0f1 atp synthase","fof1 atp synthase"]),
+        ]
+    elif topic == "cell_cycle":
+        items = [
+            ("CDK/cyclin complex that promotes G1→S transition:", ["cyclin e-cdk2","cdk2-cyclin e","cyclin e cdk2"]),
+            ("Checkpoint that ensures all chromosomes are attached to the spindle:", ["spindle assembly checkpoint","sac"]),
+            ("Ubiquitin ligase that targets securin to trigger anaphase:", ["apc/c","apc c","anaphase promoting complex"]),
+            ("Tumor suppressor that halts the cell cycle in response to dna damage:", ["p53"]),
+        ]
+    elif topic == "cytoskeleton":
+        items = [
+            ("Motor protein that generally walks toward microtubule plus ends:", ["kinesin"]),
+            ("Motor protein that generally walks toward microtubule minus ends:", ["dynein"]),
+            ("Actin‑binding protein that crosslinks actin into contractile structures with myosin:", ["alpha‑actinin","alpha actinin","α‑actinin","alpha actinins"]),
+            ("Drug that stabilizes microtubules and disrupts mitotic spindle dynamics:", ["taxol","paclitaxel"]),
+        ]
+    else:  # generic fallback
+        items = [
+            ("Name one key regulator of this process:", ["regulator","mechanism"]),
+            ("Identify the rate‑limiting step:", ["rate-limiting","bottleneck"]),
+            ("Name a negative feedback element:", ["feedback","negative feedback"]),
+            ("Name a rescue/recovery mechanism:", ["recovery","redundancy"]),
+        ]
+    return items[:4]
 
-def make_dragwords(topic: str):
+def make_drag_bins(topic: str):
+    # Returns (bins: list of (label, correct_word), bank: list of words)
     if topic == "dna_replication":
-        sentence = ("At the replication fork, ______ unwinds DNA while ______ lays down primers. "
-                    "Continuous synthesis is on the ______, whereas discontinuous synthesis forms ______ "
-                    "that are sealed by ______.")
-        answers = ["helicase","primase","leading strand","okazaki fragments","dna ligase"]
-        bank = list(set(answers + ["topoisomerase","dna polymerase iii","lagging strand","rnase h","proofreading"]))
+        bins = [
+            ("Unwinds duplex DNA", "helicase"),
+            ("Lays down RNA primers", "primase"),
+            ("Continuous synthesis strand", "leading strand"),
+            ("Discontinuous fragments", "okazaki fragments"),
+            ("Seals nicks", "dna ligase"),
+        ]
+        bank = ["helicase","primase","leading strand","lagging strand","okazaki fragments",
+                "dna ligase","topoisomerase","ssb"]
+    elif topic == "metabolism":
+        bins = [
+            ("Accepts electrons from NADH", "complex i"),
+            ("Accepts electrons from FADH2", "complex ii"),
+            ("Pumps protons to IMS", "complex iii"),
+            ("Reduces oxygen to water", "complex iv"),
+            ("Synthesizes ATP", "atp synthase"),
+        ]
+        bank = ["complex i","complex ii","complex iii","complex iv","atp synthase","coq","cytc"]
     else:
-        sentence = ("In this pathway, ______ initiates the process, ______ is rate-limiting, "
-                    "feedback via ______ stabilizes output, and recovery depends on ______.")
-        answers = ["initiator","rate-limiting","feedback","recovery"]
-        bank = list(set(answers + ["mechanism","inhibitor","activator"]))
-    return {"sentence": sentence, "answers": answers, "bank": bank}
+        bins = [
+            ("Initiates process", "initiator"),
+            ("Rate‑limiting step", "rate-limiting"),
+            ("Stabilizing feedback", "feedback"),
+            ("Recovery pathway", "recovery"),
+        ]
+        bank = ["initiator","rate-limiting","feedback","recovery","inhibitor","activator"]
+    return bins, sorted(list(set(bank)), key=lambda x: x.lower())
 
-def normalize(s): return re.sub(r"\s+"," ", (s or "").strip().lower())
-def check_fitb(user, accepted): return normalize(user) in [normalize(a) for a in accepted]
-
-# -------------------- UI (minimal; exact order) ----------------
+# ---------------------- UI ----------------------
 st.title("📘 Study Mode — Prompt + Slides")
-st.caption("Enter a topic prompt. The app searches your existing slides and generates two activities in order: Fill-in-the-Blank, then Drag-and-Drop.")
+st.caption("Enter a topic; the app searches your slides and generates 4x Fill‑in‑the‑Blank, then Drag‑to‑Bins.")
 
-prompt = st.text_input("Enter a topic prompt (e.g., 'DNA Replication', 'RTK signaling', 'Cell cycle checkpoints')", value="DNA Replication")
-go = st.button("Generate")
-
-# Load once per session
-if "corpus" not in st.session_state:
-    st.session_state.corpus = load_corpus(SLIDES_DIR)
-
-if go:
+prompt = st.text_input("Topic prompt", value="DNA Replication")
+if st.button("Generate"):
+    if "corpus" not in st.session_state:
+        st.session_state.corpus = load_corpus(SLIDES_DIR)
     corpus = st.session_state.corpus
+
     if not corpus:
-        st.error("No slides found or unable to read from `./slides`. Add slides or install a PDF parser (PyPDF2/pypdf).")
+        st.error("No slides found or unable to read PDFs. Add slides to `./slides` and/or install PyPDF2/pypdf.")
     else:
-        q_toks = tokenize(prompt)
-        ranked = sorted(corpus.items(), key=lambda kv: simple_match_score(kv[1], q_toks), reverse=True)
-        best_text = ranked[0][1] if ranked else ""
-        topic = detect_topic_from_text(best_text or prompt)
-        los = extract_los(best_text or prompt)
-        # choose first LO for FITB; if missing, create a generic one
-        fitb_source = los[0] if los else f"Explain the main constraint in {prompt}."
-        fitb_item = make_fitb(fitb_source, topic)
-        drag_item = make_dragwords(topic)
-        st.session_state["activities"] = {"fitb": fitb_item, "drag": drag_item}
+        q_tokens = tokenize(prompt)
+        ranked = sorted(corpus.items(), key=lambda kv: match_score(kv[1], q_tokens), reverse=True)
+        text_best = ranked[0][1] if ranked else ""
+        topic = detect_topic(text_best + " " + prompt)
+        st.session_state.topic = topic
 
-data = st.session_state.get("activities")
-if data:
-    # 1) Fill-in-the-Blank (first)
-    st.markdown("## Activity 1: Fill-in-the-Blank")
-    st.write(data["fitb"]["prompt"])
-    user_ans = st.text_input("Your answer:", key="fitb_ans")
-    if st.button("Check answer"):
-        st.success("✅ Correct!") if check_fitb(user_ans, data["fitb"]["accepted"]) else st.error("❌ Not quite. Aim for the most specific term.")
+        # Build FITB
+        fitb_items = make_fitb_set(topic)
+        st.session_state.fitb = [{"prompt": p, "accepted": a} for (p,a) in fitb_items]
 
-    # 2) Drag-and-Drop (second)
+        # Build Drag bins
+        bins, bank = make_drag_bins(topic)
+        st.session_state.drag_bins = [{"label": lbl, "correct": ans, "current": None} for (lbl, ans) in bins]
+        st.session_state.drag_bank = bank
+        st.success(f"Generated activities for topic: **{topic.replace('_',' ').title()}**")
+
+# Render activities if available
+if "fitb" in st.session_state and "drag_bins" in st.session_state:
+    # ---------- Activity A: 4x Fill-in-the-Blank ----------
+    st.markdown("## Activity 1: Fill‑in‑the‑Blank")
+    for i, item in enumerate(st.session_state.fitb, start=1):
+        colq, cola = st.columns([2.5, 1.5])
+        with colq:
+            st.write(f"**Q{i}.** {item['prompt']}")
+        with cola:
+            ans = st.text_input("Answer", key=f"fitb_ans_{i}")
+            if st.button("Check", key=f"fitb_check_{i}"):
+                user = normalize(ans)
+                accepted = [normalize(x) for x in item["accepted"]]
+                ok = any((user == a) or (a in user) or (user in a) for a in accepted if a)
+                st.success("Correct!") if ok else st.error("Not quite.")
+
     st.markdown("---")
-    st.markdown("## Activity 2: Drag-and-Drop")
-    d = data["drag"]
-    # Keep state for blanks/bank
-    if "dw_bank" not in st.session_state:
-        st.session_state.dw_bank = list(d["bank"])
-    if "dw_blanks" not in st.session_state:
-        st.session_state.dw_blanks = [None]*len(d["answers"])
-    bank = st.session_state.dw_bank
-    blanks = st.session_state.dw_blanks
 
-    parts = d["sentence"].split("______")
-    disp = []
-    for idx in range(len(parts)+len(blanks)):
-        if idx % 2 == 0:
-            disp.append(parts[idx//2])
-        else:
-            bi = (idx-1)//2
-            label = blanks[bi] if blanks[bi] else "______"
-            if st.button(label, key=f"blank_{bi}"):
-                if blanks[bi]:
-                    bank.append(blanks[bi])
-                    blanks[bi] = None
-                st.session_state.dw_blanks = blanks
-    st.write("".join(disp))
+    # ---------- Activity B: Drag-to-Bins (click assign) ----------
+    st.markdown("## Activity 2: Drag‑to‑Bins")
+    left, right = st.columns([1, 2])
 
-    st.write("**Word bank:**")
-    cols = st.columns(4)
-    for idx, w in enumerate(list(bank)):
-        col = cols[idx % 4]
-        if col.button(w, key=f"bank_{idx}"):
-            for bi in range(len(blanks)):
-                if blanks[bi] is None:
-                    blanks[bi] = w
-                    break
-            bank.remove(w)
-            st.session_state.dw_bank = bank
-            st.session_state.dw_blanks = blanks
+    # LEFT: Word bank (click one to select for placement)
+    with left:
+        st.subheader("Word bank")
+        selected = st.session_state.get("drag_selected")
+        st.caption("Click a word to select it, then click a bin label to place it.")
+        for idx, w in enumerate(st.session_state.drag_bank):
+            if st.button(("🔘 " if selected == w else "⚪ ") + w, key=f"bank_{idx}"):
+                st.session_state.drag_selected = w
+                selected = w
+        if st.button("Reset bank/bins"):
+            # move all placed items back to bank
+            for b in st.session_state.drag_bins:
+                if b["current"]:
+                    st.session_state.drag_bank.append(b["current"])
+                    b["current"] = None
+            st.session_state.drag_bank = sorted(list(set(st.session_state.drag_bank)), key=lambda x: x.lower())
+            st.session_state.drag_selected = None
+            st.experimental_rerun()
 
-    if st.button("Check sentence"):
-        correct = all((blanks[i] or "").lower() == d["answers"][i].lower() for i in range(len(d["answers"])))
-        if correct:
-            st.success("✅ All blanks correct!")
-        else:
-            good = sum(1 for i in range(len(d["answers"])) if (blanks[i] or '').lower() == d['answers'][i].lower())
-            st.warning(f"{good}/{len(d['answers'])} correct. Keep refining.")
-        st.caption("Answer key: " + ", ".join(d["answers"]))
+    # RIGHT: Labeled bins
+    with right:
+        st.subheader("Bins")
+        cols = st.columns(2)
+        for i, b in enumerate(st.session_state.drag_bins):
+            col = cols[i % 2]
+            with col:
+                label_btn = st.button(f"🗂️ {b['label']}", key=f"bin_label_{i}")
+                if label_btn and st.session_state.get("drag_selected"):
+                    # place selected word here (swap if occupied)
+                    sel = st.session_state.drag_selected
+                    if b["current"]:
+                        # return current to bank first
+                        st.session_state.drag_bank.append(b["current"])
+                    b["current"] = sel
+                    # remove from bank
+                    st.session_state.drag_bank = [x for x in st.session_state.drag_bank if x != sel]
+                    st.session_state.drag_selected = None
+                    st.experimental_rerun()
+                # show current content with a clear button
+                st.write("Placed:", b["current"] if b["current"] else "—")
+                if b["current"]:
+                    if st.button("Remove", key=f"bin_rm_{i}"):
+                        st.session_state.drag_bank.append(b["current"])
+                        b["current"] = None
+                        st.session_state.drag_bank = sorted(list(set(st.session_state.drag_bank)), key=lambda x: x.lower())
+                        st.experimental_rerun()
+
+        if st.button("Check bins"):
+            placed = sum(1 for b in st.session_state.drag_bins if b["current"])
+            if placed < len(st.session_state.drag_bins):
+                st.warning(f"Place items in all {len(st.session_state.drag_bins)} bins before checking.")
+            else:
+                correct = sum(1 for b in st.session_state.drag_bins if normalize(b["current"]) == normalize(b["correct"]))
+                if correct == len(st.session_state.drag_bins):
+                    st.success("All bins correct! 🎉")
+                else:
+                    st.warning(f"{correct}/{len(st.session_state.drag_bins)} correct. Keep refining.")
+
