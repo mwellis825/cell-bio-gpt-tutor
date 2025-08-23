@@ -6,7 +6,7 @@ from openai import OpenAI
 from pathlib import Path
 
 # ---------- Config ----------
-st.set_page_config(page_title="Cell Bio Tutor — Inline H5P (local runtime, AMD/CJS neutralizer)", layout="centered")
+st.set_page_config(page_title="Cell Bio Tutor — Inline H5P (eval loader)", layout="centered")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     st.error("Missing OPENAI_API_KEY in Streamlit secrets or environment.")
@@ -109,6 +109,9 @@ def load_runtime_b64_from_repo():
         "css":   root / "runtime" / "h5p.css",
     }
     out, dbg = {}, {}
+    missing = [str(p) for p in files.values() if not p.exists()]
+    if missing:
+        raise FileNotFoundError("Missing runtime assets: " + ", ".join(missing))
     for key, path in files.items():
         data = path.read_bytes()
         out[key] = base64.b64encode(data).decode("ascii")
@@ -116,6 +119,7 @@ def load_runtime_b64_from_repo():
     return out, dbg
 
 def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 760):
+    """Eval the decoded JS directly in the iframe, with AMD/CJS neutralized."""
     main_b64  = runtime_b64["main"]
     frame_b64 = runtime_b64["frame"]
     css_b64   = runtime_b64["css"]
@@ -132,12 +136,20 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
   pre{{white-space:pre-wrap;word-break:break-word;background:#f7f7f8;padding:8px;border-radius:6px}}
 </style>
 <script>
-  function blobUrl(b64, type){{
-    const bin = atob(b64); const len = bin.length; const bytes = new Uint8Array(len);
-    for (let i=0;i<len;i++) bytes[i] = bin.charCodeAt(i);
-    return URL.createObjectURL(new Blob([bytes], {{type}}));
+  function toText(b64) {{
+    // decode base64 into a JS string (latin-1 safe)
+    const bin = atob(b64); let s = '';
+    for (let i=0;i<bin.length;i++) s += String.fromCharCode(bin.charCodeAt(i));
+    return s;
   }}
-  // Minimal H5PIntegration (needed by frame.bundle.js)
+  function injectCSS(b64) {{
+    const css = toText(b64);
+    const blob = new Blob([css], {{type:'text/css'}});
+    const url  = URL.createObjectURL(blob);
+    const link = document.createElement('link');
+    link.rel='stylesheet'; link.href=url; document.head.appendChild(link);
+  }}
+  // Minimal H5PIntegration required by frame bundle
   window.H5PIntegration = {{
     baseUrl: location.origin, url: location.href, siteUrl: location.origin,
     hubIsEnabled: false, disableHub: true, postUserStatistics: false, saveFreq: false,
@@ -150,33 +162,16 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
 <body>
 <div id="app"></div>
 <div class="badge">Runtime: local</div>
-<link id="h5pcss" rel="stylesheet">
 <script>
-  document.getElementById('h5pcss').href = blobUrl("{css_b64}", "text/css");
-  const mainUrl  = blobUrl("{main_b64}",  "application/javascript");
-  const frameUrl = blobUrl("{frame_b64}", "application/javascript");
-
-  function loadScript(src) {{
-    return new Promise((res, rej)=>{{ const s=document.createElement('script'); s.src=src; s.onload=res; s.onerror=rej; document.body.appendChild(s); }});
-  }}
-
-  function resolveHS() {{
-    let HS = window.H5PStandalone || window['h5p-standalone'];
-    if (HS && typeof HS.display==='function') return HS;
-    if (HS && HS.default && typeof HS.default.display==='function') return HS.default;
-    const maybe = (window.H5PStandalone && window.H5PStandalone.default) || (window['h5p-standalone'] && window['h5p-standalone'].default);
-    if (maybe && typeof maybe.display==='function') return maybe;
-    return null;
-  }}
-
-  (async function boot(){{
+  (function boot(){{
     try {{
+      injectCSS("{css_b64}");
+
       // ---- AMD/CJS NEUTRALIZER ----
       const oldDefine  = window.define;
       const oldModule  = window.module;
       const oldExports = window.exports;
       try {{
-        // neutralize any AMD/CommonJS env so UMD chooses "browser global"
         Object.defineProperty(window,'define',{{value: undefined, configurable: true}});
         Object.defineProperty(window,'module',{{value: undefined, configurable: true}});
         Object.defineProperty(window,'exports',{{value: undefined, configurable: true}});
@@ -184,17 +179,23 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
         window.define = undefined; window.module = undefined; window.exports = undefined;
       }}
 
-      await loadScript(mainUrl);
-      await loadScript(frameUrl);
-      await new Promise(r => setTimeout(r, 50));
+      // EVAL the decoded bundles directly (no <script src>, no blob src)
+      const mainCode  = toText("{main_b64}");
+      const frameCode = toText("{frame_b64}");
+      (new Function(mainCode))();   // executes in global scope
+      (new Function(frameCode))();
 
-      // restore environment
+      // restore AMD/CJS if they existed
       if (oldDefine !== undefined) window.define = oldDefine; else delete window.define;
       if (oldModule !== undefined) window.module = oldModule; else delete window.module;
       if (oldExports !== undefined) window.exports = oldExports; else delete window.exports;
 
-      const HS = resolveHS();
-      if (HS) {{
+      // Resolve export
+      let HS = window.H5PStandalone || window['h5p-standalone'];
+      if (!HS && window.H5PStandalone && window.H5PStandalone.default) HS = window.H5PStandalone.default;
+      if (!HS && window['h5p-standalone'] && window['h5p-standalone'].default) HS = window['h5p-standalone'].default;
+
+      if (HS && typeof HS.display === 'function') {{
         const src = 'data:application/zip;base64,{h5p_b64}';
         HS.display('#app', {{ h5pContent: src }});
       }} else {{
@@ -206,11 +207,11 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
         }};
         document.getElementById('app').innerHTML =
           '<div class="msg"><b>H5P API not ready (no display()).</b><pre>'+JSON.stringify(diag,null,2)+'</pre>' +
-          '<p>The AMD/CJS shim ran. If this still fails, double-check the runtime files are from <code>h5p-standalone@1.3.0/dist</code>.</p></div>';
+          '<p>Bundles were executed via eval(). If this persists, the files may be mismatched versions.</p></div>';
       }}
     }} catch(e) {{
       document.getElementById('app').innerHTML =
-        '<div class="msg">Failed loading runtime: '+(e && e.message || e)+'</div>';
+        '<div class="msg">Runtime error: '+(e && e.message || e)+'</div>';
     }}
   }})();
 </script>
@@ -221,7 +222,7 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
     st.components.v1.html(html, height=height, scrolling=True)
 
 # ---------- UI ----------
-st.title("🧬 Cell Bio Tutor — Inline H5P (local runtime)")
+st.title("🧬 Cell Bio Tutor — Inline H5P (eval loader)")
 
 with st.expander("Runtime files on disk"):
     try:
