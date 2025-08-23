@@ -4,8 +4,10 @@
   <meta charset="utf-8" />
   <title>H5P Viewer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- Load CSS from /docs explicitly -->
-  <link rel="stylesheet" href="./docs/h5p.css" />
+
+  <!-- All files are in /docs -->
+  <link rel="stylesheet" href="./h5p.css" />
+
   <style>
     html,body{margin:0;height:100%;background:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
     #app{min-height:100vh}
@@ -15,7 +17,7 @@
   </style>
 
   <script>
-    // Minimal H5PIntegration must exist before frame.bundle.js
+    // Minimal H5PIntegration (must exist before frame.bundle.js)
     window.H5PIntegration = {
       baseUrl: location.origin + location.pathname.replace(/\/[^\/]*$/, ''),
       url: location.href,
@@ -32,13 +34,15 @@
       contents: {}
     };
 
-    // AMD shim that ONLY captures the 'h5p-standalone' module
+    // AMD shim: only capture the 'h5p-standalone' module (avoid grabbing jQuery)
     (function installAmdShim(){
       function amdDefine(name, deps, factory){
+        // normalize args
         if (typeof name === 'function') { factory = name; deps = []; name = undefined; }
         else if (Array.isArray(name))   { factory = deps; deps = name; name = undefined; }
         else if (typeof deps === 'function') { factory = deps; deps = []; }
 
+        // Resolve deps (don’t hijack jquery)
         let resolved = [];
         if (Array.isArray(deps)) {
           resolved = deps.map(d => {
@@ -51,9 +55,9 @@
 
         const out = (typeof factory === 'function') ? factory.apply(null, resolved) : factory;
 
-        const isH5PName = typeof name === 'string' && /(^|\/)h5p-standalone$/i.test(name.trim());
+        const isH5P = typeof name === 'string' && /(^|\/)h5p-standalone$/i.test(name.trim());
         const api = out && (out.display ? out : (out.default && out.default.display ? out.default : null));
-        if (isH5PName && api && typeof api.display === 'function') {
+        if (isH5P && api && typeof api.display === 'function') {
           window.H5PStandalone = api;
           window['h5p-standalone'] = api;
         }
@@ -63,6 +67,7 @@
       Object.defineProperty(window, 'define',  { configurable: true, writable: true, value: amdDefine });
       Object.defineProperty(window, 'require', { configurable: true, writable: true, value: function(){ return {}; } });
 
+      // error visibility
       window.addEventListener('error', e => console.error('Window error:', e.error || e.message || e));
       window.addEventListener('unhandledrejection', e => console.error('Unhandled promise rejection:', e.reason || e));
     })();
@@ -70,9 +75,9 @@
     function qp(n){ const u=new URL(location.href); return u.searchParams.get(n); }
   </script>
 
-  <!-- Load from /docs explicitly -->
-  <script src="./docs/main.bundle.js"></script>
-  <script src="./docs/frame.bundle.js"></script>
+  <!-- Load runtime from the SAME folder as this file (/docs) -->
+  <script src="./main.bundle.js"></script>
+  <script src="./frame.bundle.js"></script>
 </head>
 <body>
   <div id="app"></div>
@@ -89,6 +94,7 @@
       let tries = 0;
       (function waitReady(){
         tries++;
+        // prefer captured export; also accept default-export style
         let HS = window.H5PStandalone || window['h5p-standalone'];
         if (!HS && window.H5PStandalone && window.H5PStandalone.default && typeof window.H5PStandalone.default.display === 'function') {
           HS = window.H5PStandalone.default;
@@ -97,7 +103,7 @@
           HS = window['h5p-standalone'].default;
         }
 
-        // Guard against accidentally grabbing jQuery
+        // guard against jQuery being captured by mistake
         const looksLikeJQ = HS && typeof HS === 'function' && HS.fn && HS.ajax && !HS.display;
         if (looksLikeJQ) HS = null;
 
@@ -105,9 +111,9 @@
           try { HS.display('#app', { h5pContent: src }); }
           catch(e){ app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>'; }
         } else if (tries < 240) {
-          setTimeout(waitReady, 50);
+          setTimeout(waitReady, 50); // ~12s total
         } else {
-          app.innerHTML = '<p class="err">H5P API not ready. Check that <code>/docs/main.bundle.js</code>, <code>/docs/frame.bundle.js</code>, and <code>/docs/h5p.css</code> exist and are the official dist files.</p>';
+          app.innerHTML = '<p class="err">H5P API not ready. Check that <code>main.bundle.js</code>, <code>frame.bundle.js</code>, and <code>h5p.css</code> are the official dist files in this same folder.</p>';
         }
       })();
     })();
