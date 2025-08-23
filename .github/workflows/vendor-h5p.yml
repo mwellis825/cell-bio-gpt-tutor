@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # we will commit the files into the repo
+  contents: write
 
 jobs:
   vendor:
@@ -15,104 +15,29 @@ jobs:
         with:
           ref: main
 
-      - name: Prepare
+      - name: Ensure docs directory
         run: mkdir -p docs
 
-      - name: Try npm tarballs (1.3.1 → 1.3.0 → latest)
-        id: npmfetch
-        shell: bash
+      - name: Download h5p-standalone dist (GitHub raw, tag 1.3.1)
         run: |
           set -euo pipefail
-          try_versions=("1.3.1" "1.3.0")
-          got=""
-          for v in "${try_versions[@]}"; do
-            echo "Attempting npm tarball h5p-standalone@$v..."
-            if curl -fsSL "https://registry.npmjs.org/h5p-standalone/-/h5p-standalone-${v}.tgz" -o h5p.tgz; then
-              echo "version=$v" >> $GITHUB_OUTPUT
-              got="$v"
-              break
-            else
-              echo "  not found."
-            fi
-          done
-
-          if [ -z "$got" ]; then
-            echo "Querying npm dist-tags for 'latest'..."
-            # Use python to extract the "latest" dist-tag (jq is not guaranteed)
-            LATEST=$(python3 - <<'PY'
-import json,sys,urllib.request
-u=urllib.request.urlopen("https://registry.npmjs.org/h5p-standalone")
-d=json.load(u)
-print(d.get("dist-tags",{}).get("latest",""))
-PY
-)
-            if [ -n "$LATEST" ]; then
-              echo "npm latest is $LATEST"
-              if curl -fsSL "https://registry.npmjs.org/h5p-standalone/-/h5p-standalone-${LATEST}.tgz" -o h5p.tgz; then
-                echo "version=$LATEST" >> $GITHUB_OUTPUT
-                got="$LATEST"
-              fi
-            fi
-          fi
-
-          if [ -n "$got" ]; then
-            echo "Using npm version $got"
-            tar -xzf h5p.tgz
-            if [ ! -d package/dist ]; then
-              echo "ERROR: npm tarball structure unexpected (no package/dist)."
-              exit 1
-            fi
-            cp package/dist/main.bundle.js   docs/main.bundle.js
-            cp package/dist/frame.bundle.js  docs/frame.bundle.js
-            if [ -f package/dist/styles/h5p.css ]; then
-              cp package/dist/styles/h5p.css docs/h5p.css
-            elif [ -f package/dist/h5p.css ]; then
-              cp package/dist/h5p.css docs/h5p.css
-            else
-              echo "ERROR: h5p.css not found in dist."
-              exit 1
-            fi
-            echo "npm_ok=true" >> $GITHUB_OUTPUT
-          else
-            echo "npm_ok=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Fallback to GitHub raw (1.3.1 → 1.3.0)
-        if: steps.npmfetch.outputs.npm_ok != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          try_tags=("1.3.1" "1.3.0")
-          success=""
-          for tag in "${try_tags[@]}"; do
-            echo "Trying GitHub raw for tag $tag..."
-            if curl -fsSL "https://raw.githubusercontent.com/tunapanda/h5p-standalone/${tag}/dist/main.bundle.js" -o docs/main.bundle.js \
-            && curl -fsSL "https://raw.githubusercontent.com/tunapanda/h5p-standalone/${tag}/dist/frame.bundle.js" -o docs/frame.bundle.js; then
-              # h5p.css has lived in dist/styles/ in these tags
-              if curl -fsSL "https://raw.githubusercontent.com/tunapanda/h5p-standalone/${tag}/dist/styles/h5p.css" -o docs/h5p.css; then
-                success="$tag"
-                break
-              fi
-            fi
-          done
-          if [ -z "$success" ]; then
-            echo "ERROR: Could not fetch runtime from GitHub raw either."
-            exit 1
-          fi
-          echo "Got files from GitHub raw tag $success"
+          TAG="1.3.1"
+          echo "Fetching h5p-standalone @ ${TAG} …"
+          curl -fsSL "https://raw.githubusercontent.com/tunapanda/h5p-standalone/${TAG}/dist/main.bundle.js"  -o docs/main.bundle.js
+          curl -fsSL "https://raw.githubusercontent.com/tunapanda/h5p-standalone/${TAG}/dist/frame.bundle.js" -o docs/frame.bundle.js
+          curl -fsSL "https://raw.githubusercontent.com/tunapanda/h5p-standalone/${TAG}/dist/styles/h5p.css" -o docs/h5p.css
+          echo "Downloaded files:"
+          ls -lh docs
 
       - name: Commit files to main
         run: |
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/main.bundle.js docs/frame.bundle.js docs/h5p.css || true
+          git add docs/main.bundle.js docs/frame.bundle.js docs/h5p.css
           if git diff --cached --quiet; then
-            echo "No file changes to commit."
+            echo "No changes to commit."
           else
-            git commit -m "Vendor h5p-standalone dist into docs (CI)"
+            git commit -m "Vendor h5p-standalone dist (1.3.1) into docs"
             git push origin main
           fi
-
-      - name: Show docs listing
-        run: ls -lh docs
