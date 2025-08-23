@@ -2,11 +2,16 @@ import io, json, re, zipfile, base64, requests
 from typing import List
 import streamlit as st
 from pypdf import PdfReader
-import openai
+from openai import OpenAI
+import os
 
 # ---------- Config ----------
 st.set_page_config(page_title="Cell Bio Tutor — Inline H5P (blob runtime)", layout="centered")
-openai.api_key = st.secrets.get("OPENAI_API_KEY", "")
+
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    st.error("Missing OPENAI_API_KEY in Streamlit secrets or environment.")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM = (
     "You are a cell biology tutor. Only use the provided slide excerpts "
@@ -29,18 +34,34 @@ def read_pdfs(files) -> str:
     txt = re.sub(r"\s+", " ", "\n\n".join(out)).strip()
     return txt[:12000]
 
-def ask_llm(messages, model="gpt-3.5-turbo", temperature=0.25, max_tokens=800):
-    if not openai.api_key:
-        st.error("Missing OPENAI_API_KEY in secrets.")
-        return ""
+def ask_llm(messages, model="gpt-4o-mini", temperature=0.25, max_tokens=800) -> str:
     try:
-        resp = openai.ChatCompletion.create(
-            model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "text"},
         )
-        return resp.choices[0].message["content"]
+        return resp.choices[0].message.content or ""
     except Exception as e:
         st.error(f"OpenAI error: {e}")
         return ""
+
+def safe_json_loads(s: str):
+    # try direct JSON
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # try to extract last JSON object in message
+    m = re.search(r"\{.*\}\s*$", s, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+    return None
 
 def build_h5p_drag_words(title: str, instructions: str, clozes: List[str]) -> bytes:
     """Minimal VALID H5P (Drag-the-Words). Accepts **word** and converts to *word*."""
@@ -52,8 +73,10 @@ def build_h5p_drag_words(title: str, instructions: str, clozes: List[str]) -> by
         "textField": "\n".join(to_dragtext(s) for s in clozes),
         "overallFeedback": [{"from": 0, "to": 100, "feedback": "Great job!"}],
         "behaviour": {
-            "enableRetry": True, "enableSolutionsButton": True,
-            "instantFeedback": True, "caseSensitive": False
+            "enableRetry": True,
+            "enableSolutionsButton": True,
+            "instantFeedback": True,
+            "caseSensitive": False
         }
     }
     h5p_json = {
@@ -104,7 +127,6 @@ def fetch_runtime_b64() -> dict:
     ]
 
     out = {}
-    # try primary, otherwise fallback per file
     for primary, key in try_sources:
         try:
             out[key] = base64.b64encode(fetch(primary)).decode("ascii")
@@ -123,17 +145,14 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
 <!doctype html>
 <html>
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>html,body,#app{{margin:0;height:100%}} .badge{{position:fixed;right:8px;top:8px;padding:4px 8px;background:#eef;border:1px solid #99c;border-radius:6px;font:12px sans-serif;opacity:.9}}</style>
 <script>
-  // Blob utilities
   function blobUrl(b64, type){{
     const bin = atob(b64); const len = bin.length; const bytes = new Uint8Array(len);
     for (let i=0;i<len;i++) bytes[i] = bin.charCodeAt(i);
     return URL.createObjectURL(new Blob([bytes], {{type}}));
   }}
-  // Required by frame.bundle.js
   window.H5PIntegration = {{
     baseUrl: location.origin, url: location.href, siteUrl: location.origin,
     hubIsEnabled: false, disableHub: true, postUserStatistics: false, saveFreq: false,
@@ -148,9 +167,7 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
 <div class="badge">Runtime: blob</div>
 <link id="h5pcss" rel="stylesheet">
 <script>
-  // Inject CSS
   document.getElementById('h5pcss').href = blobUrl("{css_b64}", "text/css");
-  // Load JS in order
   const mainUrl  = blobUrl("{main_b64}",  "application/javascript");
   const frameUrl = blobUrl("{frame_b64}", "application/javascript");
 
@@ -181,7 +198,7 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
     st.components.v1.html(html, height=height, scrolling=True)
 
 # ---------- UI ----------
-st.title("🧬 Cell Bio Tutor — Inline H5P (no external loads)")
+st.title("🧬 Cell Bio Tutor — Inline H5P (no external loads in browser)")
 
 with st.expander("1) Upload your course slides (PDF)"):
     slides = st.file_uploader("Upload 1–10 PDFs", type=["pdf"], accept_multiple_files=True)
@@ -218,21 +235,19 @@ Rules:
 SLIDES:
 {slide_text}
 """
-        out = ask_llm(
+        llm_text = ask_llm(
             [{"role":"system","content":SYSTEM},
              {"role":"user","content":prompt}],
             temperature=0.25, max_tokens=800
         )
-        try:
-            data = json.loads(out)
-        except Exception:
+        data = safe_json_loads(llm_text or "")
+        if not data:
             st.error("Could not parse LLM output. Try a narrower topic.")
-            data = None
-
-        if data:
+        else:
             title = data.get("title") or f"{topic} — Drag the Words"
             instructions = data.get("instructions") or "Fill the missing terms."
-            clozes = [c for c in data.get("clozes", []) if "**" in c][:7]
+            clozes_raw = data.get("clozes", [])
+            clozes = [c for c in clozes_raw if isinstance(c, str) and "**" in c][:7]
             if not clozes:
                 st.error("No valid clozes returned. Try regenerating.")
             else:
@@ -249,9 +264,6 @@ SLIDES:
                     st.success("Generated H5P. Rendering inline below (look for the 'Runtime: blob' badge)…")
                     render_h5p_inline_from_b64(h5p_b64, runtime_b64, height=760)
 
-                st.download_button(
-                    "⬇️ Download this H5P",
-                    data=h5p_bytes,
-                    file_name=re.sub(r'[^a-z0-9]+','_',title.lower()).strip('_') + ".h5p",
-                    mime="application/zip",
-                )
+                # Optional: also offer download (LMS backup)
+                safe_name = re.sub(r'[^a-z0-9]+','_',title.lower()).strip('_') + ".h5p"
+                st.download_button("⬇️ Download this H5P", data=h5p_bytes, file_name=safe_name, mime="application/zip")
