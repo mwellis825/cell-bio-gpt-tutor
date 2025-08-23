@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>H5P Viewer (hard-capture UMD)</title>
+  <title>H5P Viewer (robust export detection)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="./h5p.css" />
   <style>
@@ -11,10 +11,11 @@
     .err{color:#b00;padding:1rem;line-height:1.5}
     .hint{padding:.75rem 1rem;background:#f6f8fa;border:1px solid #e5e7eb;border-radius:.5rem;margin:1rem}
     code{background:#f3f4f6;padding:0 .25rem;border-radius:.25rem}
+    pre{white-space:pre-wrap;word-break:break-word;background:#f9fafb;border:1px solid #e5e7eb;border-radius:.5rem;padding:.75rem;margin:1rem}
   </style>
 
   <script>
-    // 1) Must exist before frame.bundle.js
+    // Minimal H5PIntegration must exist before frame.bundle.js
     window.H5PIntegration = {
       baseUrl: location.origin + location.pathname.replace(/\/[^\/]*$/, ''),
       url: location.href,
@@ -31,61 +32,44 @@
       contents: {}
     };
 
-    // 2) Hard UMD capture shims
+    // AMD/CJS shims + capture
     (function installCaptureShims(){
-      // Capture bucket for AMD object/function return
       window.__H5P_EXPORT__ = undefined;
-
-      // Prepare a faux CJS module/exports pair
       const cjsModule  = { exports: {} };
       const cjsExports = cjsModule.exports;
 
-      // Expose CJS globals (writable/configurable to be safe)
       Object.defineProperty(window, 'module',  { configurable: true, writable: true, value: cjsModule  });
       Object.defineProperty(window, 'exports', { configurable: true, writable: true, value: cjsExports });
 
-      // AMD define that captures factory result into __H5P_EXPORT__
       function amdDefine(name, deps, factory){
-        // normalize args
-        if (typeof name === 'function') { factory = name; deps = []; name = undefined; }
-        else if (Array.isArray(name))   { factory = deps; deps = name; name = undefined; }
+        if (typeof name === 'function') { factory = name; deps = []; }
+        else if (Array.isArray(name))   { factory = deps; deps = name; }
         else if (typeof deps === 'function') { factory = deps; deps = []; }
-
-        // very permissive deps resolver
         let resolved = [];
         if (Array.isArray(deps)) {
           resolved = deps.map(d => {
             if (d === 'exports') return cjsExports;
             if (d === 'module')  return cjsModule;
             if (d === 'require') return function(){};
-            if (d === 'h5p-standalone' || d === 'H5PStandalone') return window.H5PStandalone || window['h5p-standalone'] || window.__H5P_EXPORT__;
+            if (d === 'h5p-standalone' || d === 'H5PStandalone')
+              return window.H5PStandalone || window['h5p-standalone'] || window.__H5P_EXPORT__;
             return {};
           });
         }
-
-        let out;
-        if (typeof factory === 'function') out = factory.apply(null, resolved);
-        else out = factory; // object literal path
-
-        if (out && (typeof out === 'object' || typeof out === 'function')) {
-          window.__H5P_EXPORT__ = out;
-        }
+        let out = (typeof factory === 'function') ? factory.apply(null, resolved) : factory;
+        if (out && (typeof out === 'object' || typeof out === 'function')) window.__H5P_EXPORT__ = out;
         return out;
       }
-      amdDefine.amd = {}; // make UMD think AMD is present
-
-      // Expose AMD globals
+      amdDefine.amd = {};
       Object.defineProperty(window, 'define',  { configurable: true, writable: true, value: amdDefine });
       Object.defineProperty(window, 'require', { configurable: true, writable: true, value: function(){ return {}; } });
 
-      // Finalizer that promotes any captured export to window globals
       window.__finalizeH5PStandalone__ = function(){
         const candidate =
           window.__H5P_EXPORT__ ||
           (window.module && window.module.exports) ||
           window.H5PStandalone ||
           window['h5p-standalone'];
-
         if (candidate && (typeof candidate === 'object' || typeof candidate === 'function')) {
           window.H5PStandalone = candidate;
           window['h5p-standalone'] = candidate;
@@ -93,20 +77,7 @@
       };
     })();
 
-    // Helpers
     function qp(n){ const u=new URL(location.href); return u.searchParams.get(n); }
-    function loadScript(src){
-      return new Promise((resolve,reject)=>{
-        const s=document.createElement('script');
-        s.src = src; s.async = false; // preserve order
-        s.onload = ()=>{ console.log('Loaded', src); resolve(); };
-        s.onerror = ()=>reject(new Error('Failed to load: '+src));
-        document.head.appendChild(s);
-      });
-    }
-
-    window.addEventListener('error', e => console.error('Window error:', e.error || e.message || e));
-    window.addEventListener('unhandledrejection', e => console.error('Unhandled promise rejection:', e.reason || e));
   </script>
 
   <!-- Load in order -->
@@ -119,13 +90,12 @@
   <script>
     (function boot(){
       const app = document.getElementById('app');
-      const src = qp('src'); // .h5p URL (or data:application/zip;base64,...)
+      const src = qp('src'); // URL or data:application/zip;base64,...
       if (!src) {
         app.innerHTML = '<div class="hint">No H5P source. Use <code>?src=&lt;url-to-your.h5p&gt;</code> (or a data: URL).</div>';
         return;
       }
 
-      // Promote any captured export to window
       if (typeof window.__finalizeH5PStandalone__ === 'function') {
         try { window.__finalizeH5PStandalone__(); } catch {}
       }
@@ -133,21 +103,32 @@
       let tries = 0;
       (function waitReady(){
         tries++;
-        const HS = window.H5PStandalone || window['h5p-standalone'] || window.__H5P_EXPORT__ || (window.module && window.module.exports);
+        const rawHS =
+          window.H5PStandalone ||
+          window['h5p-standalone'] ||
+          window.__H5P_EXPORT__ ||
+          (window.module && window.module.exports);
+
+        // Some builds export { default: { display() {…} } }
+        const HS = rawHS && (rawHS.display ? rawHS : (rawHS.default && rawHS.default.display ? rawHS.default : null));
+
         if (HS && typeof HS.display === 'function') {
-          console.log('Detected export =', window.H5PStandalone ? 'H5PStandalone' :
-                                      window['h5p-standalone'] ? 'h5p-standalone' :
-                                      window.__H5P_EXPORT__ ? '__H5P_EXPORT__' : 'module.exports');
+          console.log('Resolved H5P API object =', HS === rawHS ? 'global export' : 'export.default');
           try { HS.display('#app', { h5pContent: src }); }
-          catch(e){ app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>'; }
+          catch(e){
+            console.error(e);
+            app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>';
+          }
         } else if (tries < 240) {
-          setTimeout(waitReady, 50);
+          setTimeout(waitReady, 50); // ~12s total
         } else {
-          console.log('typeof H5PStandalone =', typeof window.H5PStandalone);
-          console.log('typeof window["h5p-standalone"] =', typeof window['h5p-standalone']);
-          console.log('typeof __H5P_EXPORT__ =', typeof window.__H5P_EXPORT__);
-          console.log('typeof (module && module.exports) =', typeof (window.module && window.module.exports));
-          app.innerHTML = '<p class="err">H5P API not ready. Even the captured AMD/CJS export did not expose <code>display()</code>. Re-verify that the two JS files are exactly from <code>h5p-standalone@1.3.0/dist</code>.</p>';
+          console.log('Debug types:',
+            'H5PStandalone =', typeof window.H5PStandalone,
+            '| h5p-standalone =', typeof window['h5p-standalone'],
+            '| __H5P_EXPORT__ =', typeof window.__H5P_EXPORT__,
+            '| module.exports =', typeof (window.module && window.module.exports),
+            '| rawHS keys =', rawHS && Object.keys(rawHS || {}));
+          app.innerHTML = '<p class="err">H5P API not ready. Export present but no <code>display()</code>. This usually means your bundles are not the <em>standalone dist</em> from <code>h5p-standalone@1.3.0/dist</code> or they are a variant that requires <code>export.default</code>. This viewer now checks <code>export.default.display</code> too.</p>';
         }
       })();
     })();
