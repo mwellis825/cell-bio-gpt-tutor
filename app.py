@@ -1,16 +1,14 @@
-# app.py — Cell Bio Tutor (Slides-only, LLM-authored, H5P via viewer ?src=data:)
-# Viewer URL (must be the ?src variant):
-#   https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html?src=<URL-ENCODED data:application/zip;base64,...>
+# app.py — Cell Bio Tutor (Slides-only, LLM-authored, H5P via viewer ?src=)
+# If data-URL is too large, uploads the .h5p to GitHub repo and passes a short URL.
 
 import os, io, json, base64, zipfile, pathlib, re, uuid, hashlib, html, urllib.parse
 from typing import List, Dict, Optional, Tuple
 import streamlit as st
 import numpy as np
 from pypdf import PdfReader
+import requests
+import time
 
-# ------------------------------
-# Page / Paths
-# ------------------------------
 st.set_page_config(page_title="Cell Bio Tutor — Slides Only", layout="centered")
 st.title("🧬 Cell Bio Tutor — Slides-Only (LLM + H5P)")
 
@@ -20,12 +18,10 @@ TEMPLATES_DIR = ROOT / "templates"
 FIB_MASTER = TEMPLATES_DIR / "rtk_fill_in_blanks_FIXED_blocks.h5p"
 DND_MASTER = TEMPLATES_DIR / "cellular_respiration_aligned_course_style.h5p"
 
-# ✅ Viewer that expects ?src=
-GH_PAGES_VIEWER_QS = "https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html?src="
+VIEWER_QS = "https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html?src="
+DATA_URL_LIMIT = 180_000  # conservative URL-encoded length limit
 
-# ------------------------------
-# OpenAI (lazy init)
-# ------------------------------
+# --- OpenAI (lazy) ---
 EMBED_MODEL = "text-embedding-3-small"
 
 def _get_api_key() -> Optional[str]:
@@ -53,9 +49,47 @@ def client():
         st.session_state.openai_client = _get_openai_client()
     return st.session_state.openai_client
 
-# ------------------------------
-# Session state
-# ------------------------------
+# --- GitHub upload helper ---
+def gh_cfg():
+    tok = st.secrets.get("GITHUB_TOKEN")
+    repo = st.secrets.get("GITHUB_REPO", "")
+    branch = st.secrets.get("GITHUB_BRANCH", "main")
+    updir = st.secrets.get("GITHUB_UPLOAD_DIR", "docs/generated")
+    return tok, repo, branch, updir
+
+def upload_h5p_to_github(bytes_data: bytes, filename: str) -> Optional[str]:
+    tok, repo, branch, updir = gh_cfg()
+    if not tok or not repo:
+        return None
+    path = f"{updir.rstrip('/')}/{filename}"
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    content_b64 = base64.b64encode(bytes_data).decode("utf-8")
+    payload = {
+        "message": f"Add generated H5P {filename}",
+        "content": content_b64,
+        "branch": branch,
+    }
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}
+    r = requests.put(url, headers=headers, json=payload, timeout=30)
+    if r.status_code in (200, 201):
+        # raw URL (works for public repos)
+        user_repo = repo
+        raw = f"https://raw.githubusercontent.com/{user_repo}/{branch}/{path}"
+        # tiny wait for GitHub to serve fresh content
+        for _ in range(5):
+            try:
+                rr = requests.head(raw, timeout=5)
+                if rr.status_code == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.6)
+        return raw
+    else:
+        st.warning(f"GitHub upload failed: {r.status_code} {r.text}")
+        return None
+
+# --- Session state ---
 def init_state():
     defaults = dict(
         topic="",
@@ -66,7 +100,7 @@ def init_state():
         index_chunks=[],
         index_embeds=None,
         run_id=None,
-        cache={},  # run_id -> {"fib_bytes":..., "dnd_bytes":..., "mcqs":[...]}
+        cache={},  # run_id -> {"fib_bytes":..., "dnd_bytes":..., "mcqs":[...], "fib_url":..., "dnd_url":...}
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -74,9 +108,7 @@ def init_state():
 
 init_state()
 
-# ------------------------------
-# Slides ingestion & retrieval
-# ------------------------------
+# --- Slides ingestion & retrieval ---
 def extract_pages(pdf_path: pathlib.Path) -> List[Dict]:
     out = []
     try:
@@ -183,9 +215,7 @@ def build_context_with_fallback(query: str, min_chars: int = 1200) -> Tuple[str,
         ctx = (ctx + "\n\n[OpenStax fallback]\n" + fb) if ctx else fb
     return ctx, src
 
-# ------------------------------
-# LLM generation (slides + fallback)
-# ------------------------------
+# --- LLM generation (slides + fallback) ---
 def gen_fib_lines_from_context(topic: str, difficulty: str, n_items: int) -> List[str]:
     if client() is None:
         raise RuntimeError("OpenAI client not initialized.")
@@ -243,10 +273,7 @@ Write {n_items} MCQs as JSON array:
 [{{"question": "...", "options": ["A","B","C","D"], "answer_index": 0}}]
 Keep options concise; use only slide/fallback facts. If insufficient, return [].
 """
-    resp = client().chat_completions.create( # fallback in case .chat.completions differs
-        model="gpt-4o", temperature=0.2,
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}]
-    ) if hasattr(client(), "chat_completions") else client().chat.completions.create(
+    resp = client().chat.completions.create(
         model="gpt-4o", temperature=0.2,
         messages=[{"role":"system","content":sys},{"role":"user","content":user}]
     )
@@ -287,7 +314,7 @@ Distinct pairs; concise; use only context/fallback.
         pairs = []
     if pairs:
         return pairs[:n_pairs]
-    # Heuristic fallback
+    # fallback
     t = topic.lower()
     if "electron transport" in t or "etc" in t or "oxidative" in t:
         return [
@@ -305,9 +332,7 @@ Distinct pairs; concise; use only context/fallback.
         ("Mitochondria", "ATP production"),
     ][:n_pairs]
 
-# ------------------------------
-# H5P builders (from master .h5p)
-# ------------------------------
+# --- H5P builders (from master .h5p) ---
 def build_fib_from_master(instructions: str, lines: List[str]) -> Optional[bytes]:
     if not FIB_MASTER.exists():
         st.error("FIB master missing in templates/.")
@@ -339,7 +364,7 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
     if not DND_MASTER.exists():
         st.error("DnD master missing in templates/.")
         return None
-    # Compact left/right rows
+    # compact alignment
     elements, zones = [], []
     y_dr, y_zn = 6.5, 13.9
     for i, (drag, drop) in enumerate(pairs[:5]):
@@ -377,26 +402,24 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
         st.error(f"Couldn’t build DnD H5P: {e}")
         return None
 
-# ------------------------------
-# H5P renderer via GH Pages viewer (?src=data:)
-# ------------------------------
-def render_h5p_via_pages_src(h5p_bytes: bytes, height: int = 620):
-    if not h5p_bytes:
-        return False
-    # Build a data URL and URL-encode it for the ?src= param
+# --- Rendering helpers ---
+def render_inline_if_small(h5p_bytes: bytes, height: int = 620) -> bool:
     b64 = base64.b64encode(h5p_bytes).decode("utf-8")
     data_url = "data:application/zip;base64," + b64
     encoded = urllib.parse.quote(data_url, safe="")
-    # If the URL gets too long, some browsers/iframes may choke. Guard it:
-    if len(encoded) > 180000:  # ~180 KB of URL-encoded data (heuristic)
+    if len(encoded) > DATA_URL_LIMIT:
         return False
-    viewer_url = GH_PAGES_VIEWER_QS + encoded
-    st.components.v1.iframe(src=viewer_url, height=height)
+    st.components.v1.iframe(src=VIEWER_QS + encoded, height=height)
     return True
 
-# ------------------------------
-# Sidebar / Controls
-# ------------------------------
+def render_via_github(h5p_bytes: bytes, fname: str, height: int = 620) -> Optional[str]:
+    url = upload_h5p_to_github(h5p_bytes, fname)
+    if not url:
+        return None
+    st.components.v1.iframe(src=VIEWER_QS + urllib.parse.quote(url, safe=""), height=height)
+    return url
+
+# --- Sidebar / Controls ---
 with st.sidebar:
     st.header("Authoring")
     st.session_state.n_items = st.slider("Items per FIB", 2, 6, st.session_state.n_items, 1)
@@ -404,35 +427,29 @@ with st.sidebar:
     st.session_state.gen_dnd = st.toggle("Also generate Drag-and-Drop", value=st.session_state.gen_dnd)
     st.caption("Generations use ONLY your slides; if thin, adds a tiny OpenStax fallback snippet.")
 
-topic = st.text_input(
-    "What do you want help with? (e.g., “electron transport chain”, “RTK”):",
-    value=st.session_state.topic
-)
+topic = st.text_input("What do you want help with? (e.g., “electron transport chain”, “RTK”):", value=st.session_state.topic)
 generate_clicked = st.button("Generate Activity")
 
-# ------------------------------
-# Generate and cache by run_id
-# ------------------------------
+# --- Generate and render ---
 if generate_clicked:
     st.session_state.run_id = uuid.uuid4().hex[:8]
+    run_id = st.session_state.run_id
     st.session_state.topic = topic
-    st.session_state.cache[st.session_state.run_id] = {"fib_bytes": None, "dnd_bytes": None, "mcqs": []}
+    st.session_state.cache[run_id] = {"fib_bytes": None, "dnd_bytes": None, "mcqs": [], "fib_url": None, "dnd_url": None}
 
     # FIB
     try:
         lines = gen_fib_lines_from_context(topic, difficulty="medium", n_items=st.session_state.n_items)
-        instructions = (
-            f"Based ONLY on your course slides: predict the downstream effect for "
-            f"**{st.session_state.topic}** (answer with *increase/decrease*)."
-        )
-        st.session_state.cache[st.session_state.run_id]["fib_bytes"] = build_fib_from_master(instructions, lines)
+        instructions = f"Based ONLY on your course slides: predict the downstream effect for **{topic}** (answer with *increase/decrease*)."
+        fib_bytes = build_fib_from_master(instructions, lines)
+        st.session_state.cache[run_id]["fib_bytes"] = fib_bytes
     except Exception as e:
         st.error(f"FIB generation failed: {e}")
 
     # MCQs
     if st.session_state.gen_mcq:
         try:
-            st.session_state.cache[st.session_state.run_id]["mcqs"] = gen_mcqs_from_context(topic, difficulty="medium", n_items=2)
+            st.session_state.cache[run_id]["mcqs"] = gen_mcqs_from_context(topic, difficulty="medium", n_items=2)
         except Exception as e:
             st.warning(f"MCQ generation failed: {e}")
 
@@ -441,35 +458,35 @@ if generate_clicked:
         try:
             pairs = gen_dnd_pairs_from_context(topic, n_pairs=5)
             if pairs:
-                st.session_state.cache[st.session_state.run_id]["dnd_bytes"] = build_dnd_from_master(pairs)
+                dnd_bytes = build_dnd_from_master(pairs)
+                st.session_state.cache[run_id]["dnd_bytes"] = dnd_bytes
         except Exception as e:
             st.warning(f"DnD generation failed: {e}")
 
-# ------------------------------
-# Render last run
-# ------------------------------
-current_run = st.session_state.run_id
-if current_run and current_run in st.session_state.cache:
-    data = st.session_state.cache[current_run]
+# --- Show results (latest run) ---
+rid = st.session_state.run_id
+if rid and rid in st.session_state.cache:
+    data = st.session_state.cache[rid]
 
     if data.get("fib_bytes"):
         st.success("Fill-in-the-Blanks (slides-only)")
-        ok_inline = render_h5p_via_pages_src(data["fib_bytes"], height=620)
+        if not render_inline_if_small(data["fib_bytes"]):
+            url = render_via_github(data["fib_bytes"], f"fib_{rid}.h5p")
+            if not url:
+                st.info("Inline preview skipped (payload too large) and upload failed. Use the download button.")
         st.download_button(
             "⬇️ Download FIB (.h5p)",
             data=data["fib_bytes"],
-            file_name=f"fib_{current_run}.h5p",
+            file_name=f"fib_{rid}.h5p",
             mime="application/zip",
-            key=f"dl-fib-{current_run}-{hashlib.md5(data['fib_bytes']).hexdigest()[:8]}",
+            key=f"dl-fib-{rid}-{hashlib.md5(data['fib_bytes']).hexdigest()[:8]}",
         )
-        if not ok_inline:
-            st.info("Inline preview skipped (payload too large for URL). Use the download button or host the file and pass ?src=<url>.")
 
     mcqs = data.get("mcqs", [])
     if mcqs:
         st.subheader("Quick Check (slides-only)")
         for idx, q in enumerate(mcqs):
-            key = f"{current_run}-mcq-{idx}"
+            key = f"{rid}-mcq-{idx}"
             sel = st.radio(q["question"], q["options"], index=None, key=key)
             if sel is not None:
                 correct = (q["options"].index(sel) == q["answer_index"])
@@ -478,13 +495,14 @@ if current_run and current_run in st.session_state.cache:
 
     if data.get("dnd_bytes"):
         st.success("Drag-and-Drop (slides-only)")
-        ok_inline = render_h5p_via_pages_src(data["dnd_bytes"], height=620)
+        if not render_inline_if_small(data["dnd_bytes"]):
+            url = render_via_github(data["dnd_bytes"], f"dnd_{rid}.h5p")
+            if not url:
+                st.info("Inline preview skipped (payload too large) and upload failed. Use the download button.")
         st.download_button(
             "⬇️ Download DnD (.h5p)",
             data=data["dnd_bytes"],
-            file_name=f"dnd_{current_run}.h5p",
+            file_name=f"dnd_{rid}.h5p",
             mime="application/zip",
-            key=f"dl-dnd-{current_run}-{hashlib.md5(data['dnd_bytes']).hexdigest()[:8]}",
+            key=f"dl-dnd-{rid}-{hashlib.md5(data['dnd_bytes']).hexdigest()[:8]}",
         )
-        if not ok_inline:
-            st.info("Inline preview skipped (payload too large for URL). Use the download button or host the file and pass ?src=<url>.")
