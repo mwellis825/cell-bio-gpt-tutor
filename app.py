@@ -1,9 +1,8 @@
-import io, json, re, zipfile, base64, requests
-from typing import List
+import io, json, re, zipfile, base64, requests, os
+from typing import List, Dict, Any
 import streamlit as st
 from pypdf import PdfReader
 from openai import OpenAI
-import os
 
 # ---------- Config ----------
 st.set_page_config(page_title="Cell Bio Tutor — Inline H5P (blob runtime)", layout="centered")
@@ -14,8 +13,8 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM = (
-    "You are a cell biology tutor. Only use the provided slide excerpts "
-    "to author concise, causal, critical-thinking practice items."
+    "You are a rigorous, supportive Cell Biology tutor. "
+    "You ONLY use the provided slide excerpts to author concise, causal, critical-thinking practice."
 )
 
 H5P_VER = "1.3.0"
@@ -27,41 +26,93 @@ def read_pdfs(files) -> str:
     out = []
     for f in files or []:
         try:
-            reader = PdfReader(f)
-            out.append("\n".join((page.extract_text() or "") for page in reader.pages))
+            r = PdfReader(f)
+            out.append("\n".join((p.extract_text() or "") for p in r.pages))
         except Exception as e:
             st.warning(f"Could not read {getattr(f,'name','file')}: {e}")
     txt = re.sub(r"\s+", " ", "\n\n".join(out)).strip()
-    return txt[:12000]
+    return txt[:12000]  # keep prompt modest
 
-def ask_llm(messages, model="gpt-4o-mini", temperature=0.25, max_tokens=800) -> str:
+def ask_json(topic: str, slide_text: str, model="gpt-4o-mini") -> Dict[str, Any]:
+    """
+    2-pass JSON enforcement.
+    Pass 1: response_format=json_object (strict).
+    Pass 2: low-temp with a tiny few-shot example if needed.
+    Returns dict or {}.
+    """
+    base_user = f"""
+Using ONLY these slide excerpts, author a concise Drag-the-Words activity for college Cell Biology on: "{topic}".
+
+Return JSON ONLY with this exact shape:
+{{
+  "title": "short title",
+  "instructions": "one clear task line",
+  "clozes": [
+    "Short sentence with **answer**",
+    "Another sentence with **term**",
+    "3rd sentence with **concept**",
+    "4th sentence with **word**"
+  ]
+}}
+
+Rules:
+- 4–7 clozes total.
+- Each **answer** is 1–2 words present in the slides.
+- Prefer causal/function statements over trivia. Keep sentences short.
+- DO NOT add extra fields. DO NOT use markdown outside the **answer** markers.
+SLIDES:
+{slide_text}
+""".strip()
+
+    # Pass 1: strict JSON
     try:
         resp = client.chat.completions.create(
             model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "text"},
+            temperature=0.2,
+            max_tokens=700,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role":"system","content":SYSTEM},
+                {"role":"user","content":base_user},
+            ],
         )
-        return resp.choices[0].message.content or ""
+        txt = resp.choices[0].message.content or ""
+        return json.loads(txt)
     except Exception as e:
-        st.error(f"OpenAI error: {e}")
-        return ""
+        st.warning(f"Retrying with a stricter format (pass 2). First error: {e}")
 
-def safe_json_loads(s: str):
-    # try direct JSON
+    # Pass 2: add a tiny example and lower temp
+    fewshot_user = base_user + """
+
+EXAMPLE (structure only; content must come from slides):
+{
+  "title": "electron transport outcomes",
+  "instructions": "Fill each blank with the correct term from the slides.",
+  "clozes": [
+    "Complex IV reduces **oxygen** to water.",
+    "A proton gradient across the **inner membrane** drives ATP synthase.",
+    "An inhibitor of Complex I lowers **NADH** oxidation.",
+    "Uncouplers increase **oxygen consumption** but reduce ATP yield."
+  ]
+}
+""".rstrip()
+
     try:
-        return json.loads(s)
-    except Exception:
-        pass
-    # try to extract last JSON object in message
-    m = re.search(r"\{.*\}\s*$", s, flags=re.S)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
-    return None
+        resp2 = client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            max_tokens=700,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role":"system","content":SYSTEM},
+                {"role":"user","content":fewshot_user},
+            ],
+        )
+        txt2 = resp2.choices[0].message.content or ""
+        return json.loads(txt2)
+    except Exception as e2:
+        st.error(f"OpenAI error (pass 2): {e2}")
+        return {}
 
 def build_h5p_drag_words(title: str, instructions: str, clozes: List[str]) -> bytes:
     """Minimal VALID H5P (Drag-the-Words). Accepts **word** and converts to *word*."""
@@ -73,10 +124,8 @@ def build_h5p_drag_words(title: str, instructions: str, clozes: List[str]) -> by
         "textField": "\n".join(to_dragtext(s) for s in clozes),
         "overallFeedback": [{"from": 0, "to": 100, "feedback": "Great job!"}],
         "behaviour": {
-            "enableRetry": True,
-            "enableSolutionsButton": True,
-            "instantFeedback": True,
-            "caseSensitive": False
+            "enableRetry": True, "enableSolutionsButton": True,
+            "instantFeedback": True, "caseSensitive": False
         }
     }
     h5p_json = {
@@ -115,24 +164,24 @@ def fetch_runtime_b64() -> dict:
             raise RuntimeError(f"Bad fetch: {url}")
         return r.content
 
-    try_sources = [
+    prim = [
         (f"{JSDELIVR}/main.bundle.js", "main"),
         (f"{JSDELIVR}/frame.bundle.js","frame"),
         (f"{JSDELIVR}/styles/h5p.css", "css"),
     ]
-    fallback = [
+    fb = [
         (f"{UNPKG}/main.bundle.js","main"),
         (f"{UNPKG}/frame.bundle.js","frame"),
         (f"{UNPKG}/styles/h5p.css","css"),
     ]
 
     out = {}
-    for primary, key in try_sources:
+    for primary, key in prim:
         try:
             out[key] = base64.b64encode(fetch(primary)).decode("ascii")
         except Exception:
-            fb = next(u for u,k in fallback if k==key)
-            out[key] = base64.b64encode(fetch(fb)).decode("ascii")
+            alt = next(u for u,k in fb if k==key)
+            out[key] = base64.b64encode(fetch(alt)).decode("ascii")
     return out
 
 def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 760):
@@ -211,45 +260,17 @@ if go:
     if not slide_text:
         st.error("No slide text detected. Please upload slides (PDF).")
     else:
-        prompt = f"""
-Using ONLY these slide excerpts, author a concise Drag-the-Words activity for college Cell Biology on: "{topic}".
-
-Return JSON ONLY:
-{{
-  "title": "short title",
-  "instructions": "one clear task line",
-  "clozes": [
-    "Sentence with **missing** word",
-    "Another with **blank**",
-    "3rd with **something**",
-    "4th with **term**"
-  ]
-}}
-
-Rules:
-- 4–7 clozes max.
-- Each **answer** should be 1–2 words that appear in the slides.
-- Prefer causal/function statements over trivia.
-- Keep sentences short and readable.
-
-SLIDES:
-{slide_text}
-"""
-        llm_text = ask_llm(
-            [{"role":"system","content":SYSTEM},
-             {"role":"user","content":prompt}],
-            temperature=0.25, max_tokens=800
-        )
-        data = safe_json_loads(llm_text or "")
+        data = ask_json(topic=topic, slide_text=slide_text)
         if not data:
-            st.error("Could not parse LLM output. Try a narrower topic.")
+            st.error("Could not parse LLM output after two attempts. Try a narrower topic or different slides.")
         else:
             title = data.get("title") or f"{topic} — Drag the Words"
             instructions = data.get("instructions") or "Fill the missing terms."
             clozes_raw = data.get("clozes", [])
             clozes = [c for c in clozes_raw if isinstance(c, str) and "**" in c][:7]
+
             if not clozes:
-                st.error("No valid clozes returned. Try regenerating.")
+                st.error("No valid clozes with **answer** markers returned. Try regenerating.")
             else:
                 # Build H5P and runtime
                 h5p_bytes = build_h5p_drag_words(title, instructions, clozes)
