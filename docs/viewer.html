@@ -2,49 +2,92 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>H5P Viewer (CDN test)</title>
+  <title>H5P Viewer (multi-source fallback)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>html,body{margin:0;height:100%;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}#app{min-height:100vh}.err{color:#b00;padding:1rem}.hint{padding:.75rem 1rem;background:#f6f8fa;border:1px solid #e5e7eb;border-radius:.5rem;margin:1rem}</style>
+  <!-- No CSP while debugging; add later if needed -->
+  <link rel="stylesheet" href="./h5p.css" />
+  <style>
+    html,body{margin:0;height:100%;background:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    #app{min-height:100vh}
+    .err{color:#b00;padding:1rem;line-height:1.4}
+    .hint{padding:.75rem 1rem;background:#f6f8fa;border:1px solid #e5e7eb;border-radius:.5rem;margin:1rem}
+    code{background:#f3f4f6;padding:0 .25rem;border-radius:.25rem}
+  </style>
   <script>
-    // Log any runtime errors so we can see them
-    window.addEventListener('error', e => console.error('Window error:', e.error || e.message || e));
-    function qp(n){ const u=new URL(location.href); return u.searchParams.get(n); }
+    // Utility
+    function qp(n){ const u = new URL(location.href); return u.searchParams.get(n); }
     function loadScript(src){
       return new Promise((resolve,reject)=>{
         const s=document.createElement('script');
-        s.src=src; s.onload=()=>{ console.log('Loaded',src); resolve(); };
-        s.onerror=()=>reject(new Error('Failed to load: '+src));
+        s.src = src + (src.includes('?') ? '&' : '?') + 'cb=' + Date.now(); // cache-bust
+        s.onload=()=>{ console.log('Loaded:', src); resolve(src); };
+        s.onerror=()=>reject(new Error('Failed to load: ' + src));
         document.head.appendChild(s);
       });
     }
+
+    // Try a list of sources in order until one works
+    async function loadWithFallback(sources, label){
+      let lastErr;
+      for (const src of sources){
+        try { return await loadScript(src); }
+        catch(e){ console.warn(label, e.message); lastErr = e; }
+      }
+      throw lastErr || new Error('No '+label+' source worked');
+    }
+
     async function boot(){
-      const app=document.getElementById('app');
-      const src=qp('src');
-      if(!src){ app.innerHTML='<div class="hint">No H5P source. Use <code>?src=&lt;url-to-your.h5p&gt;</code>.</div>'; return; }
+      const app = document.getElementById('app');
+      const src = qp('src'); // .h5p URL (or data:application/zip;base64,...)
+      if(!src){
+        app.innerHTML = '<div class="hint">No H5P source. Use <code>?src=&lt;url-to-your.h5p&gt;</code> or a <code>data:application/zip;base64,...</code> URL.</div>';
+        return;
+      }
 
-      // Load h5p-standalone from CDN (known good)
+      // Where to load bundles from (in order)
+      const MAIN_SOURCES = [
+        './main.bundle.js',
+        'https://unpkg.com/h5p-standalone@1.3.0/dist/main.bundle.js',
+        'https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/main.bundle.js',
+        'https://raw.githubusercontent.com/tunapanda/h5p-standalone/1.3.0/dist/main.bundle.js'
+      ];
+      const FRAME_SOURCES = [
+        './frame.bundle.js',
+        'https://unpkg.com/h5p-standalone@1.3.0/dist/frame.bundle.js',
+        'https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/frame.bundle.js',
+        'https://raw.githubusercontent.com/tunapanda/h5p-standalone/1.3.0/dist/frame.bundle.js'
+      ];
+
+      // Load bundles with fallback
       try {
-        await loadScript('https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/main.bundle.js');
-        await loadScript('https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/frame.bundle.js');
-      } catch(e){ app.innerHTML='<p class="err">'+e.message+'</p>'; return; }
+        await loadWithFallback(MAIN_SOURCES, 'main.bundle.js');
+        await loadWithFallback(FRAME_SOURCES, 'frame.bundle.js');
+      } catch(e){
+        app.innerHTML = '<p class="err">'+e.message+'<br/>Check network/CSP and that at least one source is reachable.</p>';
+        return;
+      }
 
+      // Detect global
       console.log('typeof H5PStandalone =', typeof window.H5PStandalone);
       console.log('typeof window["h5p-standalone"] =', typeof window['h5p-standalone']);
 
-      let tries=0;
+      let tries = 0;
       (function waitReady(){
         tries++;
         const HS = window.H5PStandalone || window['h5p-standalone'];
         if (HS && typeof HS.display === 'function') {
           console.log('H5P detected; rendering …');
           try { HS.display('#app', { h5pContent: src }); }
-          catch(e){ app.innerHTML='<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>'; }
-        } else if (tries < 240) { setTimeout(waitReady,50); }
+          catch(e){ app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>'; }
+        } else if (tries < 240) { setTimeout(waitReady, 50); }
         else {
-          app.innerHTML='<p class="err">H5P API not ready (CDN). Check console for errors.</p>';
+          app.innerHTML = '<p class="err">H5P API not ready. If both globals are "undefined", all bundle sources failed to execute. Open DevTools → Network to see which loads failed and why.</p>';
         }
       })();
     }
+
+    // Catch unhandled errors so they show up clearly
+    window.addEventListener('error', e => console.error('Window error:', e.error || e.message || e));
     document.addEventListener('DOMContentLoaded', boot);
   </script>
 </head>
