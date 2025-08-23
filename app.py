@@ -1,8 +1,8 @@
-# app.py — Cell Bio Tutor (slides-only, LLM-authored)
-# Uses GitHub Pages viewer that expects base64 via URL hash: #b64=<base64>
-# Viewer URL: https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html
+# app.py — Cell Bio Tutor (Slides-only, LLM-authored, H5P via viewer ?src=data:)
+# Viewer URL (must be the ?src variant):
+#   https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html?src=<URL-ENCODED data:application/zip;base64,...>
 
-import os, io, json, base64, zipfile, pathlib, re, uuid, hashlib, html
+import os, io, json, base64, zipfile, pathlib, re, uuid, hashlib, html, urllib.parse
 from typing import List, Dict, Optional, Tuple
 import streamlit as st
 import numpy as np
@@ -20,8 +20,8 @@ TEMPLATES_DIR = ROOT / "templates"
 FIB_MASTER = TEMPLATES_DIR / "rtk_fill_in_blanks_FIXED_blocks.h5p"
 DND_MASTER = TEMPLATES_DIR / "cellular_respiration_aligned_course_style.h5p"
 
-# Your viewer expects #b64=... (hash approach)
-GH_PAGES_VIEWER_HASH = "https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html#b64="
+# ✅ Viewer that expects ?src=
+GH_PAGES_VIEWER_QS = "https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html?src="
 
 # ------------------------------
 # OpenAI (lazy init)
@@ -99,14 +99,12 @@ def ensure_index() -> bool:
     if not SLIDES_DIR.exists():
         st.error("slides/ folder not found. Add your course PDFs there.")
         return False
-
     chunks = []
     for p in sorted(SLIDES_DIR.glob("*.pdf")):
         chunks.extend(extract_pages(p))
     if not chunks:
         st.error("No extractable text found in slides/.")
         return False
-
     st.session_state.index_chunks = chunks
 
     cli = client()
@@ -245,7 +243,10 @@ Write {n_items} MCQs as JSON array:
 [{{"question": "...", "options": ["A","B","C","D"], "answer_index": 0}}]
 Keep options concise; use only slide/fallback facts. If insufficient, return [].
 """
-    resp = client().chat.completions.create(
+    resp = client().chat_completions.create( # fallback in case .chat.completions differs
+        model="gpt-4o", temperature=0.2,
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}]
+    ) if hasattr(client(), "chat_completions") else client().chat.completions.create(
         model="gpt-4o", temperature=0.2,
         messages=[{"role":"system","content":sys},{"role":"user","content":user}]
     )
@@ -284,10 +285,8 @@ Distinct pairs; concise; use only context/fallback.
                 pairs.append((obj["drag"], obj["drop"]))
     except Exception:
         pairs = []
-
     if pairs:
         return pairs[:n_pairs]
-
     # Heuristic fallback
     t = topic.lower()
     if "electron transport" in t or "etc" in t or "oxidative" in t:
@@ -379,15 +378,21 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
         return None
 
 # ------------------------------
-# H5P renderer via GH Pages viewer (base64 hash)
+# H5P renderer via GH Pages viewer (?src=data:)
 # ------------------------------
-def render_h5p_via_pages_b64(h5p_bytes: bytes, comp_id: str, height: int = 620):
+def render_h5p_via_pages_src(h5p_bytes: bytes, height: int = 620):
     if not h5p_bytes:
-        return
+        return False
+    # Build a data URL and URL-encode it for the ?src= param
     b64 = base64.b64encode(h5p_bytes).decode("utf-8")
-    # IMPORTANT: use the hash form (#b64=...), not ?src=
-    viewer_url = GH_PAGES_VIEWER_HASH + b64
+    data_url = "data:application/zip;base64," + b64
+    encoded = urllib.parse.quote(data_url, safe="")
+    # If the URL gets too long, some browsers/iframes may choke. Guard it:
+    if len(encoded) > 180000:  # ~180 KB of URL-encoded data (heuristic)
+        return False
+    viewer_url = GH_PAGES_VIEWER_QS + encoded
     st.components.v1.iframe(src=viewer_url, height=height)
+    return True
 
 # ------------------------------
 # Sidebar / Controls
@@ -449,10 +454,7 @@ if current_run and current_run in st.session_state.cache:
 
     if data.get("fib_bytes"):
         st.success("Fill-in-the-Blanks (slides-only)")
-        try:
-            render_h5p_via_pages_b64(data["fib_bytes"], comp_id=f"fib-{current_run}", height=620)
-        except Exception as e:
-            st.error(f"Render error (FIB): {e}")
+        ok_inline = render_h5p_via_pages_src(data["fib_bytes"], height=620)
         st.download_button(
             "⬇️ Download FIB (.h5p)",
             data=data["fib_bytes"],
@@ -460,6 +462,8 @@ if current_run and current_run in st.session_state.cache:
             mime="application/zip",
             key=f"dl-fib-{current_run}-{hashlib.md5(data['fib_bytes']).hexdigest()[:8]}",
         )
+        if not ok_inline:
+            st.info("Inline preview skipped (payload too large for URL). Use the download button or host the file and pass ?src=<url>.")
 
     mcqs = data.get("mcqs", [])
     if mcqs:
@@ -474,10 +478,7 @@ if current_run and current_run in st.session_state.cache:
 
     if data.get("dnd_bytes"):
         st.success("Drag-and-Drop (slides-only)")
-        try:
-            render_h5p_via_pages_b64(data["dnd_bytes"], comp_id=f"dnd-{current_run}", height=620)
-        except Exception as e:
-            st.error(f"Render error (DnD): {e}")
+        ok_inline = render_h5p_via_pages_src(data["dnd_bytes"], height=620)
         st.download_button(
             "⬇️ Download DnD (.h5p)",
             data=data["dnd_bytes"],
@@ -485,3 +486,5 @@ if current_run and current_run in st.session_state.cache:
             mime="application/zip",
             key=f"dl-dnd-{current_run}-{hashlib.md5(data['dnd_bytes']).hexdigest()[:8]}",
         )
+        if not ok_inline:
+            st.info("Inline preview skipped (payload too large for URL). Use the download button or host the file and pass ?src=<url>.")
