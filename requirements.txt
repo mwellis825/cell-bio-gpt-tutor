@@ -1,5 +1,6 @@
 streamlit==1.36.0
-openai==1.43.0
+openai>=1.30.0
 httpx==0.25.2
 pypdf==4.2.0
 numpy==1.26.4
+requests==2.32.3
