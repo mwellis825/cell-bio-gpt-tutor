@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>H5P Viewer (robust export detection)</title>
+  <title>H5P Viewer (capture only h5p-standalone)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="./h5p.css" />
   <style>
@@ -11,11 +11,10 @@
     .err{color:#b00;padding:1rem;line-height:1.5}
     .hint{padding:.75rem 1rem;background:#f6f8fa;border:1px solid #e5e7eb;border-radius:.5rem;margin:1rem}
     code{background:#f3f4f6;padding:0 .25rem;border-radius:.25rem}
-    pre{white-space:pre-wrap;word-break:break-word;background:#f9fafb;border:1px solid #e5e7eb;border-radius:.5rem;padding:.75rem;margin:1rem}
   </style>
 
   <script>
-    // Minimal H5PIntegration must exist before frame.bundle.js
+    // 1) H5PIntegration must exist BEFORE frame.bundle.js
     window.H5PIntegration = {
       baseUrl: location.origin + location.pathname.replace(/\/[^\/]*$/, ''),
       url: location.href,
@@ -32,52 +31,71 @@
       contents: {}
     };
 
-    // AMD/CJS shims + capture
-    (function installCaptureShims(){
-      window.__H5P_EXPORT__ = undefined;
-      const cjsModule  = { exports: {} };
-      const cjsExports = cjsModule.exports;
-
-      Object.defineProperty(window, 'module',  { configurable: true, writable: true, value: cjsModule  });
-      Object.defineProperty(window, 'exports', { configurable: true, writable: true, value: cjsExports });
-
+    // 2) AMD shim that ONLY captures the 'h5p-standalone' module
+    (function installAmdShim(){
+      // We do NOT define CommonJS globals so UMD prefers AMD and calls define('h5p-standalone', ...)
+      // Minimal AMD 'define' that recognizes module name and deps
       function amdDefine(name, deps, factory){
-        if (typeof name === 'function') { factory = name; deps = []; }
-        else if (Array.isArray(name))   { factory = deps; deps = name; }
+        // normalize arguments
+        if (typeof name === 'function') { factory = name; deps = []; name = undefined; }
+        else if (Array.isArray(name))   { factory = deps; deps = name; name = undefined; }
         else if (typeof deps === 'function') { factory = deps; deps = []; }
+
+        // Resolve deps (very permissive). We explicitly DO NOT capture jquery.
         let resolved = [];
         if (Array.isArray(deps)) {
           resolved = deps.map(d => {
-            if (d === 'exports') return cjsExports;
-            if (d === 'module')  return cjsModule;
-            if (d === 'require') return function(){};
-            if (d === 'h5p-standalone' || d === 'H5PStandalone')
-              return window.H5PStandalone || window['h5p-standalone'] || window.__H5P_EXPORT__;
+            if (d === 'exports') return {};           // not used by the dist build
+            if (d === 'module')  return {};           // not used by the dist build
+            if (d === 'require') return function(){}; // stub
+            if (d === 'jquery' || d === 'JQuery' || d === 'jQuery') {
+              return window.jQuery || window.$ || function(){}; // pass-through if present, harmless stub otherwise
+            }
+            // For any other dep name, return an empty object to satisfy the call
             return {};
           });
         }
-        let out = (typeof factory === 'function') ? factory.apply(null, resolved) : factory;
-        if (out && (typeof out === 'object' || typeof out === 'function')) window.__H5P_EXPORT__ = out;
+
+        // Invoke factory
+        const out = (typeof factory === 'function') ? factory.apply(null, resolved) : factory;
+
+        // Only capture when the module NAME is clearly 'h5p-standalone'
+        const isH5PStandaloneName = typeof name === 'string' && /(^|\/)h5p-standalone$/i.test(name.trim());
+
+        // Determine if the output looks like the H5PStandalone API
+        const hasDisplay =
+          out && (typeof out.display === 'function' ||
+                 (out.default && typeof out.default.display === 'function'));
+
+        if (isH5PStandaloneName && hasDisplay) {
+          // Promote to globals (both spellings)
+          const api = out.display ? out : out.default;
+          window.H5PStandalone = api;
+          window['h5p-standalone'] = api;
+        }
+
+        // Return whatever the module returned (important for internal requires)
         return out;
       }
-      amdDefine.amd = {};
+      amdDefine.amd = {}; // signal AMD is present
       Object.defineProperty(window, 'define',  { configurable: true, writable: true, value: amdDefine });
       Object.defineProperty(window, 'require', { configurable: true, writable: true, value: function(){ return {}; } });
-
-      window.__finalizeH5PStandalone__ = function(){
-        const candidate =
-          window.__H5P_EXPORT__ ||
-          (window.module && window.module.exports) ||
-          window.H5PStandalone ||
-          window['h5p-standalone'];
-        if (candidate && (typeof candidate === 'object' || typeof candidate === 'function')) {
-          window.H5PStandalone = candidate;
-          window['h5p-standalone'] = candidate;
-        }
-      };
     })();
 
+    // Helpers
     function qp(n){ const u=new URL(location.href); return u.searchParams.get(n); }
+    function loadScript(src){
+      return new Promise((resolve,reject)=>{
+        const s=document.createElement('script');
+        s.src = src; s.async = false; // keep order
+        s.onload=()=>{ console.log('Loaded', src); resolve(); };
+        s.onerror=()=>reject(new Error('Failed to load: '+src));
+        document.head.appendChild(s);
+      });
+    }
+
+    window.addEventListener('error', e => console.error('Window error:', e.error || e.message || e));
+    window.addEventListener('unhandledrejection', e => console.error('Unhandled promise rejection:', e.reason || e));
   </script>
 
   <!-- Load in order -->
@@ -96,39 +114,34 @@
         return;
       }
 
-      if (typeof window.__finalizeH5PStandalone__ === 'function') {
-        try { window.__finalizeH5PStandalone__(); } catch {}
-      }
-
       let tries = 0;
       (function waitReady(){
         tries++;
-        const rawHS =
-          window.H5PStandalone ||
-          window['h5p-standalone'] ||
-          window.__H5P_EXPORT__ ||
-          (window.module && window.module.exports);
+        // Prefer the explicit capture; also accept default export pattern
+        let HS = window.H5PStandalone || window['h5p-standalone'];
+        if (!HS && window.H5PStandalone && window.H5PStandalone.default && typeof window.H5PStandalone.default.display === 'function') {
+          HS = window.H5PStandalone.default;
+        }
+        if (!HS && window['h5p-standalone'] && window['h5p-standalone'].default && typeof window['h5p-standalone'].default.display === 'function') {
+          HS = window['h5p-standalone'].default;
+        }
 
-        // Some builds export { default: { display() {…} } }
-        const HS = rawHS && (rawHS.display ? rawHS : (rawHS.default && rawHS.default.display ? rawHS.default : null));
+        // Guard against accidentally capturing jQuery again:
+        // jQuery is a function with lots of keys like fn, ajax, Deferred, etc., and no display()
+        const looksLikeJQuery = HS && typeof HS === 'function' && HS.fn && HS.ajax && !HS.display;
+        if (looksLikeJQuery) HS = null;
 
         if (HS && typeof HS.display === 'function') {
-          console.log('Resolved H5P API object =', HS === rawHS ? 'global export' : 'export.default');
+          console.log('Resolved H5P API =', HS === (window.H5PStandalone||window['h5p-standalone']) ? 'captured export' : 'export.default');
           try { HS.display('#app', { h5pContent: src }); }
-          catch(e){
-            console.error(e);
-            app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>';
-          }
+          catch(e){ app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>'; }
         } else if (tries < 240) {
           setTimeout(waitReady, 50); // ~12s total
         } else {
-          console.log('Debug types:',
-            'H5PStandalone =', typeof window.H5PStandalone,
-            '| h5p-standalone =', typeof window['h5p-standalone'],
-            '| __H5P_EXPORT__ =', typeof window.__H5P_EXPORT__,
-            '| module.exports =', typeof (window.module && window.module.exports),
-            '| rawHS keys =', rawHS && Object.keys(rawHS || {}));
-          app.innerHTML = '<p class="err">H5P API not ready. Export present but no <code>display()</code>. This usually means your bundles are not the <em>standalone dist</em> from <code>h5p-standalone@1.3.0/dist</code> or they are a variant that requires <code>export.default</code>. This viewer now checks <code>export.default.display</code> too.</p>';
+          console.log('typeof H5PStandalone =', typeof window.H5PStandalone);
+          console.log('typeof window["h5p-standalone"] =', typeof window['h5p-standalone']);
+          if (window.H5PStandalone && window.H5PStandalone.fn) console.log('Note: H5PStandalone looks like jQuery; not using it.');
+          app.innerHTML = '<p class="err">H5P API not ready. If the capture still grabs jQuery, ensure your two JS files are the official <em>dist</em> builds from <code>h5p-standalone@1.3.0/dist</code>.</p>';
         }
       })();
     })();
