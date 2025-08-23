@@ -31,10 +31,6 @@ def read_pdfs(files) -> str:
     return txt[:12000]  # keep prompt modest
 
 def ask_json(topic: str, slide_text: str, model="gpt-4o-mini") -> Dict[str, Any]:
-    """
-    Force JSON with response_format, 2-pass fallback.
-    Returns dict or {}.
-    """
     base_user = f"""
 Using ONLY these slide excerpts, author a concise Drag-the-Words activity for college Cell Biology on: "{topic}".
 
@@ -59,7 +55,6 @@ SLIDES:
 {slide_text}
 """.strip()
 
-    # Pass 1: strict JSON
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -75,7 +70,6 @@ SLIDES:
     except Exception as e:
         st.warning(f"Retrying with a stricter format (pass 2). First error: {e}")
 
-    # Pass 2: add a tiny example and lower temp
     fewshot_user = base_user + """
 
 EXAMPLE (structure only; content must come from slides):
@@ -149,10 +143,7 @@ def build_h5p_drag_words(title: str, instructions: str, clozes: List[str]) -> by
     return buf.getvalue()
 
 def load_runtime_b64_from_repo() -> dict:
-    """
-    Read the three runtime files from ./runtime and return as base64 strings.
-    No network calls.
-    """
+    """Read ./runtime files and return base64 strings."""
     root = Path(__file__).parent
     files = {
         "main":  root / "runtime" / "main.bundle.js",
@@ -174,7 +165,7 @@ def load_runtime_b64_from_repo() -> dict:
     return out
 
 def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 760):
-    """Create Blob URLs in iframe for runtime; feed base64 .h5p to H5PStandalone.display()."""
+    """Create Blob URLs; robustly resolve H5PStandalone export (with .default fallback)."""
     main_b64  = runtime_b64["main"]
     frame_b64 = runtime_b64["frame"]
     css_b64   = runtime_b64["css"]
@@ -184,13 +175,19 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
 <html>
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>html,body,#app{{margin:0;height:100%}} .badge{{position:fixed;right:8px;top:8px;padding:4px 8px;background:#eef;border:1px solid #99c;border-radius:6px;font:12px sans-serif;opacity:.9}}</style>
+<style>
+  html,body,#app{{margin:0;height:100%}}
+  .badge{{position:fixed;right:8px;top:8px;padding:4px 8px;background:#eef;border:1px solid #99c;border-radius:6px;font:12px sans-serif;opacity:.9}}
+  .msg{{padding:12px;font:14px system-ui}}
+  pre{{white-space:pre-wrap;word-break:break-word;background:#f7f7f8;padding:8px;border-radius:6px}}
+</style>
 <script>
   function blobUrl(b64, type){{
     const bin = atob(b64); const len = bin.length; const bytes = new Uint8Array(len);
     for (let i=0;i<len;i++) bytes[i] = bin.charCodeAt(i);
     return URL.createObjectURL(new Blob([bytes], {{type}}));
   }}
+  // Required by frame.bundle.js
   window.H5PIntegration = {{
     baseUrl: location.origin, url: location.href, siteUrl: location.origin,
     hubIsEnabled: false, disableHub: true, postUserStatistics: false, saveFreq: false,
@@ -205,29 +202,54 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
 <div class="badge">Runtime: local</div>
 <link id="h5pcss" rel="stylesheet">
 <script>
-  // Inject CSS from local base64
+  // Inject CSS
   document.getElementById('h5pcss').href = blobUrl("{css_b64}", "text/css");
-  // Load JS in order from local base64
+
+  // Load JS in order
   const mainUrl  = blobUrl("{main_b64}",  "application/javascript");
   const frameUrl = blobUrl("{frame_b64}", "application/javascript");
 
   function loadScript(src){{
-    return new Promise((res, rej)=>{{ const s=document.createElement('script'); s.src=src; s.onload=res; s.onerror=rej; document.body.appendChild(s); }});
+    return new Promise((res, rej)=>{{
+      const s=document.createElement('script'); s.src=src; s.onload=res; s.onerror=rej; document.body.appendChild(s);
+    }});
+  }}
+
+  function resolveHS() {{
+    // Try all common export patterns
+    let HS = window.H5PStandalone || window['h5p-standalone'];
+    if (HS && typeof HS.display === 'function') return HS;
+    if (HS && HS.default && typeof HS.default.display === 'function') return HS.default;
+    // Some builds attach to window as { default: fn }
+    const maybe = (window.H5PStandalone && window.H5PStandalone.default) || (window['h5p-standalone'] && window['h5p-standalone'].default);
+    if (maybe && typeof maybe.display === 'function') return maybe;
+    return null;
   }}
 
   (async function boot(){{
     try {{
       await loadScript(mainUrl);
       await loadScript(frameUrl);
-      const HS = window.H5PStandalone || window['h5p-standalone'];
+      const HS = resolveHS();
       if (HS && typeof HS.display === 'function') {{
         const src = 'data:application/zip;base64,{h5p_b64}';
         HS.display('#app', {{ h5pContent: src }});
       }} else {{
-        document.getElementById('app').innerHTML = '<div style="padding:12px;font:14px system-ui">H5P API not ready (no display()).</div>';
+        const diag = {{
+          typeof_H5PStandalone: typeof window.H5PStandalone,
+          typeof_h5p_standalone: typeof window['h5p-standalone'],
+          has_default_on_H5PStandalone: !!(window.H5PStandalone && window.H5PStandalone.default),
+          has_default_on_hyphen: !!(window['h5p-standalone'] && window['h5p-standalone'].default),
+          keys_H5PStandalone: (window.H5PStandalone && Object.keys(window.H5PStandalone)) || null,
+          keys_hyphen: (window['h5p-standalone'] && Object.keys(window['h5p-standalone'])) || null
+        }};
+        document.getElementById('app').innerHTML =
+          '<div class="msg"><b>H5P API not ready (no display()).</b><br>Diagnostics:<br><pre>'+JSON.stringify(diag,null,2)+'</pre>' +
+          'Confirm that <code>runtime/main.bundle.js</code> and <code>runtime/frame.bundle.js</code> are the UMD dist files from <code>h5p-standalone@1.3.0/dist</code> (not HTML, not source builds).</div>';
       }}
     }} catch(e) {{
-      document.getElementById('app').innerHTML = '<div style="padding:12px;font:14px system-ui">Failed loading runtime: '+(e && e.message || e)+'</div>';
+      document.getElementById('app').innerHTML =
+        '<div class="msg">Failed loading runtime: '+(e && e.message || e)+'</div>';
     }}
   }})();
 </script>
@@ -247,35 +269,40 @@ topic = st.text_input("2) Topic (e.g., Electron transport chain, RTK signaling)"
 go = st.button("Generate & Render Inline H5P")
 
 if go:
+    # 1) Slides
     slide_text = read_pdfs(slides)
     if not slide_text:
         st.error("No slide text detected. Please upload slides (PDF).")
-    else:
-        data = ask_json(topic=topic, slide_text=slide_text)
-        if not data:
-            st.error("Could not parse LLM output after two attempts. Try a narrower topic or different slides.")
-        else:
-            title = data.get("title") or f"{topic} — Drag the Words"
-            instructions = data.get("instructions") or "Fill the missing terms."
-            clozes_raw = data.get("clozes", [])
-            clozes = [c for c in clozes_raw if isinstance(c, str) and "**" in c][:7]
+        st.stop()
 
-            if not clozes:
-                st.error("No valid clozes with **answer** markers returned. Try regenerating.")
-            else:
-                # Build H5P and render with local runtime
-                h5p_bytes = build_h5p_drag_words(title, instructions, clozes)
-                h5p_b64   = base64.b64encode(h5p_bytes).decode("ascii")
-                try:
-                    runtime_b64 = load_runtime_b64_from_repo()
-                except Exception as e:
-                    st.error(str(e))
-                    runtime_b64 = None
+    # 2) LLM → JSON
+    data = ask_json(topic=topic, slide_text=slide_text)
+    if not data:
+        st.error("Could not parse LLM output after two attempts. Try a narrower topic or different slides.")
+        st.stop()
 
-                if runtime_b64:
-                    st.success("Generated H5P. Rendering inline below (look for the 'Runtime: local' badge)…")
-                    render_h5p_inline_from_b64(h5p_b64, runtime_b64, height=760)
+    title = data.get("title") or f"{topic} — Drag the Words"
+    instructions = data.get("instructions") or "Fill the missing terms."
+    clozes_raw = data.get("clozes", [])
+    clozes = [c for c in clozes_raw if isinstance(c, str) and "**" in c][:7]
+    if not clozes:
+        st.error("No valid clozes with **answer** markers returned. Try regenerating.")
+        st.stop()
 
-                # Optional: also offer download (LMS backup)
-                safe_name = re.sub(r'[^a-z0-9]+','_',title.lower()).strip('_') + ".h5p"
-                st.download_button("⬇️ Download this H5P", data=h5p_bytes, file_name=safe_name, mime="application/zip")
+    # 3) Build H5P
+    h5p_bytes = build_h5p_drag_words(title, instructions, clozes)
+    h5p_b64   = base64.b64encode(h5p_bytes).decode("ascii")
+
+    # 4) Load local runtime
+    try:
+        runtime_b64 = load_runtime_b64_from_repo()
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
+    st.success("Generated H5P. Rendering inline below (look for the 'Runtime: local' badge)…")
+    render_h5p_inline_from_b64(h5p_b64, runtime_b64, height=760)
+
+    # 5) Optional download
+    safe_name = re.sub(r'[^a-z0-9]+','_',title.lower()).strip('_') + ".h5p"
+    st.download_button("⬇️ Download this H5P", data=h5p_bytes, file_name=safe_name, mime="application/zip")
