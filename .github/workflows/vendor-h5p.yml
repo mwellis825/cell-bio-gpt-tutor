@@ -1,4 +1,4 @@
-name: Vendor H5P runtime into docs (robust)
+name: Vendor H5P runtime into docs (robust, simple)
 
 on:
   workflow_dispatch:
@@ -18,92 +18,59 @@ jobs:
       - name: Ensure docs directory
         run: mkdir -p docs
 
-      - name: Fetch h5p-standalone dist from multiple sources
+      - name: Fetch main.bundle.js
         shell: bash
         run: |
-          set -euo pipefail
-          cd "$(git rev-parse --show-toplevel)"
-
-          # helper: download one file with fallback list
-          fetch_one () {
-            local outfile="$1"; shift
-            for url in "$@"; do
-              echo "→ trying $url"
-              if curl -fsSL "$url" -o "$outfile"; then
-                echo "✓ saved $outfile"
-                return 0
-              else
-                echo "✗ failed: $url"
-              fi
-            done
-            return 1
-          }
-
-          # try to fetch JS+CSS directly from mirrors first
-          MAIN_CANDIDATES=(
-            "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@1.3.0/dist/main.bundle.js"
-            "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@master/dist/main.bundle.js"
-            "https://unpkg.com/h5p-standalone@latest/dist/main.bundle.js"
-          )
-          FRAME_CANDIDATES=(
-            "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@1.3.0/dist/frame.bundle.js"
-            "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@master/dist/frame.bundle.js"
-            "https://unpkg.com/h5p-standalone@latest/dist/frame.bundle.js"
-          )
-          CSS_CANDIDATES=(
-            "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@1.3.0/dist/styles/h5p.css"
-            "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@master/dist/styles/h5p.css"
-            "https://unpkg.com/h5p-standalone@latest/dist/styles/h5p.css"
-          )
-
-          HAVE_DIRECT=true
-          fetch_one docs/main.bundle.js "${MAIN_CANDIDATES[@]}" || HAVE_DIRECT=false
-          fetch_one docs/frame.bundle.js "${FRAME_CANDIDATES[@]}" || HAVE_DIRECT=false
-          fetch_one docs/h5p.css       "${CSS_CANDIDATES[@]}"  || HAVE_DIRECT=false
-
-          if [ "$HAVE_DIRECT" = false ]; then
-            echo "Direct mirror fetch failed; falling back to npm registry tarball…"
-            rm -f docs/main.bundle.js docs/frame.bundle.js docs/h5p.css || true
-            TMPDIR="$(mktemp -d)"
-            pushd "$TMPDIR" >/dev/null
-            # get npm dist-tag latest tarball
-            if curl -fsSL "https://registry.npmjs.org/h5p-standalone/-/h5p-standalone-latest.tgz" -o h5p.tgz; then
-              :
-            else
-              # some registries require version; fetch index to find latest
-              python3 - <<'PY' > latest.txt
-import json,urllib.request
-d=json.load(urllib.request.urlopen("https://registry.npmjs.org/h5p-standalone"))
-print(d.get("dist-tags",{}).get("latest",""))
-PY
-              V=$(cat latest.txt)
-              [ -n "$V" ] || { echo "Could not resolve npm latest"; exit 1; }
-              curl -fsSL "https://registry.npmjs.org/h5p-standalone/-/h5p-standalone-${V}.tgz" -o h5p.tgz
-            fi
-            tar -xzf h5p.tgz
-            # copy from dist
-            if [ -f package/dist/main.bundle.js ] && [ -f package/dist/frame.bundle.js ]; then
-              cp package/dist/main.bundle.js   "$OLDPWD/docs/main.bundle.js"
-              cp package/dist/frame.bundle.js  "$OLDPWD/docs/frame.bundle.js"
-              if [ -f package/dist/styles/h5p.css ]; then
-                cp package/dist/styles/h5p.css "$OLDPWD/docs/h5p.css"
-              elif [ -f package/dist/h5p.css ]; then
-                cp package/dist/h5p.css "$OLDPWD/docs/h5p.css"
-              else
-                echo "ERROR: h5p.css not found inside npm tarball"
-                exit 1
-              fi
-            else
-              echo "ERROR: dist files not found inside npm tarball"
-              exit 1
-            fi
-            popd >/dev/null
+          set -e
+          echo "Fetching main.bundle.js…"
+          # Try jsDelivr tag 1.3.0
+          if curl -fsSL "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@1.3.0/dist/main.bundle.js" -o docs/main.bundle.js; then
+            echo "Got main.bundle.js from jsDelivr 1.3.0"
+          # Try jsDelivr master
+          elif curl -fsSL "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@master/dist/main.bundle.js" -o docs/main.bundle.js; then
+            echo "Got main.bundle.js from jsDelivr master"
+          # Try unpkg latest
+          elif curl -fsSL "https://unpkg.com/h5p-standalone@latest/dist/main.bundle.js" -o docs/main.bundle.js; then
+            echo "Got main.bundle.js from unpkg latest"
+          else
+            echo "ERROR: Could not fetch main.bundle.js from any mirror"
+            exit 1
           fi
 
-          echo "Final docs/ listing:"
-          ls -lh docs
+      - name: Fetch frame.bundle.js
+        shell: bash
+        run: |
+          set -e
+          echo "Fetching frame.bundle.js…"
+          if curl -fsSL "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@1.3.0/dist/frame.bundle.js" -o docs/frame.bundle.js; then
+            echo "Got frame.bundle.js from jsDelivr 1.3.0"
+          elif curl -fsSL "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@master/dist/frame.bundle.js" -o docs/frame.bundle.js; then
+            echo "Got frame.bundle.js from jsDelivr master"
+          elif curl -fsSL "https://unpkg.com/h5p-standalone@latest/dist/frame.bundle.js" -o docs/frame.bundle.js; then
+            echo "Got frame.bundle.js from unpkg latest"
+          else
+            echo "ERROR: Could not fetch frame.bundle.js from any mirror"
+            exit 1
+          fi
+
+      - name: Fetch h5p.css
+        shell: bash
+        run: |
+          set -e
+          echo "Fetching h5p.css…"
+          if curl -fsSL "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@1.3.0/dist/styles/h5p.css" -o docs/h5p.css; then
+            echo "Got h5p.css from jsDelivr 1.3.0"
+          elif curl -fsSL "https://cdn.jsdelivr.net/gh/tunapanda/h5p-standalone@master/dist/styles/h5p.css" -o docs/h5p.css; then
+            echo "Got h5p.css from jsDelivr master"
+          elif curl -fsSL "https://unpkg.com/h5p-standalone@latest/dist/styles/h5p.css" -o docs/h5p.css; then
+            echo "Got h5p.css from unpkg latest"
+          else
+            echo "ERROR: Could not fetch h5p.css from any mirror"
+            exit 1
+          fi
 
       - name: Commit files to main
+        shell: bash
         run: |
           set -e
           git config user.name  "github-actions[bot]"
@@ -115,3 +82,6 @@ PY
             git commit -m "Vendor h5p-standalone dist into docs (automated)"
             git push origin main
           fi
+
+      - name: Show docs listing
+        run: ls -lh docs
