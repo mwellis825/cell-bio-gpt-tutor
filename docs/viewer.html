@@ -3,17 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-
-  <!-- CSP: allow local, blob:, data:, and https (CDN + your .h5p host) -->
+  <!-- CSP: allow local + blob/data for H5P -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self' https: data: blob:;
-                 script-src  'self' https: 'unsafe-inline' 'unsafe-eval' data: blob:;
-                 style-src   'self' https: 'unsafe-inline' data: blob:;
-                 img-src     'self' https: data: blob:;
-                 connect-src 'self' https: data: blob:;
+        content="default-src 'self' data: blob:;
+                 script-src  'self' 'unsafe-inline' 'unsafe-eval' data: blob:;
+                 style-src   'self' 'unsafe-inline' data: blob:;
+                 img-src     'self' data: blob:;
+                 connect-src 'self' data: blob:;
                  worker-src  'self' blob:;">
 
-  <!-- Core H5P CSS you put in /docs (from h5p-standalone dist) -->
   <link rel="stylesheet" href="./h5p.css" />
   <style>
     html, body { height:100%; margin:0; background:#fff; }
@@ -21,8 +19,8 @@
     .err { color:#b00; padding:1rem; font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
   </style>
 
-  <!-- Define H5PIntegration BEFORE any bundles -->
   <script>
+    // Define H5PIntegration BEFORE any bundles
     window.H5PIntegration = {
       baseUrl: window.location.origin + window.location.pathname.replace(/\/[^\/]*$/, ''),
       url: window.location.href,
@@ -38,9 +36,7 @@
       loadedJs: [], loadedCss: [],
       contents: {}
     };
-  </script>
 
-  <script>
     function qp(name) {
       const u = new URL(location.href);
       return u.searchParams.get(name);
@@ -54,35 +50,23 @@
         document.head.appendChild(s);
       });
     }
+
     async function boot() {
       const app = document.getElementById('app');
-      const src = qp('src'); // <-- absolute/public URL to the .h5p file
+      const src = qp('src'); // absolute URL or data: URL to the .h5p
       if (!src) {
         app.innerHTML = '<p class="err">No H5P source. Use <code>?src=&lt;url-to-your.h5p&gt;</code>.</p>';
         return;
       }
 
-      // 1) Try LOCAL bundles (from /docs)
       try {
         await loadScript("./main.bundle.js");
         await loadScript("./frame.bundle.js");
       } catch (e) {
-        console.warn(e.message);
+        app.innerHTML = '<p class="err">' + e.message + '</p>';
+        return;
       }
 
-      // 2) If not ready, fall back to CDN (known-good version)
-      if (!(window.H5PStandalone && typeof window.H5PStandalone.display === 'function')) {
-        console.warn("Local bundles did not expose H5PStandalone; loading CDN fallback…");
-        try {
-          await loadScript("https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/main.bundle.js");
-          await loadScript("https://cdn.jsdelivr.net/npm/h5p-standalone@1.3.0/dist/frame.bundle.js");
-        } catch (e) {
-          app.innerHTML = '<p class="err">' + e.message + '</p>';
-          return;
-        }
-      }
-
-      // 3) Wait for readiness and display the .h5p from ?src=
       let tries = 0;
       (function waitReady(){
         tries++;
@@ -94,13 +78,13 @@
             app.innerHTML = '<p class="err">Could not initialize H5P: ' +
               (e && e.message ? e.message : e) + '</p>';
           }
-        } else if (tries < 240) {
-          setTimeout(waitReady, 50);
-        } else {
-          app.innerHTML = '<p class="err">H5P API not ready. Verify CSP and bundles.</p>';
+        } else if (tries < 240) { setTimeout(waitReady, 50); }
+        else {
+          app.innerHTML = '<p class="err">H5P API not ready. Check that <code>main.bundle.js</code>, <code>frame.bundle.js</code>, and <code>h5p.css</code> exist in /docs and are the real files.</p>';
         }
       })();
     }
+
     document.addEventListener('DOMContentLoaded', boot);
   </script>
 </head>
