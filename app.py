@@ -1,4 +1,4 @@
-import os, re, io, json, base64, zipfile, random
+import os, re, io, json, base64, zipfile, random, glob
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
@@ -8,6 +8,7 @@ from openai import OpenAI
 
 # ------------------ CONFIG ------------------
 st.set_page_config(page_title="Cell Bio Tutor — Inline DnD + Critical FITB", layout="wide")
+
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     st.error("Missing OPENAI_API_KEY in Streamlit secrets or environment.")
@@ -16,22 +17,29 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 SYSTEM = (
     "You are a rigorous, supportive Cell Biology tutor. "
     "Use ONLY the provided slide excerpts (and OpenStax Biology if slides lack coverage) "
-    "to create concise, causal, critical-thinking practice (not recall)."
+    "to create concise, causal, critical-thinking practice. "
+    "Never invent placeholder entities like 'protein X' or 'protein Z'. "
+    "Always use concrete, named entities found in the slides or OpenStax (e.g., 'ATP synthase', 'complex I'). "
+    "Write in plain language; if a technical term is required, add a parenthetical clarifier (e.g., 'cathode (negative end)')."
 )
 
+SLIDES_DIR = Path(__file__).parent / "slides"  # put PDFs here so students never re-upload
+
 # ------------------ UTILITIES ------------------
-def extract_text_from_pdfs(files) -> str:
+def extract_text_from_repo_slides() -> str:
+    """Concatenate text from all PDFs in ./slides folder."""
+    pdf_paths = sorted(glob.glob(str(SLIDES_DIR / "*.pdf")))
     chunks = []
-    for f in files or []:
+    for path in pdf_paths:
         try:
-            r = PdfReader(f)
-            text = "\n".join((p.extract_text() or "") for p in r.pages)
-            chunks.append(text)
+            with open(path, "rb") as f:
+                r = PdfReader(f)
+                text = "\n".join((p.extract_text() or "") for p in r.pages)
+                chunks.append(text)
         except Exception as e:
-            st.warning(f"Could not read {getattr(f,'name','file')}: {e}")
-    # compact
+            st.warning(f"Could not read {Path(path).name}: {e}")
     full = re.sub(r"\s+", " ", "\n\n".join(chunks)).strip()
-    return full[:20000]
+    return full[:25000]
 
 def levenshtein(a: str, b: str) -> int:
     a, b = a.lower(), b.lower()
@@ -73,7 +81,9 @@ Rules:
 - Prefer causal predictions and “what happens if…” reasoning over recall.
 - Each **answer** is 1–2 words present in the slides’ phrasing where possible.
 - Keep each sentence short (<= 18 words).
+- Use plain language; add parenthetical clarifiers when a technical term appears.
 - Do NOT include extra fields or markdown outside **answer** markers.
+- Never invent placeholders like “protein X/Z”. Use concrete names from slides or OpenStax only.
 """
 
 MATCHING_INSTRUCTION = """Return JSON ONLY with:
@@ -92,7 +102,9 @@ Rules:
 - Use ONLY the slide excerpts; if insufficient, you MAY draw on OpenStax Biology to fill small gaps.
 - 6–10 pairs total. Make them conceptual (e.g., “RTK always-active → MAPK output increases”), not trivia.
 - Keep phrases short (<= 6 words) and precise.
+- Use plain language with parenthetical clarifiers for jargon when needed.
 - right_choices must contain every unique target in the pairs.
+- Never invent placeholders like “protein X/Z”. Use concrete names from slides or OpenStax only.
 """
 
 def ask_llm_for_cloze(topic: str, slides: str, prior_grade: float) -> Dict[str, Any]:
@@ -170,7 +182,6 @@ def build_h5p_dragtext_zip(title: str, instructions: str, clozes_markdown: List[
     return buf.getvalue()
 
 def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[str,str]]) -> bytes:
-    # Represent matching as MCQs inside a QuestionSet for portability
     questions = []
     all_rights = sorted(list({p["right"] for p in pairs}))
     for p in pairs:
@@ -202,9 +213,9 @@ def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[s
         "mainLibrary": "H5P.QuestionSet",
         "embedTypes": ["div"],
         "preloadedDependencies": [
-            {"machineName":"H5P.QuestionSet","majorVersion":1,"minorVersion":17},
-            {"machineName":"H5P.MultiChoice","majorVersion":1,"minorVersion":14},
-            {"machineName":"H5P.JoubelUI","majorVersion":1,"minorVersion":3},
+                {"machineName":"H5P.QuestionSet","majorVersion":1,"minorVersion":17},
+                {"machineName":"H5P.MultiChoice","majorVersion":1,"minorVersion":14},
+                {"machineName":"H5P.JoubelUI","majorVersion":1,"minorVersion":3},
         ],
     }
     buf = io.BytesIO()
@@ -217,7 +228,7 @@ def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[s
 def render_inline_cloze(title: str, instructions: str, clozes: List[str], key_prefix: str) -> Tuple[int,int]:
     st.subheader(f"🧠 {title}")
     st.write(instructions)
-    total = len(clozes); correct = 0
+    total = len(clozes); n_correct = 0
     with st.form(key=f"{key_prefix}_form"):
         answers: Dict[int,str] = {}
         for i, s in enumerate(clozes, start=1):
@@ -235,26 +246,14 @@ def render_inline_cloze(title: str, instructions: str, clozes: List[str], key_pr
             truth = truth[0] if truth else ""
             student = st.session_state.get(f"{key_prefix}_a{i}","")
             ok = ok_match(student, truth)
-            correct += int(ok)
+            n_correct += int(ok)
             st.write(f"{'✅' if ok else '❌'} {i}. Correct: **{truth}** — Yours: _{student or '(blank)'}_")
-        st.info(f"Score: {correct}/{total}")
-    return correct, total
+        st.info(f"Score: {n_correct}/{total}")
+    return n_correct, total
 
-def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,str]], right_choices: List[str], key_prefix: str, height: int = 520):
-    """
-    True HTML5 drag-and-drop:
-      - Draggables (left) are compact pills (text sized to content)
-      - Drop zones (right) are compact, accept many items
-      - Center-aligned placement in zones; one-click check + reset
-    """
-    # Prepare payload for the component
+def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,str]], right_choices: List[str], key_prefix: str, height: int = 560):
     rights = sorted(list({p["right"] for p in pairs})) or right_choices
-    data = {
-        "title": title,
-        "instructions": instructions,
-        "pairs": pairs,
-        "rights": rights
-    }
+    data = {"title": title, "instructions": instructions, "pairs": pairs, "rights": rights}
     payload = json.dumps(data)
 
     html = f"""
@@ -340,7 +339,7 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
     }});
 
     // Build drop zones (right)
-    rights.forEach((r, j) => {{
+    rights.forEach((r) => {{
       const z = document.createElement('div');
       z.className = 'zone';
       z.dataset.target = r;
@@ -387,20 +386,17 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
 
     // Check answers
     document.getElementById('check').addEventListener('click', () => {{
-      let correct = 0, total = pairs.length;
-      // clear styles
+      let got = 0, total = pairs.length;
       document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
-      // score: each pill in correct target zone counts +1
       document.querySelectorAll('.zone').forEach(zone => {{
         const target = zone.dataset.target;
         zone.querySelectorAll('.pill').forEach(pill => {{
           const ok = pill.dataset.answer === target;
           pill.classList.add(ok ? 'ok' : 'bad');
-          if (ok) correct += 1;
+          if (ok) got += 1;
         }});
       }});
-      // pills still in bank count as incorrect
-      scoreBox.textContent = `Score: ${correct}/${total}`;
+      scoreBox.textContent = `Score: ${got}/${total}`;
     }});
   </script>
 </body>
@@ -416,10 +412,14 @@ if "history" not in st.session_state:
     st.session_state.history = []
 
 st.title("🧬 Cell Bio Tutor — True Drag-and-Drop + Critical FITB (inline)")
-with st.expander("1) Upload your course slides (PDF)"):
-    slides = st.file_uploader("Upload 1–10 PDFs", type=["pdf"], accept_multiple_files=True)
 
-topic = st.text_input("2) Topic (e.g., 'RTK signaling', 'Electron transport chain')")
+# Slides are loaded automatically from ./slides
+slides_ok = SLIDES_DIR.exists() and any(Path(p).suffix.lower()==".pdf" for p in glob.glob(str(SLIDES_DIR / "*.pdf")))
+if not slides_ok:
+    st.warning("No PDFs found in ./slides. Add your lecture PDFs to a 'slides' folder in the repo so content is used automatically.")
+slide_text = extract_text_from_repo_slides() if slides_ok else ""
+
+topic = st.text_input("Topic (e.g., 'RTK signaling', 'Electron transport chain')", value="")
 colA, colB, colC = st.columns(3)
 with colA:
     want_cloze = st.checkbox("Generate Critical FITB", True)
@@ -429,9 +429,8 @@ with colC:
     gen = st.button("Generate Activities")
 
 if gen:
-    slide_text = extract_text_from_pdfs(slides)
     if not slide_text:
-        st.error("No slide text detected. Please upload slides.")
+        st.error("No slide text detected in ./slides. Please add PDFs to the 'slides' folder.")
         st.stop()
 
     grade_hint = st.session_state.running_grade
@@ -440,16 +439,20 @@ if gen:
     if want_cloze:
         cloze_data = ask_llm_for_cloze(topic, slide_text, grade_hint)
         c_title = cloze_data.get("title","Causal fill-in-the-blank")
-        c_instr = cloze_data.get("instructions","Fill each blank with the best term from the slides.")
+        c_instr = cloze_data.get("instructions","Predict the missing term using plain language (with clarifiers).")
         clozes_raw = cloze_data.get("clozes", [])
-        clozes = [s for s in clozes_raw if isinstance(s,str) and "**" in s][:7]
+        # filter: keep only sentences with **answer**, forbid placeholders
+        clozes = []
+        for s in clozes_raw:
+            if isinstance(s, str) and "**" in s and not re.search(r"\bprotein [xz]\b", s, re.I):
+                clozes.append(s)
+        clozes = clozes[:7]
         if not clozes:
-            st.warning("Cloze generation returned no valid items.")
+            st.warning("Cloze generation returned no valid items (likely placeholders or no blanks). Try a more specific topic.")
         else:
             c_ok, c_total = render_inline_cloze(c_title, c_instr, clozes, key_prefix="cloze")
             if c_total > 0:
                 st.session_state.history.append(("cloze", c_ok, c_total))
-                # Update adaptivity from FITB only (stable)
                 total_correct = sum(s for _, s, _ in st.session_state.history)
                 total_items = sum(t for _, _, t in st.session_state.history)
                 st.session_state.running_grade = total_correct / max(1, total_items)
@@ -468,13 +471,19 @@ if gen:
     if want_dnd:
         match_data = ask_llm_for_matching(topic, slide_text, grade_hint)
         m_title = match_data.get("title","Concept → Target (Drag-and-Drop)")
-        m_instr = match_data.get("instructions","Drag each prompt to the correct target.")
+        m_instr = match_data.get("instructions","Drag each prompt to the correct target category (plain language with clarifiers).")
         pairs = match_data.get("pairs", [])
         right_choices = match_data.get("right_choices", [])
-        pairs = [p for p in pairs if isinstance(p, dict) and p.get("left") and p.get("right")]
+        # filter invalid/placeholder
+        clean_pairs = []
+        for p in pairs:
+            if isinstance(p, dict) and p.get("left") and p.get("right"):
+                if not re.search(r"\bprotein [xz]\b", p["left"], re.I) and not re.search(r"\bprotein [xz]\b", p["right"], re.I):
+                    clean_pairs.append({"left": p["left"], "right": p["right"]})
+        pairs = clean_pairs[:10]
         rights = sorted(list({p["right"] for p in pairs})) or right_choices
         if not pairs or not rights:
-            st.warning("Drag-and-drop generation returned no valid items.")
+            st.warning("Drag-and-drop generation returned no valid items. Try a narrower topic or check slides.")
         else:
             render_inline_dragdrop(m_title, m_instr, pairs, rights, key_prefix="dnd", height=560)
 
