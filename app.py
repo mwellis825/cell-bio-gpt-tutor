@@ -1,513 +1,298 @@
 # app.py
-# Streamlit prompt-based critical thinking question generator
+# Streamlined Streamlit app: Two activities, auto-LO extraction, critical-thinking focus
 # -----------------------------------------------------------------------------
-# IMPORTANT: This app is designed for instructors. It *never* exposes or uses
-# your private exam questions. It only uses in-code templates + your typed prompts.
+# Activities:
+#   1) Lenient Fill-in-the-Blank (short-answer, critical thinking prompts)
+#   2) Drag-the-Words (word bank -> blanks, click-to-fill simulation)
 #
-# How to run:
-#   1) pip install streamlit
-#   2) streamlit run app.py
-#
-# What it does:
-#   - Accept a topic prompt and learning objectives
-#   - Generate original, exam-style critical thinking questions (MCQ, open, diagram)
-#   - Hide answers in "Student preview" mode
-#   - Export as JSON/CSV for easy reuse (Canvas/H5P prep)
-#
-# No internet calls, no external models.
+# Instructor uploads or pastes course text (e.g., slide notes). The app
+# automatically extracts Learning Objectives and uses them to generate
+# activities tailored to the topic. No internet calls; fully local.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
-import random, uuid, json, csv, io, datetime, re
-from typing import List, Dict, Any
+import re, uuid, datetime, json
 
-# --------------------------- App Config --------------------------------------
-st.set_page_config(page_title="Critical Thinking Question Generator", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Study Mode: Two Activities", page_icon="📘", layout="wide")
 
-# --------------------------- Helpers -----------------------------------------
-def new_id(prefix: str = "q") -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+# ------------------------------ Utilities ------------------------------------
+def new_id(prefix="id"):
+    return f"{prefix}_{uuid.uuid4().hex[:6]}"
 
-def sanitize_lo_text(text: str) -> List[str]:
-    # Split by lines, strip, drop empties
-    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
-    return [x for x in lines if x]
+def now_str():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def now_iso() -> str:
-    return datetime.datetime.now().isoformat(timespec="seconds")
+def detect_topic(text: str) -> str:
+    t = text.lower()
+    if any(k in t for k in ["dna replication", "polymerase", "okazaki", "lagging strand", "leading strand", "helicase", "primase"]):
+        return "dna_replication"
+    if any(k in t for k in ["glycolysis", "tca", "electron transport", "oxidative phosphorylation", "mitochond"]):
+        return "metabolism"
+    if any(k in t for k in ["actin", "microtubule", "kinesin", "dynein", "focal adhesion"]):
+        return "cytoskeleton"
+    if any(k in t for k in ["cell cycle", "cyclin", "cdk", "p53", "meiosis", "mitosis"]):
+        return "cell_cycle"
+    if any(k in t for k in ["rtk", "pi3k", "akt", "mapk", "gpcr", "second messenger"]):
+        return "signaling"
+    return "generic"
 
-def pick_bloom_level() -> str:
-    return random.choice(["apply", "analyze", "evaluate", "create"])
+# Extract candidate Learning Objectives from text (no student entry).
+# Heuristics: lines beginning with verbs; lines containing 'LO', 'Learning Objective', or bullets.
+VERBS = [
+    "explain","predict","justify","compare","contrast","distinguish","design","interpret",
+    "evaluate","critique","diagnose","infer","propose","calculate","derive","model",
+    "identify","classify","analyze","synthesize","outline","formulate","apply","assess"
+]
+def extract_los(raw_text: str):
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_text.splitlines()]
+    los = []
+    for ln in lines:
+        low = ln.lower()
+        if not ln or len(ln) < 6: 
+            continue
+        bullet = low.startswith(("-","•","—","*")) or re.match(r"^\d+[\).\]]\s", low)
+        mentions_lo = any(k in low for k in ["learning objective", "learning objectives", "lo:", "objective:", "outcome:"])
+        starts_verb = any(re.match(rf"^\s*({v})\b", low) for v in VERBS)
+        if bullet or mentions_lo or starts_verb:
+            # remove bullet markers and LO prefixes
+            cleaned = re.sub(r"^(\d+[\).\]]\s*|[-•—*]\s*)", "", ln).strip()
+            cleaned = re.sub(r"(?i)^(learning objective(s)?|lo|objective|outcome)[:\-]\s*", "", cleaned).strip()
+            if len(cleaned) >= 10:
+                los.append(cleaned)
+    # Deduplicate while preserving order
+    seen = set(); uniq = []
+    for x in los:
+        key = x.lower()
+        if key not in seen:
+            uniq.append(x); seen.add(key)
+    return uniq[:12]  # cap to keep UI light
 
-def choice_shuffle(choices: List[str], answer_index: int):
-    order = list(range(len(choices)))
-    random.shuffle(order)
-    new_choices = [choices[i] for i in order]
-    new_answer_index = order.index(answer_index)
-    return new_choices, new_answer_index
+# -------------------------- Generators (DNA focus) ----------------------------
+# For DNA replication, craft critical-thinking prompts and cloze items.
+DNA_KEY_TERMS = [
+    "origin of replication","helicase","single-strand binding proteins","topoisomerase",
+    "primase","RNA primer","DNA polymerase III","leading strand","lagging strand",
+    "Okazaki fragments","DNA polymerase I","RNase H","DNA ligase","proofreading",
+    "3'→5' exonuclease","processivity","replication fork","bidirectional replication"
+]
 
-def export_json(questions: List[Dict[str, Any]]) -> bytes:
-    return json.dumps({"generated_at": now_iso(), "questions": questions}, indent=2).encode("utf-8")
+def make_fitb_from_lo(lo: str, topic: str):
+    # Create a short, critical-thinking prompt requiring a precise concept as the answer.
+    # For DNA, bias to a key term; otherwise fallback to a salient noun phrase (last resort).
+    answer = None
+    if topic == "dna_replication":
+        for term in DNA_KEY_TERMS:
+            if term in lo.lower():
+                answer = term
+                break
+        if answer is None:
+            # pick a plausible answer if not explicitly present
+            answer = "DNA ligase"
+        prompt = (f"{lo} — In the specific context of DNA replication, which mechanism or factor is the "
+                  f"primary constraint here? Provide the **most specific term**.")
+    else:
+        # generic fallback
+        answer = "mechanism"
+        prompt = f"{lo} — What is the single most critical mechanism that determines the outcome?"
 
-def export_csv(questions: List[Dict[str, Any]]) -> bytes:
-    # Flatten to CSV; choices joined with " || "
-    headers = ["id", "type", "prompt", "choices", "answer_index", "answer_text", "rationale", "los", "cognitive_level", "tags"]
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(headers)
-    for q in questions:
-        choices = " || ".join(q.get("choices", [])) if q.get("choices") else ""
-        answer_idx = q.get("answer_index", "")
-        answer_text = ""
-        if q.get("type") == "mcq" and q.get("choices") and isinstance(answer_idx, int) and 0 <= answer_idx < len(q["choices"]):
-            answer_text = q["choices"][answer_idx]
-        row = [
-            q.get("id",""),
-            q.get("type",""),
-            q.get("prompt","").replace("\n"," ").strip(),
-            choices,
-            answer_idx,
-            answer_text,
-            q.get("rationale","").replace("\n"," ").strip(),
-            " | ".join(q.get("los", [])),
-            q.get("cognitive_level",""),
-            " | ".join(q.get("tags", [])),
-        ]
-        writer.writerow(row)
-    return output.getvalue().encode("utf-8")
-
-# --------------------------- Template Engines --------------------------------
-# Each module returns lists of questions (dicts). We mix MCQ / open / diagram.
-def mk_mcq(prompt: str, choices: List[str], correct_idx: int, rationale: str, los: List[str], tags: List[str]) -> Dict[str, Any]:
-    c, ci = choice_shuffle(choices, correct_idx)
     return {
-        "id": new_id("mcq"),
-        "type": "mcq",
-        "prompt": prompt.strip(),
-        "choices": c,
-        "answer_index": ci,
-        "rationale": rationale.strip(),
-        "los": los,
-        "cognitive_level": pick_bloom_level(),
-        "tags": tags,
+        "id": new_id("fitb"),
+        "prompt": prompt,
+        "answer": answer,
+        "accepted": list(set([answer, answer.lower(), answer.title()])),
+        "explanation": f"The key idea the LO targets is **{answer}**. Provide targeted reasoning referencing the LO.",
     }
 
-def mk_open(prompt: str, rubric: str, los: List[str], tags: List[str]) -> Dict[str, Any]:
+def normalize(s: str):
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("’","'")
+    return s
+
+def check_fitb(user_text: str, accepted):
+    u = normalize(user_text or "")
+    acc = [normalize(x) for x in accepted]
+    # lenient: substring match or exact
+    return any((u == a) or (a in u) for a in acc)
+
+def make_dragwords_from_lo(lo: str, topic: str):
+    # Build a cloze sentence with 4 blanks and 6-8 word-bank items.
+    if topic != "dna_replication":
+        base_terms = ["mechanism","regulator","inhibitor","activator","feedback","rate-limiting"]
+        sentence = ("In this scenario, ______ coordinates with ______ to overcome ______; "
+                    "failure here elevates error risk unless ______ restores function.")
+        answers = ["regulator","activator","rate-limiting","feedback"]
+        bank = list(set(answers + base_terms))
+    else:
+        # Try to map LO to a chain of reasoning for replication
+        sentence = ("At the replication fork, ______ unwinds DNA while ______ lays down primers. "
+                    "Continuous synthesis occurs on the ______, whereas discontinuous synthesis forms ______ "
+                    "that are sealed by ______.")
+        answers = ["helicase","primase","leading strand","Okazaki fragments","DNA ligase"]
+        # Expand bank with distractors
+        bank = list(set(answers + [
+            "topoisomerase","DNA polymerase III","lagging strand","RNase H","proofreading"
+        ]))
+
+    # Build item
+    blanks = [None]*len(answers)
     return {
-        "id": new_id("open"),
-        "type": "open",
-        "prompt": prompt.strip(),
-        "rationale": rubric.strip(),  # Store suggested rubric in rationale field
-        "los": los,
-        "cognitive_level": pick_bloom_level(),
-        "tags": tags,
+        "id": new_id("drag"),
+        "sentence": sentence,
+        "answers": answers,
+        "bank": bank
     }
 
-def mk_diagram(prompt: str, rubric: str, los: List[str], tags: List[str]) -> Dict[str, Any]:
-    return {
-        "id": new_id("diagram"),
-        "type": "diagram",
-        "prompt": prompt.strip(),
-        "rationale": rubric.strip(),
-        "los": los,
-        "cognitive_level": pick_bloom_level(),
-        "tags": tags,
-    }
-
-# --------------------------- Module: Metabolism -------------------------------
-def module_metabolism(lo: List[str], topic: str, n_mcq: int, n_open: int, n_diag: int) -> List[Dict[str, Any]]:
-    qs: List[Dict[str, Any]] = []
-    tags = ["metabolism","mitochondria","glycolysis","TCA","ETC","OxPhos"]
-
-    mcq_templates = [
-        lambda: mk_mcq(
-            prompt=("A cell line shows normal glycolysis but low ATP output despite abundant O₂. "
-                    "Pyruvate accumulates in the cytosol. Which defect best explains this?"),
-            choices=[
-                "Phosphofructokinase-1 is inactive, stopping glycolysis entirely",
-                "The mitochondrial pyruvate carrier is defective",
-                "Complex II cannot oxidize FADH₂",
-                "ATP synthase is hyperactive"
-            ],
-            correct_idx=1,
-            rationale=("Cytosolic pyruvate accumulation with normal glycolysis points to failed mitochondrial import; "
-                       "a defective pyruvate carrier prevents TCA entry and downstream OxPhos."),
-            los=lo, tags=tags),
-        lambda: mk_mcq(
-            prompt=("A drug raises the redox potential of Complex I above that of O₂. Predict the most direct impact."),
-            choices=[
-                "NADH electrons still transfer normally to coenzyme Q",
-                "Electron flow accelerates through the ETC",
-                "NADH electrons cannot pass forward at Complex I, reducing proton pumping",
-                "FADH₂ oxidation at Complex II is also blocked"
-            ],
-            correct_idx=2,
-            rationale=("If Complex I has a higher redox potential than downstream carriers, "
-                       "it cannot donate electrons efficiently; proton pumping from Complex I falls."),
-            los=lo, tags=tags),
-        lambda: mk_mcq(
-            prompt=("A student replaces most carbohydrates with fats; glycolysis rate declines. "
-                    "What happens to oxidative phosphorylation?"),
-            choices=[
-                "Stops entirely because acetyl‑CoA cannot be made without glycolysis",
-                "Continues because β‑oxidation supplies acetyl‑CoA to the TCA cycle",
-                "Continues only if glycolysis supplies NADH",
-                "Slows because fats bypass ATP synthase"
-            ],
-            correct_idx=1,
-            rationale=("β‑oxidation yields acetyl‑CoA that feeds the TCA cycle; ETC/OxPhos can continue using reducing equivalents from fat metabolism."),
-            los=lo, tags=tags),
-        lambda: mk_mcq(
-            prompt=("A protonophore (H⁺ ionophore) is added to cells. Which outcome is MOST likely?"),
-            choices=[
-                "ATP production increases because the gradient forms faster",
-                "Heat production increases as the proton gradient is dissipated",
-                "Electron flow stops immediately at Complex IV",
-                "Glycolysis halts due to excess NAD⁺"
-            ],
-            correct_idx=1,
-            rationale=("Uncouplers collapse ΔpH/Δψ; energy of the gradient is released as heat, reducing ATP synthesis via ATP synthase."),
-            los=lo, tags=tags),
-        lambda: mk_mcq(
-            prompt=("Under low ATP and high O₂, what happens to phosphofructokinase‑1 (PFK‑1) activity and why?"),
-            choices=[
-                "PFK‑1 increases to produce lactate as an alternative energy source",
-                "PFK‑1 increases to keep feeding OxPhos with intermediates",
-                "PFK‑1 decreases because the ATP‑consuming step is restrained when ATP is limited",
-                "PFK‑1 decreases because it is the TCA cycle rate‑limiter"
-            ],
-            correct_idx=2,
-            rationale=("PFK‑1 consumes ATP; when ATP is scarce, PFK‑1 activity is curtailed to conserve ATP, even if O₂ is abundant."),
-            los=lo, tags=tags),
-    ]
-
-    open_templates = [
-        lambda: mk_open(
-            prompt=("You disrupt Complex IV completely. Predict effects on: (a) O₂ consumption, "
-                    "(b) proton gradient magnitude, and (c) ATP yield; justify mechanistically."),
-            rubric=("O₂ consumption falls to ~0 as it is the terminal acceptor at Complex IV; "
-                    "proton gradient collapses without continued pumping; ATP via OxPhos drops sharply; "
-                    "cells may rely more on glycolysis/fermentation."),
-            los=lo, tags=tags),
-        lambda: mk_open(
-            prompt=("Cells are supplied abundant glucose, but NAD⁺ regeneration is blocked. "
-                    "Explain what happens to glycolysis and ATP yield. How would enhancing lactate "
-                    "dehydrogenase activity change the outcome?"),
-            rubric=("Without NAD⁺ recycling, GAPDH stalls → glycolysis slows/stops → ATP yield falls. "
-                    "LDH restores NAD⁺ by reducing pyruvate to lactate, permitting glycolysis to continue anaerobically."),
-            los=lo, tags=tags),
-        lambda: mk_open(
-            prompt=("Complex I is mislocalized to the cytosol due to loss of its mitochondrial targeting sequence. "
-                    "Predict consequences for electron flow and ATP synthesis."),
-            rubric=("Mislocalized Complex I cannot contribute to the ETC; fewer protons pumped; Δp declines; "
-                    "ATP synthase output falls; upstream NADH accumulates; potential metabolic rerouting."),
-            los=lo, tags=tags),
-    ]
-
-    diagram_templates = [
-        lambda: mk_diagram(
-            prompt=("On a mitochondrion diagram, (1) indicate where protons accumulate during normal ETC, "
-                    "(2) redraw distribution if ATP synthase is inhibited, and (3) predict NADH oxidation rate."),
-            rubric=("Normal: H⁺ accumulates in the intermembrane space; inhibition increases gradient back‑pressure → "
-                    "ETC slows; NADH oxidation rate decreases due to elevated proton motive force opposing pumping."),
-            los=lo, tags=tags),
-        lambda: mk_diagram(
-            prompt=("Sketch how a protonophore affects the proton gradient across the inner membrane "
-                    "and annotate expected changes in heat vs. ATP output."),
-            rubric=("Gradient is dissipated (similar [H⁺] across membrane); ATP output drops; heat output rises due to uncoupling."),
-            los=lo, tags=tags),
-    ]
-
-    # Sample seeding quantity
-    for _ in range(min(n_mcq, len(mcq_templates))):
-        qs.append(random.choice(mcq_templates)())
-    for _ in range(min(n_open, len(open_templates))):
-        qs.append(random.choice(open_templates)())
-    for _ in range(min(n_diag, len(diagram_templates))):
-        qs.append(random.choice(diagram_templates)())
-
-    return qs
-
-# --------------------------- Module: Cytoskeleton -----------------------------
-def module_cytoskeleton(lo: List[str], topic: str, n_mcq: int, n_open: int, n_diag: int) -> List[Dict[str, Any]]:
-    qs: List[Dict[str, Any]] = []
-    tags = ["cytoskeleton","actin","microtubules","motility","kinesin","dynein"]
-
-    mcq_templates = [
-        lambda: mk_mcq(
-            prompt=("A fibroblast can polymerize actin but cannot depolymerize F‑actin. "
-                    "Which cellular process is MOST impaired?"),
-            choices=["Lamellipodia extension","Filopodia retraction","Stress fiber stability","Directional migration speed"],
-            correct_idx=3,
-            rationale=("Without depolymerization, treadmilling/recycling of G‑actin is limited → slower migration."),
-            los=lo, tags=tags),
-        lambda: mk_mcq(
-            prompt=("Taxol stabilizes microtubules. Which outcome in mitosis is most likely?"),
-            choices=["Accelerated anaphase A","Failure of spindle dynamics and chromosome segregation","Enhanced kinetochore capture","Faster cytokinesis"],
-            correct_idx=1,
-            rationale=("Excess stabilization impairs dynamic instability needed for spindle function and segregation."),
-            los=lo, tags=tags),
-    ]
-
-    open_templates = [
-        lambda: mk_open(
-            prompt=("A GDP‑dissociation inhibitor (GDI) specific to Rho GTPases is added to migrating cells. "
-                    "Explain effects on actin remodeling and cell movement."),
-            rubric=("GDIs sequester Rho/Rac/Cdc42 in GDP‑bound state → reduced lamellipodia/filopodia dynamics → impaired motility."),
-            los=lo, tags=tags),
-        lambda: mk_open(
-            prompt=("Explain the roles of ATP and Ca²⁺ in skeletal muscle contraction and relaxation."),
-            rubric=("ATP binding releases myosin from actin; hydrolysis cocks head; Pi release drives power stroke; "
-                    "Ca²⁺ binds troponin, moves tropomyosin to expose sites; Ca²⁺ reuptake promotes relaxation."),
-            los=lo, tags=tags),
-    ]
-
-    diagram_templates = [
-        lambda: mk_diagram(
-            prompt=("Draw focal adhesions and indicate: integrin‑ECM link, actin stress fibers, and direction of traction force "
-                    "during cell migration."),
-            rubric=("Integrins link ECM to actin; acto‑myosin pulls cell body; leading edge protrusion + rear retraction."),
-            los=lo, tags=tags),
-    ]
-
-    for _ in range(min(n_mcq, len(mcq_templates))):
-        qs.append(random.choice(mcq_templates)())
-    for _ in range(min(n_open, len(open_templates))):
-        qs.append(random.choice(open_templates)())
-    for _ in range(min(n_diag, len(diagram_templates))):
-        qs.append(random.choice(diagram_templates)())
-
-    return qs
-
-# --------------------------- Module: Cell Cycle -------------------------------
-def module_cell_cycle(lo: List[str], topic: str, n_mcq: int, n_open: int, n_diag: int) -> List[Dict[str, Any]]:
-    qs: List[Dict[str, Any]] = []
-    tags = ["cell-cycle","cyclin","cdk","p53","mitosis","meiosis"]
-
-    mcq_templates = [
-        lambda: mk_mcq(
-            prompt=("Cyclin E is absent in a cell line. Which checkpoint transition is MOST directly affected?"),
-            choices=["G₂/M","G₁/S","Metaphase/Anaphase","G₀ to G₁ reentry"],
-            correct_idx=1,
-            rationale=("Cyclin E‑CDK2 promotes G₁→S transition; absence arrests before DNA replication."),
-            los=lo, tags=tags),
-        lambda: mk_mcq(
-            prompt=("A nondisjunction event in meiosis I typically results in which gamete outcome?"),
-            choices=["All gametes euploid","Half aneuploid, half euploid","All gametes aneuploid","Only two gametes affected"],
-            correct_idx=2,
-            rationale=("MI nondisjunction missegregates homologs → all four gametes abnormal following meiosis II."),
-            los=lo, tags=tags),
-    ]
-
-    open_templates = [
-        lambda: mk_open(
-            prompt=("Explain why p53 is called the 'guardian of the genome' with reference to checkpoints and DNA damage responses."),
-            rubric=("p53 halts cycle with damage (e.g., p21 induction), facilitates repair; can trigger apoptosis if damage severe."),
-            los=lo, tags=tags),
-    ]
-
-    diagram_templates = [
-        lambda: mk_diagram(
-            prompt=("Draw the APC/C activation timeline and annotate how securin degradation triggers separase activation and chromatid separation."),
-            rubric=("APC/C tags securin → separase active → cohesin cleavage → anaphase onset; spindle checkpoint ensures proper attachment."),
-            los=lo, tags=tags),
-    ]
-
-    for _ in range(min(n_mcq, len(mcq_templates))):
-        qs.append(random.choice(mcq_templates)())
-    for _ in range(min(n_open, len(open_templates))):
-        qs.append(random.choice(open_templates)())
-    for _ in range(min(n_diag, len(diagram_templates))):
-        qs.append(random.choice(diagram_templates)())
-
-    return qs
-
-# --------------------------- Module: Signaling --------------------------------
-def module_signaling(lo: List[str], topic: str, n_mcq: int, n_open: int, n_diag: int) -> List[Dict[str, Any]]:
-    qs: List[Dict[str, Any]] = []
-    tags = ["signaling","RTK","GPCR","PI3K","AKT","MAPK"]
-
-    mcq_templates = [
-        lambda: mk_mcq(
-            prompt=("A receptor tyrosine kinase (RTK) dimerizes and autophosphorylates in the absence of ligand. "
-                    "Which downstream effect is MOST consistent?"),
-            choices=[
-                "Transient growth arrest via p53",
-                "Constitutive MAPK activation promoting proliferation",
-                "Increased apoptosis via BAD activation",
-                "Suppressed PI3K‑AKT signaling"
-            ],
-            correct_idx=1,
-            rationale=("Ligand‑independent RTK activation drives Ras/MAPK cascades → pro‑growth signaling."),
-            los=lo, tags=tags),
-        lambda: mk_mcq(
-            prompt=("A mutation renders AKT catalytically inactive. Which effect on cell fate is MOST likely?"),
-            choices=["Enhanced cell survival signaling","Impaired phosphorylation of BAD and increased apoptosis","Constitutive mTOR activation","Unchanged survival pathways"],
-            correct_idx=1,
-            rationale=("AKT normally phosphorylates BAD to inhibit apoptosis; loss of AKT activity tips toward apoptosis."),
-            los=lo, tags=tags),
-    ]
-
-    open_templates = [
-        lambda: mk_open(
-            prompt=("Contrast 'fast' vs 'slow' signaling responses with examples of altering protein function vs altering protein abundance."),
-            rubric=("Fast: post‑translational mods/relocation (sec‑min). Slow: transcription/translation (hours). Provide examples."),
-            los=lo, tags=tags),
-    ]
-
-    diagram_templates = [
-        lambda: mk_diagram(
-            prompt=("Sketch PI3K‑AKT signaling from RTK activation to BAD inhibition and indicate intervention points for targeted therapy."),
-            rubric=("RTK→PI3K→PIP₃→AKT activation→phospho‑BAD→pro‑survival; interventions: RTK inhibitors, PI3K inhibitors, AKT inhibitors."),
-            los=lo, tags=tags),
-    ]
-
-    for _ in range(min(n_mcq, len(mcq_templates))):
-        qs.append(random.choice(mcq_templates)())
-    for _ in range(min(n_open, len(open_templates))):
-        qs.append(random.choice(open_templates)())
-    for _ in range(min(n_diag, len(diagram_templates))):
-        qs.append(random.choice(diagram_templates)())
-
-    return qs
-
-# --------------------------- Router -------------------------------------------
-def route_topic_to_modules(topic: str) -> List[str]:
-    t = topic.lower()
-    modules = []
-    if any(k in t for k in ["glycolysis","mitochond","tca","oxidative","oxphos","electron transport","metab"]):
-        modules.append("metabolism")
-    if any(k in t for k in ["actin","microtubule","kinesin","dynein","cytoskeleton","migration","muscle"]):
-        modules.append("cytoskeleton")
-    if any(k in t for k in ["cell cycle","cyclin","cdk","p53","mitosis","meiosis","checkpoint"]):
-        modules.append("cell_cycle")
-    if any(k in t for k in ["signal","rtk","gpcr","pi3k","akt","mapk","erk","ras"]):
-        modules.append("signaling")
-    # Default: if nothing matches, include metabolism as a safe example
-    if not modules:
-        modules.append("metabolism")
-    return modules
-
-def build_questions(topic: str, los: List[str], n_mcq: int, n_open: int, n_diag: int, seed: int) -> List[Dict[str, Any]]:
-    random.seed(seed)
-    modules = route_topic_to_modules(topic)
-    per_mod_mcq = max(0, n_mcq // len(modules)) if modules else 0
-    per_mod_open = max(0, n_open // len(modules)) if modules else 0
-    per_mod_diag = max(0, n_diag // len(modules)) if modules else 0
-
-    questions: List[Dict[str, Any]] = []
-    for m in modules:
-        if m == "metabolism":
-            questions.extend(module_metabolism(los, topic, per_mod_mcq, per_mod_open, per_mod_diag))
-        elif m == "cytoskeleton":
-            questions.extend(module_cytoskeleton(los, topic, per_mod_mcq, per_mod_open, per_mod_diag))
-        elif m == "cell_cycle":
-            questions.extend(module_cell_cycle(los, topic, per_mod_mcq, per_mod_open, per_mod_diag))
-        elif m == "signaling":
-            questions.extend(module_signaling(los, topic, per_mod_mcq, per_mod_open, per_mod_diag))
-
-    # If integer division truncated, top-up with metabolism templates
-    short_mcq = n_mcq - sum(1 for q in questions if q["type"]=="mcq")
-    short_open = n_open - sum(1 for q in questions if q["type"]=="open")
-    short_diag = n_diag - sum(1 for q in questions if q["type"]=="diagram")
-    if short_mcq > 0: questions.extend(module_metabolism(los, topic, short_mcq, 0, 0))
-    if short_open > 0: questions.extend(module_metabolism(los, topic, 0, short_open, 0))
-    if short_diag > 0: questions.extend(module_metabolism(los, topic, 0, 0, short_diag))
-
-    # Attach topic tag to all
-    for q in questions:
-        q.setdefault("tags", []).append(topic.strip())
-    return questions
-
-# --------------------------- UI ----------------------------------------------
+# ------------------------------ UI -------------------------------------------
 with st.sidebar:
-    st.title("🧪 Instructor Controls")
-    st.caption("This tool generates **original** critical‑thinking questions from your prompts. "
-               "It never reveals your private exam questions.")
-    instructor_mode = st.toggle("Instructor mode (show answers & rationales)", True)
-    seed = st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1)
+    st.title("Instructor")
+    st.caption("Upload/paste course text. The app auto-extracts **Learning Objectives** and builds two activities.\n"
+               "Toggle **Instructor mode** to reveal answers & export.")
+    instructor_mode = st.toggle("Instructor mode", True)
     st.markdown("---")
-    st.markdown("**Export settings**")
-    add_timestamp = st.checkbox("Append timestamp to export filenames", True)
+    st.write("**Export**")
+    add_ts = st.checkbox("Timestamp filenames", True)
 
-st.title("🧠 Critical Thinking Question Generator (Prompt‑based)")
-st.write("Enter a topic and (optionally) learning objectives. Choose quantities for each question type, then **Generate**.")
+st.title("📘 Study Mode")
+st.subheader("Two activities • Auto-LO extraction • Critical thinking")
 
-colA, colB = st.columns([2,1])
-with colA:
-    topic = st.text_input("Topic prompt (e.g., 'Glycolysis → TCA → OxPhos' or 'PI3K‑AKT survival signaling')",
-                          value="Glycolysis, TCA cycle, and Oxidative Phosphorylation")
-with colB:
-    st.info("Tip: Include keywords (e.g., 'actin', 'cyclin', 'RTK') to route templates to the right module(s).")
+# Input: paste or upload text (we avoid heavy PDF parsing; paste exported text content recommended)
+tabs = st.tabs(["Paste Text", "Upload Text File (.txt)"])
+raw_text = ""
+with tabs[0]:
+    raw_text = st.text_area("Paste course text (include LO bullets if possible):", height=220,
+                            placeholder="e.g., Learning Objectives:\n- Explain how helicase and primase coordinate at the replication fork...\n- Predict the effect of a ligase inhibitor on lagging-strand synthesis...\n- Justify how proofreading affects mutation rates under nucleotide scarcity...")
+with tabs[1]:
+    up = st.file_uploader("Upload a plain text file (.txt) with slide notes/objectives", type=["txt"])
+    if up is not None:
+        try:
+            raw_text = up.read().decode("utf-8", errors="ignore")
+        except Exception:
+            st.error("Could not read the uploaded file as UTF-8 text.")
 
-lo_text = st.text_area("Learning objectives (optional, one per line)",
-                       value="Predict effects of inhibitors on ETC and ATP synthesis\nConnect substrate flux to redox carriers and ATP yield\nDistinguish fast vs slow signaling responses",
-                       height=120)
-n_mcq = st.number_input("Number of MCQs", min_value=0, max_value=50, value=5, step=1)
-n_open = st.number_input("Number of open responses", min_value=0, max_value=50, value=3, step=1)
-n_diag = st.number_input("Number of diagram/prediction prompts", min_value=0, max_value=50, value=2, step=1)
+gen = st.button("Generate Activities")
 
-gen_btn = st.button("🚀 Generate Questions")
+if gen:
+    if not raw_text or len(raw_text.strip()) < 20:
+        st.error("Please paste or upload sufficient course text that includes learning objectives.")
+    else:
+        topic = detect_topic(raw_text)
+        los = extract_los(raw_text)
+        if not los:
+            st.warning("No clear Learning Objectives detected. Using top sentences as stand-ins.")
+            # fallback: use first few long sentences
+            cand = re.split(r"[.;]\s+", raw_text)
+            los = [c.strip() for c in cand if len(c.strip())>40][:6]
 
-questions: List[Dict[str, Any]] = []
-if gen_btn:
-    los = sanitize_lo_text(lo_text)
-    questions = build_questions(topic, los, n_mcq, n_open, n_diag, seed)
-    st.success(f"Generated {len(questions)} questions.")
+        # Build activities from top 4 LOs
+        picked = los[:4]
+        fitb_items = [make_fitb_from_lo(lo, topic) for lo in picked[:2]]
+        drag_items = [make_dragwords_from_lo(lo, topic) for lo in picked[2:4] or [picked[0]]]
 
-if questions:
-    st.markdown("### Preview")
-    st.caption("Student preview hides answers/rationales unless revealed. Toggle Instructor mode in the sidebar.")
+        st.success(f"Detected topic: **{topic.replace('_',' ').title()}** • Extracted {len(los)} learning objectives.")
+        st.write("You can proceed directly to student mode, or review below in instructor mode.")
 
-    for i, q in enumerate(questions, start=1):
-        with st.expander(f"{i}. ({q['type'].upper()}) {q['prompt'][:120]}{'...' if len(q['prompt'])>120 else ''}", expanded=False):
-            st.write(q["prompt"])
-            if q["type"] == "mcq":
-                # Show choices without grading (preview only)
-                st.radio("Choices:", q["choices"], index=None, key=q["id"]+"_choice", label_visibility="collapsed")
-                if instructor_mode:
-                    ans = q["choices"][q["answer_index"]]
-                    st.markdown(f"**Answer:** {ans}")
-                    st.markdown(f"**Rationale:** {q.get('rationale','')}")
-                else:
-                    if st.toggle("Reveal answer", key=q["id"]+"_rev"):
-                        ans = q["choices"][q["answer_index"]]
-                        st.markdown(f"**Answer:** {ans}")
-                        st.markdown(f"**Rationale:** {q.get('rationale','')}")
+        st.session_state["generated"] = {
+            "timestamp": now_str(),
+            "topic": topic,
+            "los": picked,
+            "fitb": fitb_items,
+            "drag": drag_items,
+        }
 
-            else:  # open or diagram
-                st.text_area("Student response space (preview):", value="", height=100, key=q["id"]+"_resp")
-                if instructor_mode:
-                    st.markdown(f"**Suggested rubric / solution notes:** {q.get('rationale','')}")
-                else:
-                    if st.toggle("Reveal rubric", key=q["id"]+"_rub"):
-                        st.markdown(f"**Suggested rubric / solution notes:** {q.get('rationale','')}")
+data = st.session_state.get("generated")
 
-            # Meta
-            meta_cols = st.columns(3)
-            with meta_cols[0]:
-                st.caption(f"**Bloom:** {q.get('cognitive_level','')}")
-            with meta_cols[1]:
-                st.caption(f"**LOs:** {', '.join(q.get('los', [])) or '—'}")
-            with meta_cols[2]:
-                st.caption(f"**Tags:** {', '.join(q.get('tags', []))}")
-
-    # ------------------- Export -------------------
+if data:
     st.markdown("---")
-    st.subheader("Export")
-    fname_base = "question_bank"
-    if add_timestamp:
-        fname_base += "_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_bytes = export_json(questions)
-    csv_bytes = export_csv(questions)
+    st.header("Activity 1: Fill in the Blank (Lenient, critical-thinking)")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button("⬇️ Download JSON", data=json_bytes, file_name=f"{fname_base}.json", mime="application/json")
-    with col2:
-        st.download_button("⬇️ Download CSV", data=csv_bytes, file_name=f"{fname_base}.csv", mime="text/csv")
+    for i, item in enumerate(data["fitb"], start=1):
+        with st.expander(f"FITB {i}", expanded=True):
+            st.write(item["prompt"])
+            user = st.text_input("Your answer:", key=item["id"]+"_ans")
+            if instructor_mode:
+                st.info(f"Accepted answer(s): {', '.join(item['accepted'])}")
+                st.caption(item["explanation"])
+            else:
+                if st.button("Check", key=item["id"]+"_check"):
+                    correct = check_fitb(user, item["accepted"])
+                    if correct:
+                        st.success("Correct (lenient match).")
+                    else:
+                        st.error("Not quite. Try to be more precise.")
 
-# --------------------------- Footer ------------------------------------------
-st.markdown("---")
-st.caption("Instructor note: This app uses only on‑device templates + your prompts. "
-           "It does not reveal or reuse private exam content. Customize question text freely.")
+    st.markdown("---")
+    st.header("Activity 2: Drag the Words (click-to-fill)")
+
+    for j, d in enumerate(data["drag"], start=1):
+        with st.expander(f"Drag-the-Words {j}", expanded=True):
+            st.caption("Click words from the bank to fill blanks. Click a filled blank to clear it.")
+            # initialize state
+            bank_key = d["id"]+"_bank"
+            blanks_key = d["id"]+"_blanks"
+            if bank_key not in st.session_state:
+                st.session_state[bank_key] = list(d["bank"])
+            if blanks_key not in st.session_state:
+                st.session_state[blanks_key] = [None]*len(d["answers"])
+
+            bank = st.session_state[bank_key]
+            blanks = st.session_state[blanks_key]
+
+            # Sentence renderer
+            parts = d["sentence"].split("______")
+            row = st.container()
+            with row:
+                # render sentence with clickable blanks
+                disp = []
+                for idx in range(len(parts)+len(blanks)):
+                    if idx % 2 == 0:
+                        disp.append(parts[idx//2])
+                    else:
+                        b_i = (idx-1)//2
+                        label = blanks[b_i] if blanks[b_i] else "______"
+                        if st.button(label, key=f"{d['id']}_blank_{b_i}"):
+                            # clear if already filled
+                            if blanks[b_i]:
+                                bank.append(blanks[b_i])
+                                blanks[b_i] = None
+                            st.session_state[blanks_key] = blanks
+                st.write("".join(disp))
+
+            st.write("**Word bank:**")
+            cols = st.columns(4)
+            for idx, w in enumerate(bank):
+                col = cols[idx % 4]
+                if col.button(w, key=f"{d['id']}_bank_{idx}"):
+                    # fill first empty blank
+                    for bi in range(len(blanks)):
+                        if blanks[bi] is None:
+                            blanks[bi] = w
+                            break
+                    # remove from bank
+                    bank.pop(idx)
+                    st.session_state[bank_key] = bank
+                    st.session_state[blanks_key] = blanks
+
+            # Check answers
+            if st.button("Check Sentence", key=d["id"]+"_check"):
+                correct = all((blanks[i] or "").lower() == d["answers"][i].lower() for i in range(len(d["answers"])))
+                if correct:
+                    st.success("All blanks correct!")
+                else:
+                    # partial feedback
+                    good = sum(1 for i in range(len(d["answers"])) if (blanks[i] or "").lower() == d["answers"][i].lower())
+                    st.warning(f"{good}/{len(d['answers'])} correct. Keep refining.")
+                if instructor_mode:
+                    st.info("Answer key: " + ", ".join(d["answers"]))
+
+    # ---------------- Export (Instructor) ----------------
+    st.markdown("---")
+    if instructor_mode:
+        st.subheader("Export Activity Set")
+        payload = json.dumps(data, indent=2).encode("utf-8")
+        fname = "activities"
+        if add_ts:
+            fname += "_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button("⬇️ Download JSON", data=payload, file_name=f"{fname}.json", mime="application/json")
+else:
+    st.info("To begin, paste or upload your course text, then click **Generate Activities**.")
