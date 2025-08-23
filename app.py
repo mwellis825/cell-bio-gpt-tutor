@@ -1,11 +1,12 @@
-import io, json, re, zipfile, base64, requests, os
+import io, json, re, zipfile, base64, os
 from typing import List, Dict, Any
 import streamlit as st
 from pypdf import PdfReader
 from openai import OpenAI
+from pathlib import Path
 
 # ---------- Config ----------
-st.set_page_config(page_title="Cell Bio Tutor — Inline H5P (blob runtime)", layout="centered")
+st.set_page_config(page_title="Cell Bio Tutor — Inline H5P (local runtime)", layout="centered")
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -16,10 +17,6 @@ SYSTEM = (
     "You are a rigorous, supportive Cell Biology tutor. "
     "You ONLY use the provided slide excerpts to author concise, causal, critical-thinking practice."
 )
-
-H5P_VER = "1.3.0"
-JSDELIVR = f"https://cdn.jsdelivr.net/npm/h5p-standalone@{H5P_VER}/dist"
-UNPKG    = f"https://unpkg.com/h5p-standalone@{H5P_VER}/dist"
 
 # ---------- Helpers ----------
 def read_pdfs(files) -> str:
@@ -35,9 +32,7 @@ def read_pdfs(files) -> str:
 
 def ask_json(topic: str, slide_text: str, model="gpt-4o-mini") -> Dict[str, Any]:
     """
-    2-pass JSON enforcement.
-    Pass 1: response_format=json_object (strict).
-    Pass 2: low-temp with a tiny few-shot example if needed.
+    Force JSON with response_format, 2-pass fallback.
     Returns dict or {}.
     """
     base_user = f"""
@@ -76,8 +71,7 @@ SLIDES:
                 {"role":"user","content":base_user},
             ],
         )
-        txt = resp.choices[0].message.content or ""
-        return json.loads(txt)
+        return json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         st.warning(f"Retrying with a stricter format (pass 2). First error: {e}")
 
@@ -108,8 +102,7 @@ EXAMPLE (structure only; content must come from slides):
                 {"role":"user","content":fewshot_user},
             ],
         )
-        txt2 = resp2.choices[0].message.content or ""
-        return json.loads(txt2)
+        return json.loads(resp2.choices[0].message.content or "{}")
     except Exception as e2:
         st.error(f"OpenAI error (pass 2): {e2}")
         return {}
@@ -155,33 +148,29 @@ def build_h5p_drag_words(title: str, instructions: str, clozes: List[str]) -> by
             z.writestr(f"libraries/{path}", json.dumps(payload, ensure_ascii=False))
     return buf.getvalue()
 
-@st.cache_resource(show_spinner=False)
-def fetch_runtime_b64() -> dict:
-    """Download h5p-standalone runtime server-side and return base64 blobs."""
-    def fetch(url) -> bytes:
-        r = requests.get(url, timeout=30)
-        if not r.ok or len(r.content) < 10_000:
-            raise RuntimeError(f"Bad fetch: {url}")
-        return r.content
-
-    prim = [
-        (f"{JSDELIVR}/main.bundle.js", "main"),
-        (f"{JSDELIVR}/frame.bundle.js","frame"),
-        (f"{JSDELIVR}/styles/h5p.css", "css"),
-    ]
-    fb = [
-        (f"{UNPKG}/main.bundle.js","main"),
-        (f"{UNPKG}/frame.bundle.js","frame"),
-        (f"{UNPKG}/styles/h5p.css","css"),
-    ]
-
+def load_runtime_b64_from_repo() -> dict:
+    """
+    Read the three runtime files from ./runtime and return as base64 strings.
+    No network calls.
+    """
+    root = Path(__file__).parent
+    files = {
+        "main":  root / "runtime" / "main.bundle.js",
+        "frame": root / "runtime" / "frame.bundle.js",
+        "css":   root / "runtime" / "h5p.css",
+    }
     out = {}
-    for primary, key in prim:
-        try:
-            out[key] = base64.b64encode(fetch(primary)).decode("ascii")
-        except Exception:
-            alt = next(u for u,k in fb if k==key)
-            out[key] = base64.b64encode(fetch(alt)).decode("ascii")
+    missing = [k for k,p in files.items() if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing runtime assets: " + ", ".join(missing) +
+            ". Add runtime/main.bundle.js, runtime/frame.bundle.js, runtime/h5p.css to the repo."
+        )
+    for key, path in files.items():
+        data = path.read_bytes()
+        if len(data) < 10_000:
+            raise ValueError(f"Runtime file too small or corrupted: {path}")
+        out[key] = base64.b64encode(data).decode("ascii")
     return out
 
 def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 760):
@@ -213,10 +202,12 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
 </head>
 <body>
 <div id="app"></div>
-<div class="badge">Runtime: blob</div>
+<div class="badge">Runtime: local</div>
 <link id="h5pcss" rel="stylesheet">
 <script>
+  // Inject CSS from local base64
   document.getElementById('h5pcss').href = blobUrl("{css_b64}", "text/css");
+  // Load JS in order from local base64
   const mainUrl  = blobUrl("{main_b64}",  "application/javascript");
   const frameUrl = blobUrl("{frame_b64}", "application/javascript");
 
@@ -247,7 +238,7 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
     st.components.v1.html(html, height=height, scrolling=True)
 
 # ---------- UI ----------
-st.title("🧬 Cell Bio Tutor — Inline H5P (no external loads in browser)")
+st.title("🧬 Cell Bio Tutor — Inline H5P (local runtime, no network)")
 
 with st.expander("1) Upload your course slides (PDF)"):
     slides = st.file_uploader("Upload 1–10 PDFs", type=["pdf"], accept_multiple_files=True)
@@ -272,17 +263,17 @@ if go:
             if not clozes:
                 st.error("No valid clozes with **answer** markers returned. Try regenerating.")
             else:
-                # Build H5P and runtime
+                # Build H5P and render with local runtime
                 h5p_bytes = build_h5p_drag_words(title, instructions, clozes)
                 h5p_b64   = base64.b64encode(h5p_bytes).decode("ascii")
                 try:
-                    runtime_b64 = fetch_runtime_b64()
+                    runtime_b64 = load_runtime_b64_from_repo()
                 except Exception as e:
-                    st.error(f"Could not fetch H5P runtime server-side: {e}")
+                    st.error(str(e))
                     runtime_b64 = None
 
                 if runtime_b64:
-                    st.success("Generated H5P. Rendering inline below (look for the 'Runtime: blob' badge)…")
+                    st.success("Generated H5P. Rendering inline below (look for the 'Runtime: local' badge)…")
                     render_h5p_inline_from_b64(h5p_b64, runtime_b64, height=760)
 
                 # Optional: also offer download (LMS backup)
