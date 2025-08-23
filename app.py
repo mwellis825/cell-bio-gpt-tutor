@@ -1,4 +1,4 @@
-import io, json, re, zipfile, base64, os, hashlib
+import io, json, re, zipfile, base64, os, hashlib, textwrap
 from typing import List, Dict, Any
 import streamlit as st
 from pypdf import PdfReader
@@ -6,8 +6,7 @@ from openai import OpenAI
 from pathlib import Path
 
 # ---------- Config ----------
-st.set_page_config(page_title="Cell Bio Tutor — Inline H5P (local runtime)", layout="centered")
-
+st.set_page_config(page_title="Cell Bio Tutor — Inline H5P (local runtime, deep diagnostics)", layout="centered")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     st.error("Missing OPENAI_API_KEY in Streamlit secrets or environment.")
@@ -103,7 +102,7 @@ def build_h5p_drag_words(title: str, instructions: str, clozes: List[str]) -> by
     return buf.getvalue()
 
 def load_runtime_b64_from_repo() -> dict:
-    """Read ./runtime files and return base64; also return sizes and md5 for debugging."""
+    """Read ./runtime files and return base64; also provide debug info."""
     root = Path(__file__).parent
     files = {
         "main":  root / "runtime" / "main.bundle.js",
@@ -118,11 +117,17 @@ def load_runtime_b64_from_repo() -> dict:
     for key, path in files.items():
         data = path.read_bytes()
         out[key] = base64.b64encode(data).decode("ascii")
-        debug[key] = {"path": str(path), "size_bytes": len(data), "md5": hashlib.md5(data).hexdigest()}
+        head = data[:200].decode("latin-1", errors="replace")
+        debug[key] = {
+            "path": str(path),
+            "size_bytes": len(data),
+            "md5": hashlib.md5(data).hexdigest(),
+            "head_120": head[:120],
+        }
     return out, debug
 
 def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 760):
-    """Create Blob URLs; robustly resolve H5PStandalone export (with .default fallback) and show diagnostics."""
+    """Create Blob URLs; resolve H5PStandalone export; show detailed diagnostics on failure."""
     main_b64  = runtime_b64["main"]
     frame_b64 = runtime_b64["frame"]
     css_b64   = runtime_b64["css"]
@@ -139,12 +144,28 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
   pre{{white-space:pre-wrap;word-break:break-word;background:#f7f7f8;padding:8px;border-radius:6px}}
 </style>
 <script>
+  // capture script errors inside iframe
+  window.addEventListener('error', e => {{
+    const box = document.getElementById('app');
+    if (box && !box.dataset.seenError) {{
+      box.dataset.seenError = '1';
+      box.innerHTML = '<div class="msg"><b>Runtime loader error:</b><pre>'+String(e.message)+'</pre></div>';
+    }}
+  }});
+  window.addEventListener('unhandledrejection', e => {{
+    const box = document.getElementById('app');
+    if (box && !box.dataset.seenRej) {{
+      box.dataset.seenRej = '1';
+      box.innerHTML = '<div class="msg"><b>Unhandled promise rejection:</b><pre>'+String(e.reason)+'</pre></div>';
+    }}
+  }});
+
   function blobUrl(b64, type){{
     const bin = atob(b64); const len = bin.length; const bytes = new Uint8Array(len);
     for (let i=0;i<len;i++) bytes[i] = bin.charCodeAt(i);
     return URL.createObjectURL(new Blob([bytes], {{type}}));
   }}
-  // Minimal H5PIntegration object required by frame.bundle.js
+  // Minimal H5PIntegration required by frame.bundle.js
   window.H5PIntegration = {{
     baseUrl: location.origin, url: location.href, siteUrl: location.origin,
     hubIsEnabled: false, disableHub: true, postUserStatistics: false, saveFreq: false,
@@ -159,13 +180,22 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
 <div class="badge">Runtime: local</div>
 <link id="h5pcss" rel="stylesheet">
 <script>
-  document.getElementById('h5pcss').href = blobUrl("{css_b64}", "text/css");
+  // show first 200 chars of each blob (to confirm it's JS, not HTML)
+  const headDump = {{
+    main: atob("{main_b64}".slice(0, 400)).slice(0, 200),
+    frame: atob("{frame_b64}".slice(0, 400)).slice(0, 200)
+  }};
 
+  document.getElementById('h5pcss').href = blobUrl("{css_b64}", "text/css");
   const mainUrl  = blobUrl("{main_b64}",  "application/javascript");
   const frameUrl = blobUrl("{frame_b64}", "application/javascript");
 
   function loadScript(src) {{
-    return new Promise((res, rej)=>{{ const s=document.createElement('script'); s.src=src; s.onload=res; s.onerror=rej; document.body.appendChild(s); }});
+    return new Promise((res, rej)=>{{
+      const s=document.createElement('script');
+      s.src=src; s.onload=res; s.onerror=()=>rej(new Error('Failed to load '+src));
+      document.body.appendChild(s);
+    }});
   }}
 
   function resolveHS() {{
@@ -181,8 +211,6 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
     try {{
       await loadScript(mainUrl);
       await loadScript(frameUrl);
-
-      // small wait in case the bundles register asynchronously
       await new Promise(r => setTimeout(r, 50));
 
       const HS = resolveHS();
@@ -196,12 +224,13 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
           keys_H5PStandalone: (window.H5PStandalone && Object.keys(window.H5PStandalone)) || null,
           keys_hyphen: (window['h5p-standalone'] && Object.keys(window['h5p-standalone'])) || null,
           has_default_on_H5PStandalone: !!(window.H5PStandalone && window.H5PStandalone.default),
-          has_default_on_hyphen: !!(window['h5p-standalone'] && window['h5p-standalone'].default)
+          has_default_on_hyphen: !!(window['h5p-standalone'] && window['h5p-standalone'].default),
+          head_dump: headDump
         }};
         document.getElementById('app').innerHTML =
           '<div class="msg"><b>H5P API not ready (no display()).</b>' +
           '<p>Diagnostics:</p><pre>'+JSON.stringify(diag,null,2)+'</pre>' +
-          '<p>Confirm your runtime files are the UMD dist files from <code>h5p-standalone@1.3.0/dist</code>.</p></div>';
+          '<p>If the head_dump begins with &lt;!DOCTYPE or &lt;html or a GitHub redirect page, your JS files are HTML, not the UMD bundles.</p></div>';
       }}
     }} catch(e) {{
       document.getElementById('app').innerHTML =
@@ -216,7 +245,27 @@ def render_h5p_inline_from_b64(h5p_b64: str, runtime_b64: dict, height: int = 76
     st.components.v1.html(html, height=height, scrolling=True)
 
 # ---------- UI ----------
-st.title("🧬 Cell Bio Tutor — Inline H5P (local runtime, with diagnostics)")
+st.title("🧬 Cell Bio Tutor — Inline H5P (local runtime, deep diagnostics)")
+
+with st.expander("Runtime files on disk"):
+    try:
+        runtime_b64, rt_debug = load_runtime_b64_from_repo()
+        st.json(rt_debug)
+        # Quick heuristic checks
+        problems = []
+        if rt_debug["main"]["size_bytes"] < 100000:  # ~100 KB is too small for main.bundle.js
+            problems.append("main.bundle.js looks too small — likely not the UMD dist file.")
+        if rt_debug["frame"]["size_bytes"] < 50000:
+            problems.append("frame.bundle.js looks too small — likely not the UMD dist file.")
+        for k in ("main","frame"):
+            head = rt_debug[k]["head_120"].strip()
+            if head.startswith("<!") or head.lower().startswith("<html"):
+                problems.append(f"{k}.bundle appears to start with HTML — it’s probably an HTML page, not JS.")
+        if problems:
+            st.error(" / ".join(problems))
+    except Exception as e:
+        st.error(str(e))
+        runtime_b64, rt_debug = None, None
 
 with st.expander("1) Upload your course slides (PDF)"):
     slides = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
@@ -224,18 +273,9 @@ with st.expander("1) Upload your course slides (PDF)"):
 topic = st.text_input("2) Topic (e.g., Electron transport chain)")
 colA, colB = st.columns(2)
 with colA:
-    go = st.button("Generate H5P from slides")
+    go = st.button("Generate from slides")
 with colB:
-    test = st.button("Quick runtime self-test (tiny built-in H5P)")
-
-# Show local runtime file info
-try:
-    runtime_b64, rt_debug = load_runtime_b64_from_repo()
-    with st.expander("Runtime files (debug)"):
-        st.json(rt_debug)
-except Exception as e:
-    st.error(str(e))
-    runtime_b64, rt_debug = None, None
+    test = st.button("Quick runtime self-test")
 
 def tiny_sample_h5p() -> bytes:
     title = "Tiny self-test"
@@ -255,18 +295,20 @@ if test:
         render_h5p_inline_from_b64(base64.b64encode(tiny_sample_h5p()).decode("ascii"), runtime_b64)
 
 if go:
-    slide_text = read_pdfs(slides)
-    if not slide_text:
-        st.error("No slide text detected. Please upload slides (PDF).")
+    if not runtime_b64:
+        st.error("Runtime not loaded.")
     else:
-        data = ask_json(topic, slide_text)
-        clozes = [c for c in data.get("clozes", []) if isinstance(c,str) and "**" in c][:7]
-        if not clozes:
-            st.error("No valid clozes found in model output.")
+        slide_text = read_pdfs(slides)
+        if not slide_text:
+            st.error("No slide text detected. Please upload slides (PDF).")
         else:
-            h5p_bytes = build_h5p_drag_words(data.get("title","Cell Bio Activity"), data.get("instructions","Fill the blanks"), clozes)
-            h5p_b64 = base64.b64encode(h5p_bytes).decode("ascii")
-            if runtime_b64:
-                st.success("Generated H5P. Rendering inline below (look for the 'Runtime: local' badge)…")
+            data = ask_json(topic, slide_text)
+            clozes = [c for c in data.get("clozes", []) if isinstance(c,str) and "**" in c][:7]
+            if not clozes:
+                st.error("No valid clozes found in model output.")
+            else:
+                h5p_bytes = build_h5p_drag_words(data.get("title","Cell Bio Activity"), data.get("instructions","Fill the blanks"), clozes)
+                h5p_b64 = base64.b64encode(h5p_bytes).decode("ascii")
+                st.success("Generated H5P. Rendering inline below…")
                 render_h5p_inline_from_b64(h5p_b64, runtime_b64)
-            st.download_button("⬇️ Download this H5P", data=h5p_bytes, file_name="activity.h5p", mime="application/zip")
+                st.download_button("⬇️ Download this H5P", data=h5p_bytes, file_name="activity.h5p", mime="application/zip")
