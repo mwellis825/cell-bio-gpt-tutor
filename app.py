@@ -1,26 +1,26 @@
 # app.py
-# Prompt + Slides → (1) 4× Fill-in-the-Blank (prediction) + (2) Drag into Topic-Specific Bins
-# ------------------------------------------------------------------------------------------------
-# Zero student installs. True drag/drop implemented with pure HTML5 (embedded via st.components).
-# Activities are generated from your prompt + slide text; topic-specific fallbacks keep it on-topic.
+# Prompt + Slides → (1) 4× Fill‑in‑the‑Blank (application, lenient) + (2) Drag into Topic‑Specific Bins
+# ----------------------------------------------------------------------------------------------------
+# No student installs. Drag/drop implemented with pure HTML5 inside a Streamlit component.
+# Activities are generated from your prompt and mined slide text; topic bins change with the prompt.
 #
 # Run:
 #   pip install streamlit
-#   # For PDFs (choose one):
+#   # PDF parser (choose one):
 #   pip install PyPDF2    # or: pip install pypdf
 #   streamlit run app.py
-# ------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------
 
 import os, re, json, pathlib, random
 import streamlit as st
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
-# -------------- App config --------------
+# ---------------- App config ----------------
 st.set_page_config(page_title="Study Mode", page_icon="📘", layout="wide")
 SLIDES_DIR = os.path.join(os.getcwd(), "slides")
 SUPPORTED_TEXT_EXTS = {".txt", ".md", ".mdx", ".html", ".htm"}
 
-# -------------- PDF backends (optional) --------------
+# ---------------- PDF backends (optional) ----------------
 PDF_BACKEND = None
 try:
     import PyPDF2
@@ -32,7 +32,7 @@ except Exception:
     except Exception:
         PDF_BACKEND = None
 
-# -------------- File IO --------------
+# ---------------- File IO ----------------
 def read_text(path: str) -> str:
     for enc in ("utf-8", "latin-1"):
         try:
@@ -76,7 +76,19 @@ def load_corpus(slides_dir: str) -> List[str]:
             texts.append(t)
     return texts
 
-# -------------- Topic detection (bins + fallback stems) --------------
+# ---------------- Utilities ----------------
+def tokenize(s: str) -> List[str]:
+    return re.findall(r"[A-Za-z0-9']+", (s or "").lower())
+
+def corpus_vocab(texts: List[str]) -> set:
+    vocab = set()
+    for t in texts:
+        for tk in tokenize(t):
+            if len(tk) > 2:
+                vocab.add(tk)
+    return vocab
+
+# ---------------- Topic detection (drives bins) ----------------
 def detect_topic(prompt: str) -> str:
     t = (prompt or "").lower()
     if any(k in t for k in ["protein structure","primary structure","secondary structure","tertiary structure","quaternary structure","alpha helix","β-sheet","beta sheet","motif","domain","disulfide","hydrophobic core"]):
@@ -95,10 +107,7 @@ def detect_topic(prompt: str) -> str:
         return "cell_cycle"
     return "generic"
 
-# -------------- Mining sentences near the prompt --------------
-def tokenize(s: str) -> List[str]:
-    return re.findall(r"[A-Za-z0-9']+", (s or "").lower())
-
+# ---------------- Mine sentences near the prompt ----------------
 def split_sentences(text: str) -> List[str]:
     parts = re.split(r"(?<=[\.\?\!])\s+|\n+", text)
     return [re.sub(r"\s+", " ", p).strip() for p in parts if p and len(p.strip()) > 30]
@@ -113,10 +122,11 @@ def relevance(sent: str, q_tokens: List[str]) -> int:
         score += 2
     return score
 
+# Higher-level biology patterns (surface-level causality)
 CAUSE_EFFECT_PATTERNS = [
-    (r"\b(increase|elevat\w*|upregulat\w*|enhanc\w*|stabiliz\w*)\b.+\b(stability|folding|hydrophobic|packing|interaction|binding)\b", "increase"),
-    (r"\b(decrease|reduc\w*|destabiliz\w*|disrupt\w*|impair\w*)\b.+\b(stability|folding|hydrophobic|packing|interaction|binding)\b", "decrease"),
-    (r"\b(accumulat\w*)\b.+\b(unfolded|misfolded|aggregate|intermediate)\b", "accumulate"),
+    (r"\b(increase|elevat\w*|upregulat\w*|enhanc\w*|stabiliz\w*)\b.+\b(rate|level|amount|production|flux|stability|binding|interaction)\b", "increase"),
+    (r"\b(decrease|reduc\w*|downregulat\w*|destabiliz\w*|impair\w*|inhibit\w*)\b.+\b(rate|level|amount|production|flux|stability|binding|interaction)\b", "decrease"),
+    (r"\b(accumulat\w*)\b.+\b(intermediate|unprocessed|misfolded|aggregate|fragment)\b", "accumulate"),
     (r"\b(required|essential|necessary)\b.+\b(for)\b", "decrease"),
 ]
 
@@ -126,10 +136,11 @@ def extract_relations_from_sentence(sent: str) -> List[Tuple[str,str,str]]:
     for pat, key in CAUSE_EFFECT_PATTERNS:
         if re.search(pat, s_low):
             noun = ""
-            m = re.search(r"(unfolded proteins?|misfolded proteins?|aggregates?|intermediates?)", s_low)
+            m = re.search(r"(intermediate|unprocessed|misfolded proteins?|aggregates?)", s_low)
             if m: noun = m.group(0)
             stem = re.sub(r"\s+", " ", sent).strip()
             if not stem.endswith((".", "?")): stem += "."
+            # Friendly prediction format
             stem = f"When this condition holds: {stem} What would you expect to happen?"
             outs.append((stem, key if key in {"increase","decrease","accumulate"} else "no_change", noun))
     if re.search(r"\bleads? to\b|\bresults? in\b|\bcauses?\b", s_low):
@@ -142,6 +153,7 @@ def extract_relations_from_sentence(sent: str) -> List[Tuple[str,str,str]]:
 def mine_prompted_relations(all_text: List[str], prompt: str, max_items=8) -> List[Tuple[str,str,str]]:
     q = tokenize(prompt)
     if not q: return []
+    # rank documents
     doc_scores = []
     for doc in all_text:
         sents = split_sentences(doc)
@@ -149,6 +161,7 @@ def mine_prompted_relations(all_text: List[str], prompt: str, max_items=8) -> Li
         if sc > 0:
             doc_scores.append((sc, sents))
     doc_scores.sort(reverse=True, key=lambda x: x[0])
+
     relations = []
     for _, sents in doc_scores[:5]:
         for s in sents[:400]:
@@ -159,6 +172,8 @@ def mine_prompted_relations(all_text: List[str], prompt: str, max_items=8) -> Li
                 break
         if len(relations) >= max_items:
             break
+
+    # dedupe by stem
     seen = set(); uniq = []
     for stem, key, noun in relations:
         k = stem.lower()
@@ -166,7 +181,7 @@ def mine_prompted_relations(all_text: List[str], prompt: str, max_items=8) -> Li
             uniq.append((stem,key,noun)); seen.add(k)
     return uniq[:max_items]
 
-# -------------- Lenient grading --------------
+# ---------------- Lenient grading ----------------
 UP = {"increase","increases","increased","up","higher","stabilizes","stabilize","stabilized","faster","more","↑"}
 DOWN = {"decrease","decreases","decreased","down","lower","destabilizes","destabilize","destabilized","slower","less","↓"}
 NOCH = {"no change","unchanged","same","neutral","nc","~"}
@@ -186,7 +201,7 @@ def matches(user: str, key: str, noun: str) -> bool:
     if key == "accumulate": return (any(x in u for x in ACCU) or (noun and noun in u))
     return key in u
 
-# -------------- Topic-specific bins (now includes protein structure) --------------
+# ---------------- Topic-specific bins (adaptive) ----------------
 def topic_bins(topic: str):
     if topic == "protein_structure":
         return ["Primary", "Secondary", "Tertiary", "Quaternary"]
@@ -204,36 +219,112 @@ def topic_bins(topic: str):
         return ["Entry/Commitment", "Checkpoint hold", "Transition", "Exit/Completion"]
     return ["Increase", "Decrease", "No change", "Accumulates"]
 
-def build_drag_bank_and_answers(topic: str, mined: List[Tuple[str,str,str]]):
-    labels = topic_bins(topic)
+# ---------------- Build content from slides with surface-level application ----------------
+def build_fitb(topic: str, mined: List[Tuple[str,str,str]], vocab: set) -> List[Dict[str,str]]:
+    # Prefer mined stems; keep them warm and application focused
+    items = []
+    for (stem, key, noun) in mined:
+        items.append({"stem": stem, "key": key, "noun": noun})
+        if len(items) == 4: break
 
-    # Domain seed statements ensure multiple cards & topicality
+    if len(items) >= 4:
+        return items[:4]
+
+    # Topic-appropriate, surface-level backfill (no niche factors; filter by slide vocab)
+    candidates_by_topic = {
+        "protein_structure": [
+            ("When hydrophobic side chains are buried more effectively, overall folding stability would ______.","increase",""),
+            ("When many prolines interrupt an alpha helix, helix stability would ______.","decrease",""),
+            ("When correct disulfide bonds form within one chain, tertiary structure stability would ______.","increase",""),
+            ("When subunits fail to assemble, quaternary structure formation would ______.","decrease",""),
+        ],
+        "transcription": [
+            ("When promoter access improves, the rate of transcription initiation would ______.","increase",""),
+            ("When elongation is slowed by pausing, overall mRNA output would ______.","decrease",""),
+            ("When termination is inefficient, unprocessed transcripts would ______.","accumulate","transcripts"),
+            ("When RNA processing is efficient, mature mRNA levels would ______.","increase",""),
+        ],
+        "translation": [
+            ("When start-site recognition improves, initiation frequency would ______.","increase",""),
+            ("When elongation is hindered, protein synthesis rate would ______.","decrease",""),
+            ("When termination is delayed, stalled ribosome–nascent chains would ______.","accumulate","nascent"),
+            ("When quality control is active, misincorporation errors would ______.","decrease",""),
+        ],
+        "replication": [
+            ("When origin firing is reduced, DNA synthesis initiation events would ______.","decrease",""),
+            ("When fork progression is supported, time to complete replication would ______.","decrease",""),
+            ("When ligation is impaired, short DNA fragments would ______.","accumulate","fragments"),
+            ("When ssDNA is protected, unwanted re-annealing would ______.","decrease",""),
+        ],
+        "microscopy": [
+            ("When numerical aperture increases, the minimum resolvable distance would ______.","decrease",""),
+            ("When wavelength is shorter, the resolution limit would ______.","decrease",""),
+            ("When aberrations grow, image sharpness would ______.","decrease",""),
+            ("When optical sectioning improves, out-of-focus blur would ______.","decrease",""),
+        ],
+        "signaling": [
+            ("When a receptor is more active, downstream pathway output would ______.","increase",""),
+            ("When a pathway inhibitor is present, downstream activation would ______.","decrease",""),
+            ("When feedback removal occurs, the pathway's output would ______.","increase",""),
+            ("When a key phosphatase increases, the level of phosphorylation would ______.","decrease",""),
+        ],
+        "cell_cycle": [
+            ("When a checkpoint engages, the next cell-cycle transition would ______.","decrease",""),
+            ("When cyclin activity rises, entry into the next phase would ______.","increase",""),
+            ("When damage is unresolved, progression to the next phase would ______.","decrease",""),
+            ("When cohesion removal is delayed, time spent before separation would ______.","increase",""),
+        ],
+        "generic": [
+            ("When a rate-limiting step is helped, the amount of product formed would ______.","increase",""),
+            ("When a core step is hindered, throughput would ______.","decrease",""),
+            ("When a late processing step is blocked, intermediates would ______.","accumulate","intermediates"),
+            ("When a parallel backup route is strong, the net change would be ______.","no_change",""),
+        ],
+    }
+    # Filter overly specific stems if their keywords aren't in slide vocab (keep beginner tone)
+    def ok_for_vocab(stem: str) -> bool:
+        toks = [t for t in tokenize(stem) if len(t) > 3]
+        hits = sum(1 for t in toks if t in vocab)
+        return hits >= max(1, len(toks)//12)  # very lenient
+
+    for stem, key, noun in candidates_by_topic.get(topic, candidates_by_topic["generic"]):
+        if ok_for_vocab(stem):
+            items.append({"stem": stem, "key": key, "noun": noun})
+        if len(items) == 4:
+            break
+    while len(items) < 4:
+        items.append({"stem":"When the helpful step improves, the immediate output would ______.","key":"increase","noun":""})
+    return items[:4]
+
+def build_drag(topic: str, mined: List[Tuple[str,str,str]]) -> Tuple[List[str], List[str], Dict[str,str]]:
+    labels = topic_bins(topic)
+    # Domain seed statements (beginner-friendly)
     seeds = {
         "protein_structure": [
-            ("Amino-acid sequence (order of residues)", "Primary"),
-            ("Alpha-helix and beta-sheet content", "Secondary"),
+            ("Amino‑acid sequence (order of residues)", "Primary"),
+            ("Alpha‑helix / beta‑sheet content", "Secondary"),
             ("Hydrophobic core packing", "Tertiary"),
-            ("Disulfide bond stabilizing a single polypeptide", "Tertiary"),
+            ("Disulfide bonds within one chain", "Tertiary"),
             ("Subunit–subunit association", "Quaternary"),
             ("Hemoglobin α2β2 assembly", "Quaternary"),
         ],
         "transcription": [
-            ("Promoter clearance efficiency", "Initiation"),
-            ("Pol II pause-release rate", "Elongation"),
-            ("Readthrough at poly(A) sites", "Termination"),
-            ("Unprocessed pre-mRNA species", "Processing"),
+            ("Promoter access", "Initiation"),
+            ("Pause‑release during elongation", "Elongation"),
+            ("Transcript termination", "Termination"),
+            ("mRNA processing (capping/splicing/polyA)", "Processing"),
         ],
         "translation": [
-            ("Start-site selection", "Initiation"),
+            ("Start‑site recognition", "Initiation"),
             ("Elongation speed", "Elongation"),
-            ("Release-factor dependent termination", "Termination"),
-            ("Incomplete nascent chains", "Quality control"),
+            ("Release‑factor‑mediated termination", "Termination"),
+            ("Quality control of misfolded products", "Quality control"),
         ],
         "replication": [
-            ("Origin firing frequency", "Initiation"),
-            ("Replication-fork progression", "Elongation"),
+            ("Origin firing", "Initiation"),
+            ("Fork progression", "Elongation"),
             ("Okazaki fragment joining", "Ligation"),
-            ("Strand re-annealing at forks", "Fork stability"),
+            ("Fork re‑annealing prevention", "Fork stability"),
         ],
         "microscopy": [
             ("Minimum resolvable distance (d)", "Resolution"),
@@ -242,27 +333,26 @@ def build_drag_bank_and_answers(topic: str, mined: List[Tuple[str,str,str]]):
             ("Nyquist sampling", "Sampling"),
         ],
         "signaling": [
-            ("RTK dimerization/activation", "Upstream activation"),
-            ("RAS-GTP lifetime", "Pathway inhibition"),
-            ("ERK phosphorylation", "Downstream output"),
-            ("Negative feedback to ERK", "Feedback"),
+            ("Receptor activation", "Upstream activation"),
+            ("Inhibitor action on pathway", "Pathway inhibition"),
+            ("Downstream target output", "Downstream output"),
+            ("Negative feedback", "Feedback"),
         ],
         "cell_cycle": [
-            ("G1→S entry rate", "Entry/Commitment"),
-            ("Spindle checkpoint activity", "Checkpoint hold"),
-            ("Anaphase onset", "Transition"),
-            ("Cohesion removal completion", "Exit/Completion"),
+            ("Entry into next phase", "Entry/Commitment"),
+            ("Checkpoint engagement", "Checkpoint hold"),
+            ("Transition to anaphase", "Transition"),
+            ("Completion of division", "Exit/Completion"),
         ],
         "generic": [
             ("Product formation rate", "Increase"),
-            ("Core reaction throughput", "Decrease"),
+            ("Core step throughput", "Decrease"),
             ("Intermediate species", "Accumulates"),
-            ("Off-pathway byproducts (immediate)", "No change"),
+            ("Immediate off‑pathway effects", "No change"),
         ],
     }
     pairs = list(seeds.get(topic, seeds["generic"]))
 
-    # Add mined statements as short cards mapped to generic bins if topic is generic
     if topic == "generic":
         generic_bins = {"increase":"Increase","decrease":"Decrease","no_change":"No change","accumulate":"Accumulates"}
         for stem, key, noun in mined:
@@ -273,22 +363,20 @@ def build_drag_bank_and_answers(topic: str, mined: List[Tuple[str,str,str]]):
             if len(short) > 90: short = short[:87] + "…"
             pairs.append((short, label))
 
-    # Dedup, shuffle, ensure at least 6 cards
     seen = set(); uniq = []
     for s, lbl in pairs:
         k = (s.lower(), lbl.lower())
         if k not in seen:
             uniq.append((s,lbl)); seen.add(k)
     random.shuffle(uniq)
-
     if len(uniq) < 6:
-        pad = [("Amino-acid sequence", "Primary"),
-               ("Alpha-helix content", "Secondary"),
-               ("Hydrophobic interactions in core", "Tertiary"),
-               ("Subunit interface contacts", "Quaternary")]
-        for p in pad:
-            if p not in uniq:
-                uniq.append(p)
+        pad = [("Immediate product output", labels[0]),
+               ("Processing intermediates", labels[-1] if "Accumulates" in labels else labels[0]),
+               ("Core step throughput", labels[1] if len(labels)>1 else labels[0]),
+               ("Non‑target side effects", labels[2] if len(labels)>2 else labels[0])]
+        for s,lbl in pad:
+            if (s.lower(), lbl.lower()) not in seen:
+                uniq.append((s,lbl))
             if len(uniq) >= 6: break
 
     bank_pairs = uniq[:8]
@@ -296,96 +384,31 @@ def build_drag_bank_and_answers(topic: str, mined: List[Tuple[str,str,str]]):
     answers = {s:lbl for (s,lbl) in bank_pairs}
     return labels, bank, answers
 
-# -------------- UI --------------
-st.title("📘 Prompt → Critical-Thinking Activities")
-st.caption("Type a topic. The app searches your slides and builds *fresh* activities each time (no memorization trivia).")
+# ---------------- UI ----------------
+st.title("📘 Prompt → Critical‑Thinking Activities")
+st.caption("Enter a topic. The app reads your slides and builds fresh, application‑style practice (no trivia).")
 
-prompt = st.text_input("Enter a topic (e.g., protein structure, transcription initiation, replication fork dynamics)", value="", placeholder="Type your topic…")
+prompt = st.text_input(
+    "Enter a topic (e.g., protein structure, transcription initiation, replication fork dynamics)",
+    value="", placeholder="Type your topic…"
+)
 
 if st.button("Generate"):
     # Load slides once
     if "corpus" not in st.session_state:
         st.session_state.corpus = load_corpus(SLIDES_DIR)
 
-    all_text = st.session_state.corpus
+    texts = st.session_state.corpus
     topic = detect_topic(prompt)
+    mined = mine_prompted_relations(texts, prompt, max_items=10) if topic != "protein_structure" else []
+    vocab = corpus_vocab(texts)
 
-    # Mine relations (used mainly for non-structure topics)
-    mined = mine_prompted_relations(all_text, prompt, max_items=10) if topic != "protein_structure" else []
-
-    # Build 4 FITB items
-    fitb = []
-    if topic == "protein_structure":
-        fitb = [
-            {"stem":"When hydrophobic side chains are buried more effectively, overall folding stability would ______.","key":"increase","noun":""},
-            {"stem":"When many proline residues are introduced into an alpha helix, helix stability would ______.","key":"decrease","noun":""},
-            {"stem":"When disulfide bonds form correctly within a single chain, tertiary structure stability would ______.","key":"increase","noun":""},
-            {"stem":"When subunits fail to assemble into a complex, quaternary structure formation would ______.","key":"decrease","noun":""},
-        ]
-    else:
-        for (stem, key, noun) in mined[:4]:
-            fitb.append({"stem": stem, "key": key, "noun": noun})
-        if len(fitb) < 4:
-            # fallback topic stems (kept brief)
-            defaults = {
-                "transcription": [
-                    ("When TFIIH helicase activity is reduced, the rate of transcription initiation would ______.", "decrease", ""),
-                    ("When a strong enhancer contacts the promoter, mRNA output would ______.", "increase", ""),
-                    ("When Mediator–Pol II contact is disrupted, promoter clearance would ______.", "decrease", ""),
-                    ("When the poly(A) signal is mutated, unprocessed pre-mRNA species would ______.", "accumulate", "pre-mrna"),
-                ],
-                "translation": [
-                    ("When EF-Tu cannot escort aminoacyl-tRNA, the elongation rate would ______.", "decrease", ""),
-                    ("When the Kozak/Shine-Dalgarno context improves, initiation frequency would ______.", "increase", ""),
-                    ("When release factors are scarce, termination time per protein would ______.", "increase", ""),
-                    ("When peptidyl-transferase is blocked, incomplete nascent chains would ______.", "accumulate", "nascent"),
-                ],
-                "replication": [
-                    ("When helicase activity is inhibited, replication-fork progression would ______.", "decrease", ""),
-                    ("When primer supply drops, lagging-strand starts would ______.", "decrease", ""),
-                    ("When DNA ligase is inactive, unjoined Okazaki fragments would ______.", "accumulate", "okazaki"),
-                    ("When SSB coverage improves on ssDNA, unwanted re-annealing at forks would ______.", "decrease", ""),
-                ],
-                "microscopy": [
-                    ("When numerical aperture (NA) increases, the minimum resolvable distance would ______.", "decrease", ""),
-                    ("When a shorter wavelength is used, the resolution limit would ______.", "decrease", ""),
-                    ("When spherical aberration grows, perceived sharpness would ______.", "decrease", ""),
-                    ("When the confocal pinhole is narrowed moderately, optical sectioning would ______.", "increase", ""),
-                ],
-                "signaling": [
-                    ("When an RTK is persistently ligand-bound and dimerized, ERK phosphorylation would ______.", "increase", ""),
-                    ("When GAP activity on RAS increases, RAS-GTP lifetime would ______.", "decrease", ""),
-                    ("When PI3K is hyperactive, AKT activation would ______.", "increase", ""),
-                    ("When a phosphatase targeting ERK is overexpressed, pERK levels would ______.", "decrease", ""),
-                ],
-                "cell_cycle": [
-                    ("When APC/C is inhibited by the spindle checkpoint, separase activation would ______.", "decrease", ""),
-                    ("When Cyclin E–CDK2 activity rises, G1→S entry would ______.", "increase", ""),
-                    ("When p53 stabilizes after DNA damage, CDK activity would ______.", "decrease", ""),
-                    ("When cohesion removal is delayed, metaphase duration would ______.", "increase", ""),
-                ],
-                "generic": [
-                    ("When a rate-limiting step is enhanced, the amount of product formed would ______.", "increase", ""),
-                    ("When a core catalytic step is hindered, the overall throughput would ______.", "decrease", ""),
-                    ("When a terminal processing step is blocked, intermediate species would ______.", "accumulate", "intermediate"),
-                    ("When a robust compensation route is active, the net change would be ______.", "no_change", ""),
-                ],
-            }
-            for stem, key, noun in defaults.get(topic, defaults["generic"]):
-                if len(fitb) == 4: break
-                fitb.append({"stem": stem, "key": key, "noun": noun})
-
-    st.session_state.fitb = fitb
-
-    # Build drag bank + answers
-    labels, bank, answers = build_drag_bank_and_answers(topic, mined)
-    st.session_state.drag_labels = labels
-    st.session_state.drag_bank = bank
-    st.session_state.drag_answer = answers
+    st.session_state.fitb = build_fitb(topic, mined, vocab)
+    st.session_state.drag_labels, st.session_state.drag_bank, st.session_state.drag_answer = build_drag(topic, mined)
 
     st.success(f"Generated fresh activities for **{topic.replace('_',' ').title()}**.")
 
-# -------------- Render Activity 1: FITB --------------
+# ---------------- Activity 1: FITB ----------------
 if "fitb" in st.session_state:
     st.markdown("## Activity 1 — Predict the immediate effect")
     st.caption("Answer with **increase**, **decrease**, **no change**, or **accumulates**. Lenient matching is OK.")
@@ -394,11 +417,11 @@ if "fitb" in st.session_state:
         if st.button(f"Check {i}", key=f"fitb_check_{i}"):
             ok = matches(u, item["key"], item.get("noun",""))
             if ok:
-                st.success("Nice — that matches the expected immediate effect.")
+                st.success("Nice — that matches the immediate outcome.")
             else:
-                st.error("Not quite — think causally and immediately.")
+                st.error("Not quite — think about the direct, near‑term effect of that change.")
 
-# -------------- Render Activity 2: TRUE Drag (HTML5) --------------
+# ---------------- Activity 2: TRUE Drag (HTML5) ----------------
 if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"]):
     st.markdown("---")
     st.markdown("## Activity 2 — Drag the statements into the correct bin")
@@ -407,26 +430,35 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
     bank   = st.session_state.drag_bank
     answer = st.session_state.drag_answer
 
-    # Ensure at least 6 cards
+    # Ensure ≥6 cards
     if len(bank) < 6:
-        filler = ["Amino-acid sequence","Alpha-helix content","Hydrophobic core packing",
-                  "Subunit interface contacts","Disulfide bonds (intra-chain)","Beta-sheet registry"]
+        filler = ["Amino‑acid sequence","Alpha‑helix content","Hydrophobic core packing",
+                  "Subunit interface contacts","Disulfide bonds (intra‑chain)","Beta‑sheet registry"]
         for f in filler:
             if f not in bank:
-                # Map filler sensibly if protein structure, else first label
                 if "Primary" in labels:
                     mapping = {
-                        "Amino-acid sequence":"Primary",
-                        "Alpha-helix content":"Secondary",
-                        "Beta-sheet registry":"Secondary",
+                        "Amino‑acid sequence":"Primary",
+                        "Alpha‑helix content":"Secondary",
+                        "Beta‑sheet registry":"Secondary",
                         "Hydrophobic core packing":"Tertiary",
-                        "Disulfide bonds (intra-chain)":"Tertiary",
+                        "Disulfide bonds (intra‑chain)":"Tertiary",
                         "Subunit interface contacts":"Quaternary",
                     }
                     answer[f] = mapping.get(f, labels[0])
                 else:
                     answer[f] = labels[0]
                 bank.append(f)
+
+    # Build HTML (drop targets only on inner holders to avoid mis-drops)
+    bins_html = "".join([
+        f"""
+        <div class="bin">
+          <div class="title">{lbl}</div>
+          <div id="bin_{i}" class="holder" ondrop="drop(event)" ondragover="allow(event)"></div>
+        </div>
+        """ for i,lbl in enumerate(labels)
+    ])
 
     html_payload = f"""
     <div style="font-family: ui-sans-serif, system-ui; line-height:1.35;">
@@ -458,7 +490,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
           <div id="bank" class="bank" ondrop="drop(event)" ondragover="allow(event)"></div>
         </div>
         <div class="right">
-          {"".join([f'<div class="bin" ondrop="drop(event)" ondragover="allow(event)"><div class="title">{lbl}</div><div id="bin_{i}"></div></div>' for i,lbl in enumerate(labels)])}
+          {bins_html}
         </div>
       </div>
 
@@ -470,20 +502,15 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
       <script>
         const BANK_ITEMS = {json.dumps(bank)};
         const ANSWERS = {json.dumps(answer)};
-        function allow(ev) {{ ev.preventDefault(); }}
-        function drag(ev)  {{ ev.dataTransfer.setData("text/plain", ev.target.id); }}
+
+        function allow(ev) {{ ev.preventDefault(); ev.dataTransfer.dropEffect = "move"; }}
+        function drag(ev)  {{ ev.dataTransfer.setData("text/plain", ev.target.id); ev.dataTransfer.effectAllowed = "move"; }}
         function drop(ev) {{
           ev.preventDefault();
           const id = ev.dataTransfer.getData("text/plain");
           const card = document.getElementById(id);
-          let target = ev.target;
-          while (target && !target.classList.contains('bank') && !target.id.startsWith('bin_')) {{
-            target = target.parentElement;
-          }}
-          if (!target) return;
-          if (target.id.startsWith('bin_')) {{
-            target.appendChild(card);
-          }} else if (target.classList.contains('bank')) {{
+          const target = ev.target;
+          if (target.classList.contains('holder') || target.id === 'bank') {{
             target.appendChild(card);
           }}
         }}
@@ -495,7 +522,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
             c.className = "card";
             c.id = "card_" + idx;
             c.setAttribute("draggable", "true");
-            c.ondragstart = drag;
+            c.addEventListener("dragstart", drag);
             c.textContent = txt;
             b.appendChild(c);
           }});
@@ -506,7 +533,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
             titles.forEach((t, i) => {{
                 const holder = document.getElementById("bin_" + i);
                 const items = [];
-                holder.querySelectorAll(".card").forEach(c => items.append ? items.append(c.textContent) : items.push(c.textContent));
+                holder.querySelectorAll(".card").forEach(c => items.push(c.textContent));
                 bins[t] = items;
             }});
             return bins;
