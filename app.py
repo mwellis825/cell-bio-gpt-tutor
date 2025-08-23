@@ -1,4 +1,4 @@
-import os, re, io, json, base64, zipfile, random, glob
+import os, re, io, json, zipfile, random, glob
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
@@ -6,13 +6,15 @@ import streamlit as st
 from pypdf import PdfReader
 from openai import OpenAI
 
-# ------------------ CONFIG ------------------
+# ================== CONFIG ==================
 st.set_page_config(page_title="Cell Bio Tutor — Inline DnD + Critical FITB", layout="wide")
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     st.error("Missing OPENAI_API_KEY in Streamlit secrets or environment.")
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+SLIDES_DIR = Path(__file__).parent / "slides"   # put your PDFs here
 
 SYSTEM = (
     "You are a rigorous, supportive Cell Biology tutor. "
@@ -23,11 +25,8 @@ SYSTEM = (
     "Write in plain language; if a technical term appears, add a small parenthetical clarifier."
 )
 
-SLIDES_DIR = Path(__file__).parent / "slides"  # put PDFs here so students never re-upload
-
-# ------------------ UTILITIES ------------------
+# ================== UTILITIES ==================
 def extract_text_from_repo_slides() -> str:
-    """Concatenate text from all PDFs in ./slides folder."""
     pdf_paths = sorted(glob.glob(str(SLIDES_DIR / "*.pdf")))
     chunks = []
     for path in pdf_paths:
@@ -38,6 +37,7 @@ def extract_text_from_repo_slides() -> str:
                 chunks.append(text)
         except Exception as e:
             st.warning(f"Could not read {Path(path).name}: {e}")
+    # Compact and cap length
     full = re.sub(r"\s+", " ", "\n\n".join(chunks)).strip()
     return full[:24000]
 
@@ -59,19 +59,14 @@ def ok_match(student: str, truth: str) -> bool:
     if not isinstance(student, str) or not isinstance(truth, str):
         return False
     s, t = student.strip().lower(), truth.strip().lower()
-    if not s or not t:
-        return False
-    if s == t:
-        return True
-    # tolerate plural “s” and one edit distance
-    if s.endswith("s") and s[:-1] == t:
-        return True
-    if t.endswith("s") and t[:-1] == s:
-        return True
+    if not s or not t: return False
+    if s == t: return True
+    # tolerant: plural “s” and one edit
+    if s.endswith("s") and s[:-1] == t: return True
+    if t.endswith("s") and t[:-1] == s: return True
     return levenshtein(s, t) <= 1
 
-# ------------------ LLM PROMPTS ------------------
-# Softer, less specific, focus on observable outcomes.
+# ================== LLM PROMPTS ==================
 CRITICAL_CLOZE_INSTRUCTION = """Return JSON ONLY with:
 {
   "title": "short title",
@@ -164,7 +159,7 @@ Task: Author a concise drag-and-drop matching activity (concept → correct targ
     )
     return json.loads(resp.choices[0].message.content or "{}")
 
-# ------------------ H5P ZIPS (download only) ------------------
+# ================== H5P (optional downloads) ==================
 def build_h5p_dragtext_zip(title: str, instructions: str, clozes_markdown: List[str]) -> bytes:
     text_lines = [re.sub(r"\*\*(.+?)\*\*", r"*\1*", s) for s in clozes_markdown]
     content_json = {
@@ -233,36 +228,76 @@ def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[s
         z.writestr("content/content.json", json.dumps(qs_content, ensure_ascii=False))
     return buf.getvalue()
 
-# ------------------ INLINE RENDERERS ------------------
-def render_inline_cloze(title: str, instructions: str, clozes: List[str], key_prefix: str) -> Tuple[int,int]:
+# ================== INLINE RENDERERS ==================
+def render_inline_cloze(title: str, instructions: str, clozes: List[str], ns: str = "fitb") -> Tuple[int,int]:
+    """
+    Instant per-item feedback, no page “wipe”.
+    We keep answers & results in session_state[ns].
+    """
+    state = st.session_state.setdefault(ns, {"answers": {}, "checked": {}, "score": (0, len(clozes))})
     st.subheader(f"🧠 {title}")
     st.write(instructions)
-    total = len(clozes); n_correct = 0
 
-    form_key = f"{key_prefix}_form_{hash(title) % 10_000_000}"
-    with st.form(key=form_key, clear_on_submit=False):
-        for i, s in enumerate(clozes, start=1):
-            parts = re.split(r"\*\*(.+?)\*\*", s)
-            if len(parts) >= 3:
-                before, truth, after = parts[0], parts[1], "".join(parts[2:])
-            else:
-                before, truth, after = s, "", ""
-            st.markdown(f"{i}. {before} **____** {after}")
-            st.text_input(f"Your answer for {i}", key=f"{key_prefix}_a_{i}")
-        submitted = st.form_submit_button("Submit answers")
+    # Build UI
+    for i, s in enumerate(clozes, start=1):
+        parts = re.split(r"\*\*(.+?)\*\*", s)
+        if len(parts) >= 3:
+            before, truth, after = parts[0], parts[1], "".join(parts[2:])
+        else:
+            before, truth, after = s, "", ""
+        st.markdown(f"{i}. {before} **____** {after}")
 
-    if submitted:
+        k_ans = f"{ns}_ans_{i}"
+        k_chk = f"{ns}_chk_{i}"
+
+        # Persist the current answer (no reset on rerun)
+        default_val = state["answers"].get(i, "")
+        state["answers"][i] = st.text_input("Your answer:", value=default_val, key=k_ans, label_visibility="collapsed")
+
+        # One-click check (per item)
+        cols = st.columns([1,1,6])
+        with cols[0]:
+            if st.button("Check", key=k_chk):
+                student = state["answers"].get(i, "")
+                ok = ok_match(student, truth)
+                state["checked"][i] = (ok, truth)
+        with cols[1]:
+            # Show last result (if any) without re-click
+            if i in state["checked"]:
+                ok, truth_show = state["checked"][i]
+                st.markdown("✅" if ok else "❌")
+
+        # Show feedback line
+        if i in state["checked"]:
+            ok, truth_show = state["checked"][i]
+            st.caption(f"Correct: **{truth_show or '(no key)'}** — Yours: _{state['answers'].get(i) or '(blank)'}_")
+
+        st.divider()
+
+    # Check all & score
+    if st.button("Check all", key=f"{ns}_check_all"):
+        n_ok = 0
         for i, s in enumerate(clozes, start=1):
             truths = re.findall(r"\*\*(.+?)\*\*", s)
             truth = truths[0] if truths else ""
-            student = st.session_state.get(f"{key_prefix}_a_{i}", "")
+            student = state["answers"].get(i, "")
             ok = ok_match(student, truth)
-            n_correct += int(ok)
-            st.write(f"{'✅' if ok else '❌'} {i}. Correct: **{truth or '(no key provided)'}** — Yours: _{(student or '(blank)')}_")
-        st.info(f"Score: {n_correct}/{total}")
-    return n_correct, total
+            state["checked"][i] = (ok, truth)
+            n_ok += int(ok)
+        state["score"] = (n_ok, len(clozes))
 
-def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,str]], right_choices: List[str], key_prefix: str, height: int = 560):
+    # Display score (if any)
+    n_ok, total = state["score"]
+    if sum(1 for v in state["checked"].values() if v is not None):
+        st.info(f"Score: {n_ok}/{total}")
+
+    return n_ok, total
+
+def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,str]], right_choices: List[str], height: int = 560):
+    """
+    True JS drag-and-drop (compact pills; center-aligned in zone).
+    All scoring client-side. No Python variables referenced.
+    """
     rights = sorted(list({p["right"] for p in pairs})) or right_choices
     data = {"title": title, "instructions": instructions, "pairs": pairs, "rights": rights}
     payload = json.dumps(data)
@@ -289,7 +324,7 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
   .pill:active {{ cursor:grabbing; }}
   .zones {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap:10px; }}
   .zone {{ min-height: 60px; display:flex; flex-direction:column; gap:6px; }}
-  .zlabel {{ font-size:13px; color:#222; }}
+  .zlabel {{ font-size:13px; color:#222; text-align:center; }}
   .dropbox {{
     min-height: 38px; display:flex; flex-wrap:wrap; justify-content:center; align-items:center;
     gap:6px; border:1px dashed #c7c7c7; border-radius:8px; padding:6px; background:#fafafa;
@@ -335,7 +370,7 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
     const zones = document.getElementById('zones');
     const scoreBox = document.getElementById('score');
 
-    // Build draggables (left)
+    // Build draggables
     pairs.forEach((p, i) => {{
       if (!p || !p.left || !p.right) return;
       const pill = document.createElement('div');
@@ -350,7 +385,7 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
       bank.appendChild(pill);
     }});
 
-    // Build drop zones (right)
+    // Build zones
     rights.forEach((r) => {{
       if (!r) return;
       const z = document.createElement('div');
@@ -397,19 +432,19 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
       document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
     }});
 
-    // Check answers (all client-side; no Python variables)
+    // Check answers — purely client-side
     document.getElementById('check').addEventListener('click', () => {{
-      let scoreGot = 0, total = pairs.length;
+      let score = 0, total = pairs.length;
       document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
       document.querySelectorAll('.zone').forEach(zone => {{
         const target = zone.dataset.target;
         zone.querySelectorAll('.pill').forEach(pill => {{
           const ok = (pill.dataset.answer === target);
           pill.classList.add(ok ? 'ok' : 'bad');
-          if (ok) scoreGot += 1;
+          if (ok) score += 1;
         }});
       }});
-      scoreBox.textContent = `Score: ${scoreGot}/${total}`;
+      scoreBox.textContent = `Score: ${score}/${total}`;
     }});
   </script>
 </body>
@@ -418,15 +453,16 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
 
     st.components.v1.html(html, height=height, scrolling=True)
 
-# ------------------ APP UI ------------------
+# ================== APP STATE & UI ==================
 if "running_grade" not in st.session_state:
-    st.session_state.running_grade = 0.7  # start medium
-if "history" not in st.session_state:
-    st.session_state.history = []
+    st.session_state.running_grade = 0.7
+if "fitb_state" not in st.session_state:
+    st.session_state.fitb_state = None
+if "dnd_state" not in st.session_state:
+    st.session_state.dnd_state = None
 
-st.title("🧬 Cell Bio Tutor — True Drag-and-Drop + Critical FITB (inline)")
+st.title("🧬 Cell Bio Tutor — Inline DnD + Critical FITB (no page wipe)")
 
-# Slides are loaded automatically from ./slides
 slides_ok = SLIDES_DIR.exists() and any(Path(p).suffix.lower()==".pdf" for p in glob.glob(str(SLIDES_DIR / "*.pdf")))
 if not slides_ok:
     st.warning("No PDFs found in ./slides. Add your lecture PDFs to a 'slides' folder in the repo so content is used automatically.")
@@ -439,91 +475,84 @@ with colA:
 with colB:
     want_dnd = st.checkbox("Generate True Drag-and-Drop", True)
 with colC:
-    gen = st.button("Generate Activities")
-
-if gen:
-    if not slide_text:
-        st.error("No slide text detected in ./slides. Please add PDFs to the 'slides' folder.")
-        st.stop()
-
-    grade_hint = st.session_state.running_grade
-
-    # --------- FITB (critical thinking) ----------
-    if want_cloze:
-        cloze_data = ask_llm_for_cloze(topic, slide_text, grade_hint)
-        c_title = cloze_data.get("title","Causal fill-in-the-blank")
-        c_instr = cloze_data.get("instructions","Predict the missing term in plain language (with brief clarifiers).")
-        raw_clozes = cloze_data.get("clozes", [])
-        # filter: require **answer**, no placeholders, keep it short-ish
-        clozes: List[str] = []
-        for s in raw_clozes or []:
-            if not isinstance(s, str):
-                continue
-            if "**" not in s:
-                continue
-            if re.search(r"\bprotein [xz]\b", s, re.I):
-                continue
-            if len(s) > 140:
-                s = s[:140].rstrip(". ") + "..."
-            clozes.append(s)
-        clozes = clozes[:6]
-
-        if not clozes:
-            st.warning("Cloze generation returned no valid items (likely too specific). Try a narrower topic.")
+    if st.button("Generate / Refresh Activities"):
+        if not slide_text:
+            st.error("No slide text detected in ./slides. Please add PDFs to the 'slides' folder.")
         else:
-            c_ok, c_total = render_inline_cloze(c_title, c_instr, clozes, key_prefix="cloze")
-            if c_total > 0:
-                st.session_state.history.append(("cloze", c_ok, c_total))
-                total_correct = sum(s for _, s, _ in st.session_state.history)
-                total_items = sum(t for _, _, t in st.session_state.history)
-                st.session_state.running_grade = total_correct / max(1, total_items)
-                st.info(f"Adaptive level updated (from FITB). Running accuracy: {st.session_state.running_grade:.0%}")
+            grade = st.session_state.running_grade
+            # FITB
+            if want_cloze:
+                cdata = ask_llm_for_cloze(topic, slide_text, grade)
+                clozes_raw = cdata.get("clozes", []) or []
+                clozes = []
+                for s in clozes_raw:
+                    if isinstance(s, str) and "**" in s and not re.search(r"\bprotein [xz]\b", s, re.I):
+                        clozes.append(s if len(s) <= 140 else s[:140].rstrip(". ") + "…")
+                clozes = clozes[:6]
+                st.session_state.fitb_state = {
+                    "title": cdata.get("title","Causal fill-in-the-blank"),
+                    "instructions": cdata.get("instructions","Predict the missing term in plain language (with brief clarifiers)."),
+                    "clozes": clozes
+                }
+            else:
+                st.session_state.fitb_state = None
 
-            # Optional H5P export (DragText)
-            try:
-                h5p_bytes = build_h5p_dragtext_zip(c_title, c_instr, clozes)
-                st.download_button("⬇️ Download FITB as H5P (DragText)", data=h5p_bytes,
-                                   file_name=re.sub(r'[^a-z0-9]+','_',c_title.lower())+".h5p",
-                                   mime="application/zip", key="dl_dragtext_fitb")
-            except Exception as e:
-                st.warning(f"Could not build H5P for FITB: {e}")
+            # DnD
+            if want_dnd:
+                mdata = ask_llm_for_matching(topic, slide_text, grade)
+                pairs_raw = mdata.get("pairs", []) or []
+                cleaned = []
+                for p in pairs_raw:
+                    if isinstance(p, dict) and p.get("left") and p.get("right"):
+                        if re.search(r"\bprotein [xz]\b", p["left"], re.I) or re.search(r"\bprotein [xz]\b", p["right"], re.I):
+                            continue
+                        left = p["left"][:40] + ("…" if len(p["left"])>40 else "")
+                        right = p["right"][:40] + ("…" if len(p["right"])>40 else "")
+                        cleaned.append({"left": left, "right": right})
+                pairs = cleaned[:8]
+                rights = sorted(list({p["right"] for p in pairs})) or mdata.get("right_choices", [])
+                st.session_state.dnd_state = {
+                    "title": mdata.get("title","Concept → Target (Drag-and-Drop)"),
+                    "instructions": mdata.get("instructions","Drag each prompt to the correct target category (plain language with clarifiers)."),
+                    "pairs": pairs,
+                    "rights": rights
+                }
+            else:
+                st.session_state.dnd_state = None
 
-    # --------- True Drag-and-Drop (matching) ----------
-    if want_dnd:
-        match_data = ask_llm_for_matching(topic, slide_text, grade_hint)
-        m_title = match_data.get("title","Concept → Target (Drag-and-Drop)")
-        m_instr = match_data.get("instructions","Drag each prompt to the correct target category (plain language with clarifiers).")
-        pairs = match_data.get("pairs", []) or []
-        right_choices = match_data.get("right_choices", []) or []
+# --------- RENDER FITB (from state) ----------
+if st.session_state.fitb_state:
+    fs = st.session_state.fitb_state
+    if fs["clozes"]:
+        n_ok, total = render_inline_cloze(fs["title"], fs["instructions"], fs["clozes"], ns="fitb_state_ns")
+        # Update adaptivity gently when “Check all” was used
+        if total > 0:
+            st.session_state.running_grade = max(0.0, min(1.0, n_ok/total))
 
-        # filter invalid/placeholder
-        clean_pairs = []
-        for p in pairs:
-            if not isinstance(p, dict):
-                continue
-            left, right = p.get("left"), p.get("right")
-            if not left or not right:
-                continue
-            if re.search(r"\bprotein [xz]\b", left, re.I) or re.search(r"\bprotein [xz]\b", right, re.I):
-                continue
-            if len(left) > 40:
-                left = left[:40].rstrip() + "…"
-            if len(right) > 40:
-                right = right[:40].rstrip() + "…"
-            clean_pairs.append({"left": left, "right": right})
-        pairs = clean_pairs[:8]
-        rights = sorted(list({p["right"] for p in pairs})) or right_choices
+        # H5P download (optional)
+        try:
+            h5p_bytes = build_h5p_dragtext_zip(fs["title"], fs["instructions"], fs["clozes"])
+            st.download_button("⬇️ Download FITB as H5P (DragText)", data=h5p_bytes,
+                               file_name=re.sub(r'[^a-z0-9]+','_',fs["title"].lower())+".h5p",
+                               mime="application/zip", key="dl_dragtext_fitb_fixed")
+        except Exception as e:
+            st.warning(f"Could not build H5P for FITB: {e}")
+    else:
+        st.warning("No valid FITB items were generated for that topic.")
 
-        if not pairs or not rights:
-            st.warning("Drag-and-drop generation returned no valid items. Try a narrower topic.")
-        else:
-            render_inline_dragdrop(m_title, m_instr, pairs, rights, key_prefix="dnd", height=560)
+# --------- RENDER DnD (from state) ----------
+if st.session_state.dnd_state:
+    ds = st.session_state.dnd_state
+    if ds["pairs"] and (ds["rights"] or {p["right"] for p in ds["pairs"]}):
+        render_inline_dragdrop(ds["title"], ds["instructions"], ds["pairs"], ds["rights"], height=560)
 
-            # Optional H5P export (QuestionSet with MCQ stand-ins)
-            try:
-                qs_bytes = build_h5p_question_set_zip(m_title, m_instr, pairs)
-                st.download_button("⬇️ Download DnD as H5P (QuestionSet)", data=qs_bytes,
-                                   file_name=re.sub(r'[^a-z0-9]+','_',m_title.lower())+"_qs.h5p",
-                                   mime="application/zip", key="dl_qs_dnd")
-            except Exception as e:
-                st.warning(f"Could not build H5P for DnD: {e}")
+        # Optional H5P (QuestionSet)
+        try:
+            qs_bytes = build_h5p_question_set_zip(ds["title"], ds["instructions"], ds["pairs"])
+            st.download_button("⬇️ Download DnD as H5P (QuestionSet)", data=qs_bytes,
+                               file_name=re.sub(r'[^a-z0-9]+','_',ds["title"].lower())+"_qs.h5p",
+                               mime="application/zip", key="dl_qs_dnd_fixed")
+        except Exception as e:
+            st.warning(f"Could not build H5P for DnD: {e}")
+    else:
+        st.warning("No valid DnD items were generated for that topic.")
