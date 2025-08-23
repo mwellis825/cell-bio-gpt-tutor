@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>H5P Viewer (UMD-shimmed)</title>
+  <title>H5P Viewer (hard-capture UMD)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="./h5p.css" />
   <style>
@@ -14,7 +14,7 @@
   </style>
 
   <script>
-    // 1) H5PIntegration must exist BEFORE loading bundles
+    // 1) Must exist before frame.bundle.js
     window.H5PIntegration = {
       baseUrl: location.origin + location.pathname.replace(/\/[^\/]*$/, ''),
       url: location.href,
@@ -31,66 +31,65 @@
       contents: {}
     };
 
-    // 2) UMD shims: capture AMD or CJS export and pin it to window
-    (function installUmdShims(){
-      // Keep any originals so we can restore if needed
-      const original = {
-        define:  ('define'  in window) ? window.define  : undefined,
-        require: ('require' in window) ? window.require : undefined,
-        module:  ('module'  in window) ? window.module  : undefined,
-        exports: ('exports' in window) ? window.exports : undefined,
-      };
+    // 2) Hard UMD capture shims
+    (function installCaptureShims(){
+      // Capture bucket for AMD object/function return
+      window.__H5P_EXPORT__ = undefined;
 
-      // CommonJS shim
+      // Prepare a faux CJS module/exports pair
       const cjsModule  = { exports: {} };
       const cjsExports = cjsModule.exports;
-      Object.defineProperty(window, 'module',  { configurable: true, writable: true, value: cjsModule });
+
+      // Expose CJS globals (writable/configurable to be safe)
+      Object.defineProperty(window, 'module',  { configurable: true, writable: true, value: cjsModule  });
       Object.defineProperty(window, 'exports', { configurable: true, writable: true, value: cjsExports });
 
-      // AMD shim: accept all common call signatures and capture factory return
-      function captureExport(res){
-        if (res && typeof res === 'object' || typeof res === 'function') {
-          window.H5PStandalone = res;
-          window['h5p-standalone'] = res;
-        }
-        return res;
-      }
+      // AMD define that captures factory result into __H5P_EXPORT__
       function amdDefine(name, deps, factory){
         // normalize args
-        if (typeof name === 'function') { factory = name; deps = []; }
+        if (typeof name === 'function') { factory = name; deps = []; name = undefined; }
         else if (Array.isArray(name))   { factory = deps; deps = name; name = undefined; }
         else if (typeof deps === 'function') { factory = deps; deps = []; }
-        // very permissive resolve of deps to pass something in
+
+        // very permissive deps resolver
         let resolved = [];
         if (Array.isArray(deps)) {
           resolved = deps.map(d => {
             if (d === 'exports') return cjsExports;
             if (d === 'module')  return cjsModule;
             if (d === 'require') return function(){};
-            // some UMDs request their own name; return current captured if any
-            if (d === 'h5p-standalone' || d === 'H5PStandalone') return window.H5PStandalone || window['h5p-standalone'];
+            if (d === 'h5p-standalone' || d === 'H5PStandalone') return window.H5PStandalone || window['h5p-standalone'] || window.__H5P_EXPORT__;
             return {};
           });
         }
-        // run factory and capture result
+
         let out;
         if (typeof factory === 'function') out = factory.apply(null, resolved);
-        else out = factory; // object literal define
-        return captureExport(out);
+        else out = factory; // object literal path
+
+        if (out && (typeof out === 'object' || typeof out === 'function')) {
+          window.__H5P_EXPORT__ = out;
+        }
+        return out;
       }
-      amdDefine.amd = {}; // signal AMD present
+      amdDefine.amd = {}; // make UMD think AMD is present
+
+      // Expose AMD globals
       Object.defineProperty(window, 'define',  { configurable: true, writable: true, value: amdDefine });
-      // Provide a minimal require to satisfy UMD checks (not used)
       Object.defineProperty(window, 'require', { configurable: true, writable: true, value: function(){ return {}; } });
 
-      // After bundles load, finalize: if CJS export was used, capture it
+      // Finalizer that promotes any captured export to window globals
       window.__finalizeH5PStandalone__ = function(){
-        if (!window.H5PStandalone && cjsModule.exports && (typeof cjsModule.exports === 'object' || typeof cjsModule.exports === 'function')) {
-          window.H5PStandalone = cjsModule.exports;
-          window['h5p-standalone'] = cjsModule.exports;
+        const candidate =
+          window.__H5P_EXPORT__ ||
+          (window.module && window.module.exports) ||
+          window.H5PStandalone ||
+          window['h5p-standalone'];
+
+        if (candidate && (typeof candidate === 'object' || typeof candidate === 'function')) {
+          window.H5PStandalone = candidate;
+          window['h5p-standalone'] = candidate;
         }
-        // We intentionally leave the shims in place; they’re harmless for this viewer.
-        // If you need to restore originals later, you could do it here.
       };
     })();
 
@@ -99,7 +98,7 @@
     function loadScript(src){
       return new Promise((resolve,reject)=>{
         const s=document.createElement('script');
-        s.src = src; s.async = false; // keep order
+        s.src = src; s.async = false; // preserve order
         s.onload = ()=>{ console.log('Loaded', src); resolve(); };
         s.onerror = ()=>reject(new Error('Failed to load: '+src));
         document.head.appendChild(s);
@@ -120,13 +119,13 @@
   <script>
     (function boot(){
       const app = document.getElementById('app');
-      const src = qp('src');
+      const src = qp('src'); // .h5p URL (or data:application/zip;base64,...)
       if (!src) {
         app.innerHTML = '<div class="hint">No H5P source. Use <code>?src=&lt;url-to-your.h5p&gt;</code> (or a data: URL).</div>';
         return;
       }
 
-      // Finalize capture from CJS, if that’s how it registered
+      // Promote any captured export to window
       if (typeof window.__finalizeH5PStandalone__ === 'function') {
         try { window.__finalizeH5PStandalone__(); } catch {}
       }
@@ -134,17 +133,21 @@
       let tries = 0;
       (function waitReady(){
         tries++;
-        const HS = window.H5PStandalone || window['h5p-standalone'];
+        const HS = window.H5PStandalone || window['h5p-standalone'] || window.__H5P_EXPORT__ || (window.module && window.module.exports);
         if (HS && typeof HS.display === 'function') {
-          console.log('Detected global =', window.H5PStandalone ? 'H5PStandalone' : 'h5p-standalone');
+          console.log('Detected export =', window.H5PStandalone ? 'H5PStandalone' :
+                                      window['h5p-standalone'] ? 'h5p-standalone' :
+                                      window.__H5P_EXPORT__ ? '__H5P_EXPORT__' : 'module.exports');
           try { HS.display('#app', { h5pContent: src }); }
           catch(e){ app.innerHTML = '<p class="err">Could not initialize H5P: '+(e?.message||e)+'</p>'; }
         } else if (tries < 240) {
-          setTimeout(waitReady, 50); // ~12s total
+          setTimeout(waitReady, 50);
         } else {
           console.log('typeof H5PStandalone =', typeof window.H5PStandalone);
           console.log('typeof window["h5p-standalone"] =', typeof window['h5p-standalone']);
-          app.innerHTML = '<p class="err">H5P API not ready. The bundles did not expose a browser global even with AMD/CJS shims. Re-verify the two files are <em>exactly</em> from <code>h5p-standalone@1.3.0/dist</code>.</p>';
+          console.log('typeof __H5P_EXPORT__ =', typeof window.__H5P_EXPORT__);
+          console.log('typeof (module && module.exports) =', typeof (window.module && window.module.exports));
+          app.innerHTML = '<p class="err">H5P API not ready. Even the captured AMD/CJS export did not expose <code>display()</code>. Re-verify that the two JS files are exactly from <code>h5p-standalone@1.3.0/dist</code>.</p>';
         }
       })();
     })();
