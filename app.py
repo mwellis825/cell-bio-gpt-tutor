@@ -1,4 +1,4 @@
-import os, re, io, json, zipfile, random, glob
+import os, re, io, json, zipfile, random, glob, string
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
@@ -11,7 +11,7 @@ st.set_page_config(page_title="Cell Bio Tutor — Inline DnD + Critical FITB", l
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    st.error("Missing OPENAI_API_KEY in Streamlit secrets or environment.")
+    st.error("Missing OPENAI_API_KEY in secrets/environment.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 SLIDES_DIR = Path(__file__).parent / "slides"   # put your PDFs here
@@ -20,12 +20,13 @@ SYSTEM = (
     "You are a rigorous, supportive Cell Biology tutor. "
     "Use ONLY the provided slide excerpts (and OpenStax Biology if slides lack coverage) "
     "to create concise, causal, critical-thinking practice. "
-    "Never invent placeholder entities like 'protein X' or 'protein Z'. "
-    "Use concrete, named entities (e.g., ATP synthase, Complex I). "
-    "Write in plain language; if a technical term appears, add a small parenthetical clarifier."
+    "Never invent placeholders like 'protein X' or 'protein Z'. "
+    "Use concrete names (e.g., ATP synthase, Complex I). "
+    "Write in plain language; if jargon appears, add a brief parenthetical clarifier."
 )
 
 # ================== UTILITIES ==================
+@st.cache_data(show_spinner=False)
 def extract_text_from_repo_slides() -> str:
     pdf_paths = sorted(glob.glob(str(SLIDES_DIR / "*.pdf")))
     chunks = []
@@ -37,7 +38,6 @@ def extract_text_from_repo_slides() -> str:
                 chunks.append(text)
         except Exception as e:
             st.warning(f"Could not read {Path(path).name}: {e}")
-    # Compact and cap length
     full = re.sub(r"\s+", " ", "\n\n".join(chunks)).strip()
     return full[:24000]
 
@@ -55,16 +55,57 @@ def levenshtein(a: str, b: str) -> int:
         prev = curr
     return prev[-1]
 
+_PUNCT = str.maketrans("", "", string.punctuation + "–—-")
+STOP = {"the","a","an","to","of","in","on","for","and","or"}
+SYN = {
+    "oxygen consumption":"oxygen use",
+    "oxygen use":"oxygen consumption",
+    "o2 consumption":"oxygen consumption",
+    "o2 use":"oxygen consumption",
+    "atp production":"atp synthesis",
+    "atp synthesis":"atp production",
+    "proton gradient":"pmf",
+    "pmf":"proton gradient",
+    "electron transport chain":"etc",
+    "etc":"electron transport chain",
+    "activation":"increased activity",
+    "increased activity":"activation",
+    "inhibition":"decreased activity",
+    "decreased activity":"inhibition",
+}
+
+def normalize(s: str) -> str:
+    return (s or "").strip().lower().translate(_PUNCT)
+
+def token_set(s: str) -> set:
+    return {w for w in normalize(s).split() if w and w not in STOP}
+
+def jaccard(a: set, b: set) -> float:
+    if not a and not b: return 1.0
+    return len(a & b) / max(1, len(a | b))
+
 def ok_match(student: str, truth: str) -> bool:
+    """Lenient match: case/punct-insensitive, minor typos, synonyms, and token overlap."""
     if not isinstance(student, str) or not isinstance(truth, str):
         return False
-    s, t = student.strip().lower(), truth.strip().lower()
+    s, t = normalize(student), normalize(truth)
     if not s or not t: return False
     if s == t: return True
-    # tolerant: plural “s” and one edit
-    if s.endswith("s") and s[:-1] == t: return True
-    if t.endswith("s") and t[:-1] == s: return True
-    return levenshtein(s, t) <= 1
+
+    # synonyms mapping (both ways)
+    if SYN.get(s) == t or SYN.get(t) == s: return True
+
+    # substring acceptance for short targets
+    if len(t) <= 10 and (s in t or t in s): return True
+
+    # edit distance threshold scales with length
+    dist = levenshtein(s, t)
+    thr = 1 if max(len(s), len(t)) <= 6 else 2
+    if dist <= thr: return True
+
+    # token overlap
+    js = jaccard(token_set(s), token_set(t))
+    return js >= 0.6
 
 # ================== LLM PROMPTS ==================
 CRITICAL_CLOZE_INSTRUCTION = """Return JSON ONLY with:
@@ -85,7 +126,7 @@ Rules:
 - Avoid obscure subunits, rare cofactors, or exact numbers.
 - Each **answer** is 1–2 common course words (e.g., “ATP production”, “proton gradient”).
 - Keep each sentence short (≤ 16 words).
-- Use plain language with small clarifiers (e.g., “cathode (negative end)”).
+- Use plain language with brief clarifiers (e.g., “cathode (negative end)”).
 - Do NOT include extra fields or markdown outside **answer** markers.
 - Never invent placeholders like “protein X/Z”. Use concrete names from slides or OpenStax only.
 """
@@ -106,19 +147,18 @@ Rules:
 - Use ONLY the slide excerpts; if insufficient, you MAY draw on OpenStax Biology to fill small gaps.
 - 6–8 pairs total. Conceptual, not trivia. Example: “RTK always-active → MAPK output increases”.
 - Keep phrases short (≤ 6 words) and precise.
-- Use plain language with brief clarifiers for jargon when needed.
+- Use plain language with brief clarifiers when needed.
 - right_choices must contain every unique target in the pairs.
 - Never invent placeholders like “protein X/Z”. Use concrete names from slides or OpenStax only.
 """
 
-def ask_llm_for_cloze(topic: str, slides: str, prior_grade: float) -> Dict[str, Any]:
-    diff_hint = (
-        "Focus on approachable, single- or two-step causal effects."
-        if prior_grade <= 0.6 else
-        "Use medium complexity causal effects with two steps."
-        if prior_grade <= 0.85 else
-        "Use harder multi-step causal effects, but stay in plain language."
-    )
+@st.cache_data(show_spinner=False)
+def ask_llm_for_cloze_cached(topic: str, slides: str, grade_bucket: str) -> Dict[str, Any]:
+    diff_hint = {
+        "low":  "Focus on approachable, single- or two-step causal effects.",
+        "mid":  "Use medium complexity causal effects with two steps.",
+        "high": "Use harder multi-step causal effects, but stay in plain language.",
+    }[grade_bucket]
     user = f"""
 Topic: "{topic}"
 Slides (excerpt; compacted): {slides[:18000]}
@@ -135,14 +175,13 @@ Task: Author a concise, causal fill-in-the-blank activity (Drag-the-Words style)
     )
     return json.loads(resp.choices[0].message.content or "{}")
 
-def ask_llm_for_matching(topic: str, slides: str, prior_grade: float) -> Dict[str, Any]:
-    diff_hint = (
-        "Foundational matches with clear differences."
-        if prior_grade <= 0.6 else
-        "Medium complexity matches with subtle distractors."
-        if prior_grade <= 0.85 else
-        "Harder conceptual matches (multi-step), in plain language."
-    )
+@st.cache_data(show_spinner=False)
+def ask_llm_for_matching_cached(topic: str, slides: str, grade_bucket: str) -> Dict[str, Any]:
+    diff_hint = {
+        "low":  "Foundational matches with clear differences.",
+        "mid":  "Medium complexity matches with subtle distractors.",
+        "high": "Harder conceptual matches (multi-step), in plain language.",
+    }[grade_bucket]
     user = f"""
 Topic: "{topic}"
 Slides (excerpt; compacted): {slides[:18000]}
@@ -230,15 +269,10 @@ def build_h5p_question_set_zip(title: str, instructions: str, pairs: List[Dict[s
 
 # ================== INLINE RENDERERS ==================
 def render_inline_cloze(title: str, instructions: str, clozes: List[str], ns: str = "fitb") -> Tuple[int,int]:
-    """
-    Instant per-item feedback, no page “wipe”.
-    We keep answers & results in session_state[ns].
-    """
     state = st.session_state.setdefault(ns, {"answers": {}, "checked": {}, "score": (0, len(clozes))})
     st.subheader(f"🧠 {title}")
     st.write(instructions)
 
-    # Build UI
     for i, s in enumerate(clozes, start=1):
         parts = re.split(r"\*\*(.+?)\*\*", s)
         if len(parts) >= 3:
@@ -250,11 +284,9 @@ def render_inline_cloze(title: str, instructions: str, clozes: List[str], ns: st
         k_ans = f"{ns}_ans_{i}"
         k_chk = f"{ns}_chk_{i}"
 
-        # Persist the current answer (no reset on rerun)
         default_val = state["answers"].get(i, "")
         state["answers"][i] = st.text_input("Your answer:", value=default_val, key=k_ans, label_visibility="collapsed")
 
-        # One-click check (per item)
         cols = st.columns([1,1,6])
         with cols[0]:
             if st.button("Check", key=k_chk):
@@ -262,19 +294,16 @@ def render_inline_cloze(title: str, instructions: str, clozes: List[str], ns: st
                 ok = ok_match(student, truth)
                 state["checked"][i] = (ok, truth)
         with cols[1]:
-            # Show last result (if any) without re-click
             if i in state["checked"]:
-                ok, truth_show = state["checked"][i]
+                ok, _ = state["checked"][i]
                 st.markdown("✅" if ok else "❌")
 
-        # Show feedback line
         if i in state["checked"]:
-            ok, truth_show = state["checked"][i]
-            st.caption(f"Correct: **{truth_show or '(no key)'}** — Yours: _{state['answers'].get(i) or '(blank)'}_")
+            ok, tshow = state["checked"][i]
+            st.caption(f"Correct: **{tshow or '(no key)'}** — Yours: _{state['answers'].get(i) or '(blank)'}_")
 
         st.divider()
 
-    # Check all & score
     if st.button("Check all", key=f"{ns}_check_all"):
         n_ok = 0
         for i, s in enumerate(clozes, start=1):
@@ -286,22 +315,17 @@ def render_inline_cloze(title: str, instructions: str, clozes: List[str], ns: st
             n_ok += int(ok)
         state["score"] = (n_ok, len(clozes))
 
-    # Display score (if any)
     n_ok, total = state["score"]
-    if sum(1 for v in state["checked"].values() if v is not None):
+    if state["checked"]:
         st.info(f"Score: {n_ok}/{total}")
-
     return n_ok, total
 
 def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,str]], right_choices: List[str], height: int = 560):
-    """
-    True JS drag-and-drop (compact pills; center-aligned in zone).
-    All scoring client-side. No Python variables referenced.
-    """
     rights = sorted(list({p["right"] for p in pairs})) or right_choices
     data = {"title": title, "instructions": instructions, "pairs": pairs, "rights": rights}
     payload = json.dumps(data)
 
+    # IMPORTANT: escape all `${...}` inside f-string -> use ${{...}}
     html = f"""
 <!doctype html>
 <html>
@@ -370,7 +394,6 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
     const zones = document.getElementById('zones');
     const scoreBox = document.getElementById('score');
 
-    // Build draggables
     pairs.forEach((p, i) => {{
       if (!p || !p.left || !p.right) return;
       const pill = document.createElement('div');
@@ -385,7 +408,6 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
       bank.appendChild(pill);
     }});
 
-    // Build zones
     rights.forEach((r) => {{
       if (!r) return;
       const z = document.createElement('div');
@@ -415,7 +437,6 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
       zones.appendChild(z);
     }});
 
-    // Allow dropping back to bank
     bank.addEventListener('dragover', ev => {{ ev.preventDefault(); bank.classList.add('over'); }});
     bank.addEventListener('dragleave', () => bank.classList.remove('over'));
     bank.addEventListener('drop', ev => {{
@@ -425,14 +446,12 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
       if (el) {{ el.classList.remove('ok','bad'); bank.appendChild(el); }}
     }});
 
-    // Reset
     document.getElementById('reset').addEventListener('click', () => {{
       scoreBox.textContent = '';
       document.querySelectorAll('.pill').forEach(el => bank.appendChild(el));
       document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
     }});
 
-    // Check answers — purely client-side
     document.getElementById('check').addEventListener('click', () => {{
       let score = 0, total = pairs.length;
       document.querySelectorAll('.pill').forEach(el => el.classList.remove('ok','bad'));
@@ -444,7 +463,8 @@ def render_inline_dragdrop(title: str, instructions: str, pairs: List[Dict[str,s
           if (ok) score += 1;
         }});
       }});
-      scoreBox.textContent = `Score: ${score}/${total}`;
+      // Escape ${...} in f-string: use ${{...}}
+      scoreBox.textContent = `Score: ${{score}}/${{total}}`;
     }});
   </script>
 </body>
@@ -461,11 +481,11 @@ if "fitb_state" not in st.session_state:
 if "dnd_state" not in st.session_state:
     st.session_state.dnd_state = None
 
-st.title("🧬 Cell Bio Tutor — Inline DnD + Critical FITB (no page wipe)")
+st.title("🧬 Cell Bio Tutor — Inline DnD + Critical FITB (fast, lenient)")
 
 slides_ok = SLIDES_DIR.exists() and any(Path(p).suffix.lower()==".pdf" for p in glob.glob(str(SLIDES_DIR / "*.pdf")))
 if not slides_ok:
-    st.warning("No PDFs found in ./slides. Add your lecture PDFs to a 'slides' folder in the repo so content is used automatically.")
+    st.warning("No PDFs found in ./slides. Add your lecture PDFs to a 'slides' folder in the repo.")
 slide_text = extract_text_from_repo_slides() if slides_ok else ""
 
 topic = st.text_input("Topic (e.g., 'RTK signaling', 'Electron transport chain')", value="")
@@ -477,15 +497,16 @@ with colB:
 with colC:
     if st.button("Generate / Refresh Activities"):
         if not slide_text:
-            st.error("No slide text detected in ./slides. Please add PDFs to the 'slides' folder.")
+            st.error("No slide text detected in ./slides.")
         else:
-            grade = st.session_state.running_grade
-            # FITB
+            g = st.session_state.running_grade
+            bucket = "low" if g <= 0.6 else "mid" if g <= 0.85 else "high"
+
             if want_cloze:
-                cdata = ask_llm_for_cloze(topic, slide_text, grade)
-                clozes_raw = cdata.get("clozes", []) or []
+                cdata = ask_llm_for_cloze_cached(topic, slide_text, bucket)
+                cl_raw = cdata.get("clozes", []) or []
                 clozes = []
-                for s in clozes_raw:
+                for s in cl_raw:
                     if isinstance(s, str) and "**" in s and not re.search(r"\bprotein [xz]\b", s, re.I):
                         clozes.append(s if len(s) <= 140 else s[:140].rstrip(". ") + "…")
                 clozes = clozes[:6]
@@ -497,9 +518,8 @@ with colC:
             else:
                 st.session_state.fitb_state = None
 
-            # DnD
             if want_dnd:
-                mdata = ask_llm_for_matching(topic, slide_text, grade)
+                mdata = ask_llm_for_matching_cached(topic, slide_text, bucket)
                 pairs_raw = mdata.get("pairs", []) or []
                 cleaned = []
                 for p in pairs_raw:
@@ -524,17 +544,14 @@ with colC:
 if st.session_state.fitb_state:
     fs = st.session_state.fitb_state
     if fs["clozes"]:
-        n_ok, total = render_inline_cloze(fs["title"], fs["instructions"], fs["clozes"], ns="fitb_state_ns")
-        # Update adaptivity gently when “Check all” was used
+        n_ok, total = render_inline_cloze(fs["title"], fs["instructions"], fs["clozes"], ns="fitb_ns")
         if total > 0:
             st.session_state.running_grade = max(0.0, min(1.0, n_ok/total))
-
-        # H5P download (optional)
         try:
             h5p_bytes = build_h5p_dragtext_zip(fs["title"], fs["instructions"], fs["clozes"])
             st.download_button("⬇️ Download FITB as H5P (DragText)", data=h5p_bytes,
                                file_name=re.sub(r'[^a-z0-9]+','_',fs["title"].lower())+".h5p",
-                               mime="application/zip", key="dl_dragtext_fitb_fixed")
+                               mime="application/zip", key="dl_dragtext_fitb_ok")
         except Exception as e:
             st.warning(f"Could not build H5P for FITB: {e}")
     else:
@@ -545,13 +562,11 @@ if st.session_state.dnd_state:
     ds = st.session_state.dnd_state
     if ds["pairs"] and (ds["rights"] or {p["right"] for p in ds["pairs"]}):
         render_inline_dragdrop(ds["title"], ds["instructions"], ds["pairs"], ds["rights"], height=560)
-
-        # Optional H5P (QuestionSet)
         try:
             qs_bytes = build_h5p_question_set_zip(ds["title"], ds["instructions"], ds["pairs"])
             st.download_button("⬇️ Download DnD as H5P (QuestionSet)", data=qs_bytes,
                                file_name=re.sub(r'[^a-z0-9]+','_',ds["title"].lower())+"_qs.h5p",
-                               mime="application/zip", key="dl_qs_dnd_fixed")
+                               mime="application/zip", key="dl_qs_dnd_ok")
         except Exception as e:
             st.warning(f"Could not build H5P for DnD: {e}")
     else:
