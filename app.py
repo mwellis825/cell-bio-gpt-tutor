@@ -1,5 +1,6 @@
-# app.py — Cell Bio Tutor (Slides-only, LLM-authored, H5P via GitHub Pages viewer)
-# Renders H5P by embedding https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html#b64=<base64>
+# app.py — Cell Bio Tutor (slides-only, LLM-authored)
+# Uses GitHub Pages viewer that expects base64 via URL hash: #b64=<base64>
+# Viewer URL: https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html
 
 import os, io, json, base64, zipfile, pathlib, re, uuid, hashlib, html
 from typing import List, Dict, Optional, Tuple
@@ -19,8 +20,8 @@ TEMPLATES_DIR = ROOT / "templates"
 FIB_MASTER = TEMPLATES_DIR / "rtk_fill_in_blanks_FIXED_blocks.h5p"
 DND_MASTER = TEMPLATES_DIR / "cellular_respiration_aligned_course_style.h5p"
 
-# GitHub Pages viewer base (must exist in docs/ on your repo)
-GH_PAGES_VIEWER = "https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html#b64="
+# Your viewer expects #b64=... (hash approach)
+GH_PAGES_VIEWER_HASH = "https://mwellis825.github.io/cell-bio-gpt-tutor/viewer.html#b64="
 
 # ------------------------------
 # OpenAI (lazy init)
@@ -65,7 +66,7 @@ def init_state():
         index_chunks=[],
         index_embeds=None,
         run_id=None,
-        cache={},  # by run_id: {"fib_bytes":..., "dnd_bytes":..., "mcqs":[...]}
+        cache={},  # run_id -> {"fib_bytes":..., "dnd_bytes":..., "mcqs":[...]}
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -378,13 +379,14 @@ def build_dnd_from_master(pairs: List[Tuple[str,str]]) -> Optional[bytes]:
         return None
 
 # ------------------------------
-# H5P renderer via GitHub Pages (iframe)
+# H5P renderer via GH Pages viewer (base64 hash)
 # ------------------------------
-def render_h5p_via_pages(h5p_bytes: bytes, comp_id: str, height: int = 600):
+def render_h5p_via_pages_b64(h5p_bytes: bytes, comp_id: str, height: int = 620):
     if not h5p_bytes:
         return
     b64 = base64.b64encode(h5p_bytes).decode("utf-8")
-    viewer_url = GH_PAGES_VIEWER + html.escape(b64)
+    # IMPORTANT: use the hash form (#b64=...), not ?src=
+    viewer_url = GH_PAGES_VIEWER_HASH + b64
     st.components.v1.iframe(src=viewer_url, height=height)
 
 # ------------------------------
@@ -414,7 +416,10 @@ if generate_clicked:
     # FIB
     try:
         lines = gen_fib_lines_from_context(topic, difficulty="medium", n_items=st.session_state.n_items)
-        instructions = f"Based ONLY on your course slides: predict the downstream effect for **{st.session_state.topic}** (answer with *increase/decrease*)."
+        instructions = (
+            f"Based ONLY on your course slides: predict the downstream effect for "
+            f"**{st.session_state.topic}** (answer with *increase/decrease*)."
+        )
         st.session_state.cache[st.session_state.run_id]["fib_bytes"] = build_fib_from_master(instructions, lines)
     except Exception as e:
         st.error(f"FIB generation failed: {e}")
@@ -445,10 +450,9 @@ if current_run and current_run in st.session_state.cache:
     if data.get("fib_bytes"):
         st.success("Fill-in-the-Blanks (slides-only)")
         try:
-            render_h5p_via_pages(data["fib_bytes"], comp_id=f"fib-{current_run}", height=600)
+            render_h5p_via_pages_b64(data["fib_bytes"], comp_id=f"fib-{current_run}", height=620)
         except Exception as e:
             st.error(f"Render error (FIB): {e}")
-        # Always provide a download fallback
         st.download_button(
             "⬇️ Download FIB (.h5p)",
             data=data["fib_bytes"],
@@ -471,7 +475,7 @@ if current_run and current_run in st.session_state.cache:
     if data.get("dnd_bytes"):
         st.success("Drag-and-Drop (slides-only)")
         try:
-            render_h5p_via_pages(data["dnd_bytes"], comp_id=f"dnd-{current_run}", height=600)
+            render_h5p_via_pages_b64(data["dnd_bytes"], comp_id=f"dnd-{current_run}", height=620)
         except Exception as e:
             st.error(f"Render error (DnD): {e}")
         st.download_button(
