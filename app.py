@@ -1,16 +1,10 @@
 # app.py
-# Slides → Prompt-matched activities:
-#   (1) 4× Fill‑in‑the‑Blank (application, lenient, randomized from slide-matched lines)
-#   (2) Drag into *dynamic bins* inferred from slide keyphrases near the prompt (SortableJS, no installs)
-# ----------------------------------------------------------------------------------------------------
-# Run:
-#   pip install streamlit
-#   # For PDFs (choose one):
-#   pip install PyPDF2    # or: pip install pypdf
-#   streamlit run app.py
+# Universal prompt → activities from your slides
+# (1) 4× Fill‑in‑the‑Blank (application, lenient, randomized from slide‑matched lines)
+# (2) Drag into dynamic bins inferred from nearby slide phrases (SortableJS; no installs)
 # ----------------------------------------------------------------------------------------------------
 
-import os, re, json, pathlib, random, time, math
+import os, re, json, pathlib, random, time
 import streamlit as st
 from typing import List, Tuple, Dict
 
@@ -18,17 +12,17 @@ st.set_page_config(page_title="Study Mode (Universal)", page_icon="📘", layout
 SLIDES_DIR = os.path.join(os.getcwd(), "slides")
 SUPPORTED_TEXT_EXTS = {".txt", ".md", ".mdx", ".html", ".htm"}
 
-def new_seed():
+def new_seed() -> int:
     return int(time.time() * 1000) ^ random.randint(0, 1_000_000)
 
 # -------- PDF backends (optional) --------
 PDF_BACKEND = None
 try:
-    import PyPDF2
+    import PyPDF2  # type: ignore
     PDF_BACKEND = "PyPDF2"
 except Exception:
     try:
-        import pypdf
+        import pypdf  # type: ignore
         PDF_BACKEND = "pypdf"
     except Exception:
         PDF_BACKEND = None
@@ -47,14 +41,14 @@ def read_pdf(path: str) -> str:
     if PDF_BACKEND == "PyPDF2":
         try:
             with open(path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
+                reader = PyPDF2.PdfReader(f)  # type: ignore
                 return "\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
     if PDF_BACKEND == "pypdf":
         try:
             with open(path, "rb") as f:
-                reader = pypdf.PdfReader(f)
+                reader = pypdf.PdfReader(f)  # type: ignore
                 return "\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
@@ -77,7 +71,7 @@ def load_corpus(slides_dir: str) -> List[str]:
             texts.append(t)
     return texts
 
-# -------- Utilities --------
+# -------- Tokenization & helpers --------
 STOP = {"the","and","for","that","with","this","from","into","are","was","were","has","have","had","can","will","would","could","should",
         "a","an","of","in","on","to","by","as","at","or","be","is","it","its","their","our","your","if","when","then","than","but"}
 
@@ -101,8 +95,8 @@ def relevance(sent: str, q_tokens: List[str]) -> int:
         score += 2
     return score
 
-# -------- Mine prompt-matched sentences & keyphrases --------
-def collect_candidates(corpus: List[str], prompt: str, top_docs=6, max_sents_per_doc=400) -> List[str]:
+# -------- Mine prompt-matched sentences & infer bins --------
+def collect_candidates(corpus: List[str], prompt: str, top_docs=6, max_sents_per_doc=500) -> List[str]:
     q = tokens_nostop(prompt)
     if not q: return []
     doc_scores = []
@@ -119,14 +113,13 @@ def collect_candidates(corpus: List[str], prompt: str, top_docs=6, max_sents_per
                 matched.append(s)
     return matched
 
-def infer_bins(matched_sents: List[str], fallback_labels: List[str]) -> List[str]:
-    # harvest keyphrases (simple: frequent nouns/terms 1–3grams)
+def infer_bins(matched_sents: List[str], prompt: str) -> List[str]:
+    # collect frequent 1–3grams from matched sentences + prompt tokens
     vocab = {}
     for s in matched_sents:
         toks = tokens_nostop(s)
         for t in toks:
             vocab[t] = vocab.get(t, 0) + 1
-        # add bigrams & trigrams
         for i in range(len(toks)-1):
             big = f"{toks[i]} {toks[i+1]}"
             vocab[big] = vocab.get(big, 0) + 1
@@ -134,21 +127,32 @@ def infer_bins(matched_sents: List[str], fallback_labels: List[str]) -> List[str
             tri = f"{toks[i]} {toks[i+1]} {toks[i+2]}"
             vocab[tri] = vocab.get(tri, 0) + 1
 
-    # prefer phrases containing topic-ish words
-    preferred = sorted(vocab.items(), key=lambda kv: (len(kv[0].split())>=2, kv[1]), reverse=True)
+    # seed with prompt tokens to avoid "generic" labels
+    for t in tokens_nostop(prompt):
+        vocab[t] = vocab.get(t, 0) + 3
+
+    pref = sorted(vocab.items(), key=lambda kv: (len(kv[0].split())>=2, kv[1]), reverse=True)
     labels = []
-    for phrase, _ in preferred:
-        # filters: short, readable, not pure numbers
+    for phrase, _ in pref:
         if any(ch.isalpha() for ch in phrase) and 3 <= len(phrase) <= 36:
             title = re.sub(r"\b([a-z])", lambda m: m.group(1).upper() if m.start()==0 or phrase[m.start()-1]==" " else m.group(1), phrase)
             title = title.replace("Mrna","mRNA").replace("Dna","DNA").replace("Rna","RNA")
             if title.lower() not in {l.lower() for l in labels} and len(labels) < 4:
                 labels.append(title)
+    # if still short, use prompt-derived placeholders (never the word "Generic")
     if len(labels) < 4:
-        for l in fallback_labels:
-            if l.lower() not in {x.lower() for x in labels} and len(labels) < 4:
-                labels.append(l)
-    return labels[:4] if labels else fallback_labels
+        base = [w.capitalize() for w in tokens_nostop(prompt)[:4]]
+        for b in base:
+            if b and b.lower() not in {x.lower() for x in labels} and len(labels) < 4:
+                labels.append(b)
+    # final pad to exactly 4
+    i = 1
+    while len(labels) < 4:
+        pad = f"{tokens_nostop(prompt)[:1][0].capitalize() if tokens_nostop(prompt) else 'Topic'} {i}"
+        if pad.lower() not in {x.lower() for x in labels}:
+            labels.append(pad)
+        i += 1
+    return labels[:4]
 
 def map_statements_to_bins(statements: List[str], labels: List[str]) -> Dict[str,str]:
     mapping = {}
@@ -164,7 +168,7 @@ def map_statements_to_bins(statements: List[str], labels: List[str]) -> Dict[str
         mapping[s] = labels[best_i]
     return mapping
 
-# -------- Fit causal patterns (application tone) --------
+# -------- Extract causal stems (application tone) --------
 CAUSE_EFFECT_PATTERNS = [
     (r"\b(increase|elevat\w*|upregulat\w*|enhanc\w*|stabiliz\w*)\b.+\b(rate|level|amount|production|flux|stability|binding|interaction|initiation|elongation)\b", "increase"),
     (r"\b(decrease|reduc\w*|downregulat\w*|destabiliz\w*|impair\w*|inhibit\w*)\b.+\b(rate|level|amount|production|flux|stability|binding|interaction|initiation|elongation)\b", "decrease"),
@@ -210,50 +214,60 @@ def matches(user: str, key: str, noun: str) -> bool:
     return key in u
 
 # -------- Build activities from matched sentences --------
-def build_fitb(matched_sents: List[str], rng: random.Random) -> List[Dict[str,str]]:
+def build_fitb(matched_sents: List[str], prompt: str, rng: random.Random) -> List[Dict[str,str]]:
     pool = []
-    for s in matched_sents[:600]:
+    for s in matched_sents[:800]:
         pool.extend(extract_relations_from_sentence(s))
-    # de-dup
+    # If mining is thin, template from prompt tokens (still topic-specific; never generic)
+    if len(pool) < 4:
+        key = "increase"
+        topic_words = tokens_nostop(prompt)[:3] or ["output"]
+        stems = [
+            f"When {topic_words[0]} availability rises, the immediate {topic_words[-1]} would ______.",
+            f"When a step central to {topic_words[0]} is slowed, the {topic_words[-1]} would ______.",
+            f"When processing related to {topic_words[-1]} is blocked, intermediate forms would ______.",
+            f"When an upstream factor essential for {topic_words[0]} is missing, the {topic_words[-1]} would ______.",
+        ]
+        pool.extend([(s, key, topic_words[-1]) for s in stems])
+
+    # de-dup, shuffle, sample 4
     seen = set(); uniq = []
     for stem, key, noun in pool:
         k = stem.lower()
         if k not in seen:
             uniq.append((stem,key,noun)); seen.add(k)
     rng.shuffle(uniq)
-    # if insufficient mined items, gentle backfill
-    while len(uniq) < 4:
-        uniq.append(("When the helpful step improves, the immediate output would ______.","increase",""))
     pick = uniq[:4]
     return [{"stem": s, "key": k, "noun": n} for (s,k,n) in pick]
 
-def build_drag(matched_sents: List[str], rng: random.Random) -> Tuple[List[str], List[str], Dict[str,str]]:
-    # collect short statements from sentences (clip to ~90 chars)
+def build_drag(matched_sents: List[str], prompt: str, rng: random.Random) -> Tuple[List[str], List[str], Dict[str,str]]:
+    # short statements from matched text
     statements = []
-    for s in matched_sents[:400]:
+    for s in matched_sents[:600]:
         short = re.sub(r"\s+", " ", s).strip()
         short = re.sub(r"^Figure\s*\d+[:\.\-]\s*", "", short, flags=re.IGNORECASE)
-        if len(short) > 90: short = short[:87] + "…"
-        if 24 <= len(short) <= 90:
+        if len(short) > 100: short = short[:97] + "…"
+        if 28 <= len(short) <= 100:
             statements.append(short)
-    # if still thin, add generic process-y statements
     if len(statements) < 6:
+        # prompt-derived process phrases (topic-specific placeholders; never "Generic")
+        words = tokens_nostop(prompt) or ["Topic"]
+        base = words[0].capitalize()
         statements += [
-            "Promoter access and start frequency",
-            "Core step throughput",
-            "Intermediate species levels",
-            "Immediate product output",
-            "Elongation/processing speed",
-            "Final assembly/finishing step",
+            f"{base}: upstream factor/change",
+            f"{base}: key process step",
+            f"{base}: intermediate/evidence observed",
+            f"{base}: immediate output",
+            f"{base}: rate/throughput",
+            f"{base}: completion/finishing step",
         ]
-    # dedupe and shuffle
+    # dedupe, shuffle, sample 6–8
     statements = list(dict.fromkeys(statements))
     rng.shuffle(statements)
     bank = statements[: max(6, min(8, len(statements))) ]
 
-    # infer labels from matched sentences; fallback to generic process bins
-    fallback = ["Upstream change", "Core step", "Immediate output", "Observed intermediates"]
-    labels = infer_bins(matched_sents, fallback)
+    # infer labels from matched sentences + prompt
+    labels = infer_bins(matched_sents, prompt)
     answers = map_statements_to_bins(bank, labels)
     return labels, bank, answers
 
@@ -267,13 +281,17 @@ if st.button("Generate"):
     if "corpus" not in st.session_state:
         st.session_state.corpus = load_corpus(SLIDES_DIR)
 
+    if not st.session_state.corpus:
+        msg = "I couldn't read any slide text. If your slides are PDFs, install **PyPDF2** or **pypdf** on the server."
+        if PDF_BACKEND is None:
+            st.error(msg)
+        else:
+            st.warning("No extractable text was found in /slides. Check that PDFs contain selectable text (not just images).")
     rng = random.Random(new_seed())
-
     matched = collect_candidates(st.session_state.corpus, prompt)
-    st.session_state.fitb = build_fitb(matched, rng)
-    st.session_state.drag_labels, st.session_state.drag_bank, st.session_state.drag_answer = build_drag(matched, rng)
-
-    st.success("Generated fresh activities from your slides for this prompt.")
+    st.session_state.fitb = build_fitb(matched, prompt, rng)
+    st.session_state.drag_labels, st.session_state.drag_bank, st.session_state.drag_answer = build_drag(matched, prompt, rng)
+    st.success("Built fresh activities from your slides for this prompt.")
 
 # -------- Activity 1: FITB --------
 if "fitb" in st.session_state:
@@ -314,11 +332,11 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
       <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
       <style>
         .bank, .bin {{
-          border: 2px dashed #bbb; border-radius: 10px; padding: 10px; min-height: 120px;
+          border: 2px dashed #bbb; border-radius: 10px; padding: 12px; min-height: 140px;
           background: #fafafa; margin-bottom: 14px;
         }}
         .bin {{ background: #f6faff; }}
-        .droplist {{ list-style: none; margin: 0; padding: 0; min-height: 80px; }}
+        .droplist {{ list-style: none; margin: 0; padding: 0; min-height: 100px; }}
         .card {{
           background: white; border: 1px solid #ddd; border-radius: 8px;
           padding: 8px 10px; margin: 6px 0; cursor: grab;
@@ -356,9 +374,18 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
         const ANSWERS = {json.dumps(answer)};
         const LABELS = {json.dumps(labels)};
 
+        const opts = {{
+          group: {{ name: 'bins', pull: true, put: true }},
+          animation: 150,
+          forceFallback: true,
+          fallbackOnBody: true,
+          swapThreshold: 0.65,
+          emptyInsertThreshold: 8,
+        }};
+
         const lists = [document.getElementById('bank')];
         LABELS.forEach((_, i) => lists.push(document.getElementById('bin_'+i)));
-        lists.forEach(el => new Sortable(el, {{ group: 'shared', animation: 150 }}));
+        lists.forEach(el => new Sortable(el, opts));
 
         function readBins() {{
           const bins = {{}};
@@ -394,4 +421,4 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
     </body>
     </html>
     """
-    st.components.v1.html(html, height=640, scrolling=True)
+    st.components.v1.html(html, height=680, scrolling=True)
