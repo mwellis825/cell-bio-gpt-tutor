@@ -30,7 +30,7 @@ def _try_llm(prompt: str) -> str:
 
 def llm_hint_for_fitb(stem: str, target: str, topic: str, fallback: str) -> str:
     try:
-        return _try_llm(f"Topic: {topic}\nFITB stem: {stem}\nExpected answer (or label): {target}\nWrite one guiding question.")
+        return _try_llm(f"Topic: {topic}\nFITB stem: {stem}\nExpected answer (or label): {target}\nWrite one guiding, specific question.")
     except Exception:
         return fallback
 
@@ -189,7 +189,7 @@ def matches_label(user: str, key: str) -> bool:
     if key == "frameshift": return any(x in u for x in FRAME)
     return False
 
-# Specific-answer acceptance with synonyms
+# Specific-answer acceptance with synonyms + targeted hints
 SYNONYMS = {
     "endoplasmic reticulum": {"er","endoplasmic reticulum","rough er","smooth er"},
     "rough endoplasmic reticulum": {"rough er","rer","rough endoplasmic reticulum"},
@@ -216,9 +216,33 @@ SYNONYMS = {
     "glycolysis location": {"cytosol","cytoplasm"},
 }
 
+SPECIFIC_HINTS = {
+    "mitochondrial matrix": "Innermost mitochondrial compartment (inside inner membrane) where TCA enzymes reside.",
+    "endoplasmic reticulum": "Organelle contiguous with the nuclear envelope; entry point for secretory proteins.",
+    "rough endoplasmic reticulum": "Membrane with bound ribosomes; co‑translational entry for secreted/membrane proteins.",
+    "smooth endoplasmic reticulum": "Ribosome‑free ER region; lipid synthesis and detoxification.",
+    "nucleus": "Double membrane with pores; houses DNA and nucleolus.",
+    "cytosol": "Aqueous compartment outside organelles; most glycolysis steps happen here.",
+    "golgi apparatus": "Stacked cisternae that modify and sort proteins after ER.",
+    "lysosome": "Acidic lumen with hydrolases for macromolecule breakdown.",
+    "peroxisome": "Oxidative organelle; detoxifies H2O2 and oxidizes very‑long‑chain fatty acids.",
+    "chloroplast": "Plant organelle with thylakoids; performs photosynthesis.",
+    "rna polymerase ii": "Eukaryotic polymerase for mRNA; works in the nucleus.",
+    "helicase": "Unwinds DNA by breaking hydrogen bonds at the fork.",
+    "primase": "Synthesizes short RNA primers to start DNA synthesis.",
+    "dna polymerase": "Extends DNA from a primer; requires 3′‑OH.",
+    "dna ligase": "Forms phosphodiester bonds to seal nicks.",
+    "ribosome p site": "Ribosomal site holding peptidyl‑tRNA (growing chain).",
+    "ribosome a site": "Ribosomal site accepting incoming aminoacyl‑tRNA.",
+    "peptidyl transferase center": "Catalyzes peptide bond formation in the large subunit.",
+    "release factor": "Recognizes stop codon and promotes termination.",
+    "pyruvate": "Three‑carbon product that feeds the TCA cycle under aerobic conditions.",
+    "spontaneous": "Occurs down a gradient without ATP input.",
+    "energy-dependent": "Requires ATP hydrolysis or an equivalent energy source.",
+}
+
 def normalize_answer(a: str) -> str:
     a = norm_text(a)
-    # map common shortcuts
     return a
 
 def matches_specific(user: str, answers: List[str]) -> bool:
@@ -227,11 +251,25 @@ def matches_specific(user: str, answers: List[str]) -> bool:
         norm_ans = normalize_answer(ans)
         if u == norm_ans:
             return True
-        # synonym sets
         if ans in SYNONYMS:
             if u in {normalize_answer(x) for x in SYNONYMS[ans]}:
                 return True
     return False
+
+def specific_hint_for_answer(ans: str) -> str:
+    a = ans.lower()
+    if a in SPECIFIC_HINTS:
+        return SPECIFIC_HINTS[a]
+    # heuristic fallbacks
+    if "matrix" in a and "mitochond" in a:
+        return "Innermost mitochondrial space enclosed by the inner membrane."
+    if "endoplasmic reticulum" in a or a.endswith(" er"):
+        return "Membranous network near nucleus; entry to the secretory pathway."
+    if "cytosol" in a or "cytoplasm" in a:
+        return "Fluid compartment outside organelles."
+    if "nucleus" in a:
+        return "Double membrane with pores; DNA location."
+    return "Use the most specific biological term for the location or component."
 
 # FITB stems (mix of reasoning + specific recall)
 def extract_focus(stem: str) -> str:
@@ -304,7 +342,6 @@ def fallback_hint_fitb(stem: str, key: str, topic: str, rng: random.Random) -> s
     if "glycolysis" in t:
         H["increase"].append(f"Which metabolite builds up first if {focus} speeds up?")
         H["decrease"].append(f"Which product falls first when {focus} is inhibited?")
-
     bank = H.get(key, [f"Focus on the immediate effect of {focus}."])
     return rng.choice(bank)
 
@@ -312,67 +349,23 @@ def specific_fitb_items(topic: str) -> List[Dict]:
     t = topic.lower()
     items = []
     if "glycolysis" in t:
-        items.append({
-            "stem":"Glycolysis primarily occurs in the ______ of eukaryotic cells.",
-            "answers":["cytosol","glycolysis location"],
-            "hint":"Think about the fluid compartment outside organelles."
-        })
-        items.append({
-            "stem":"The end product of glycolysis is ______.",
-            "answers":["pyruvate"],
-            "hint":"It enters mitochondria for oxidation when oxygen is available."
-        })
+        items.append({"stem":"Glycolysis primarily occurs in the ______ of eukaryotic cells.","answers":["cytosol","glycolysis location"],"hint":"Think compartment: not membrane‑bound, enzyme‑rich fluid."})
+        items.append({"stem":"The end product of glycolysis is ______.","answers":["pyruvate"],"hint":"Three‑carbon product feeding the TCA cycle when oxygen is present."})
     if "transcription" in t:
-        items.append({
-            "stem":"Which enzyme synthesizes mRNA in eukaryotes? ______.",
-            "answers":["rna polymerase ii"],
-            "hint":"It’s often abbreviated as Pol II."
-        })
-        items.append({
-            "stem":"Transcription in eukaryotes occurs in the ______.",
-            "answers":["nucleus"],
-            "hint":"It’s bounded by a double membrane and contains chromatin."
-        })
+        items.append({"stem":"Which enzyme synthesizes mRNA in eukaryotes? ______.","answers":["rna polymerase ii"],"hint":"Eukaryotic polymerase for mRNA; often abbreviated Pol II."})
+        items.append({"stem":"Transcription in eukaryotes occurs in the ______.","answers":["nucleus"],"hint":"Compartment with nuclear pores and chromatin."})
     if "translation" in t:
-        items.append({
-            "stem":"The growing polypeptide is held at the ribosomal ______ site.",
-            "answers":["ribosome p site"],
-            "hint":"It’s not the A site that accepts the incoming tRNA."
-        })
-        items.append({
-            "stem":"Secretory proteins often begin translation on ribosomes bound to the ______.",
-            "answers":["rough endoplasmic reticulum","endoplasmic reticulum"],
-            "hint":"This membrane-bound organelle is studded with ribosomes."
-        })
+        items.append({"stem":"The growing polypeptide is held at the ribosomal ______ site.","answers":["ribosome p site"],"hint":"Not the A site; this one holds the peptidyl‑tRNA."})
+        items.append({"stem":"Secretory proteins often begin translation on ribosomes bound to the ______.","answers":["rough endoplasmic reticulum","endoplasmic reticulum"],"hint":"Membrane with ribosomes at the entry of the secretory pathway."})
     if "replication" in t:
-        items.append({
-            "stem":"The enzyme that unwinds DNA at the replication fork is ______.",
-            "answers":["helicase"],
-            "hint":"It breaks hydrogen bonds between bases."
-        })
+        items.append({"stem":"The enzyme that unwinds DNA at the replication fork is ______.","answers":["helicase"],"hint":"Breaks hydrogen bonds between base pairs."})
     if "membrane transport" in t:
-        items.append({
-            "stem":"Simple diffusion is ______ (spontaneous or energy-dependent?).",
-            "answers":["spontaneous"],
-            "hint":"It proceeds down a gradient without ATP."
-        })
-        items.append({
-            "stem":"Pumps that move solutes up their gradient are ______ (spontaneous or energy-dependent?).",
-            "answers":["energy-dependent"],
-            "hint":"They couple ATP hydrolysis to movement."
-        })
+        items.append({"stem":"Simple diffusion is ______ (spontaneous or energy‑dependent?).","answers":["spontaneous"],"hint":"Occurs down a gradient without ATP input."})
+        items.append({"stem":"Pumps that move solutes up their gradient are ______ (spontaneous or energy‑dependent?).","answers":["energy-dependent"],"hint":"Require ATP directly or indirectly."})
     if "protein sorting" in t:
-        items.append({
-            "stem":"Proteins entering the secretory pathway are first threaded into the ______.",
-            "answers":["endoplasmic reticulum","rough endoplasmic reticulum"],
-            "hint":"SRP helps target ribosomes here."
-        })
+        items.append({"stem":"Proteins entering the secretory pathway are first threaded into the ______.","answers":["endoplasmic reticulum","rough endoplasmic reticulum"],"hint":"SRP targets ribosomes here for co‑translational import."})
     if "organelle" in t:
-        items.append({
-            "stem":"Most cellular ATP is produced in the ______ (be specific).",
-            "answers":["mitochondrial matrix"],
-            "hint":"It’s the innermost compartment enclosed by cristae."
-        })
+        items.append({"stem":"Most cellular ATP is produced in the ______ (be specific).","answers":["mitochondrial matrix"],"hint":"Innermost mitochondrial compartment with TCA enzymes."})
     return items
 
 def reasoning_fitb_items(topic: str) -> List[Dict]:
@@ -394,14 +387,11 @@ def reasoning_fitb_items(topic: str) -> List[Dict]:
         stems.append(("If a signal sequence is missing, the protein would be ______.", "mislocalized"))
     elif "cell cycle" in tp:
         stems.append(("If the spindle checkpoint stays active, anaphase onset would ______.", "decrease"))
-    out = []
-    for s,k in stems:
-        out.append({"stem": s, "label": k})
+    out = [{"stem": s, "label": k} for s,k in stems]
     return out
 
 def build_fitb(topic: str, rng: random.Random) -> List[Dict]:
     items = []
-    # mix: 1–2 specific + 2 reasoning (varied)
     specific = specific_fitb_items(topic)
     rng.shuffle(specific)
     items.extend(specific[:rng.choice([1,2])])
@@ -454,44 +444,19 @@ def organelle_pairs(rng: random.Random) -> Tuple[str, list, list, dict, dict]:
 def order_pairs(topic: str) -> Tuple[str, list, list, dict, dict]:
     t = topic.lower()
     if "replication" in t:
-        steps = [
-            "Helicase unwinds DNA at origin",
-            "Primase lays RNA primers",
-            "DNA polymerase extends new strands",
-            "Ligase seals nicks to finish"
-        ]
+        steps = ["Helicase unwinds DNA at origin","Primase lays RNA primers","DNA polymerase extends new strands","Ligase seals nicks to finish"]
         title = "Put the **DNA replication** steps in order."
     elif "transcription" in t:
-        steps = [
-            "RNA polymerase binds promoter",
-            "RNA synthesis begins (initiation)",
-            "RNA chain extends (elongation)",
-            "Termination releases RNA"
-        ]
+        steps = ["RNA polymerase binds promoter","RNA synthesis begins (initiation)","RNA chain extends (elongation)","Termination releases RNA"]
         title = "Put the **transcription** steps in order."
     elif "translation" in t:
-        steps = [
-            "Ribosome assembles at start codon",
-            "Initiator tRNA occupies P site",
-            "Peptide bonds form (elongation)",
-            "Stop codon triggers release"
-        ]
+        steps = ["Ribosome assembles at start codon","Initiator tRNA occupies P site","Peptide bonds form (elongation)","Stop codon triggers release"]
         title = "Put the **translation** steps in order."
     elif "glycolysis" in t:
-        steps = [
-            "Glucose is phosphorylated",
-            "PFK‑1 commits pathway (F1,6BP forms)",
-            "ATP and NADH are generated",
-            "Pyruvate is produced"
-        ]
+        steps = ["Glucose is phosphorylated","PFK‑1 commits pathway (F1,6BP forms)","ATP and NADH are generated","Pyruvate is produced"]
         title = "Put the **glycolysis** steps in order."
     else:
-        steps = [
-            "Process begins",
-            "Key intermediate forms",
-            "Main product accumulates",
-            "Process completes"
-        ]
+        steps = ["Process begins","Key intermediate forms","Main product accumulates","Process completes"]
         title = f"Put the **{topic}** steps in order."
     k = len(steps)
     labels = [f"Step {i}" for i in range(1, k+1)]
@@ -507,47 +472,50 @@ def order_pairs(topic: str) -> Tuple[str, list, list, dict, dict]:
             hint_map[s] = "Which step requires the product of the previous step but precedes the next one?"
     return title, labels, terms, answer, hint_map
 
+def glycolysis_pairs(rng: random.Random) -> Tuple[str, list, list, dict, dict]:
+    """Glycolysis-specific matching: enzyme/component → function (unambiguous)."""
+    pairs = [
+        ("Hexokinase","Phosphorylates glucose in the first step"),
+        ("Phosphofructokinase‑1 (PFK‑1)","Commits pathway by converting F6P to F1,6BP"),
+        ("Glyceraldehyde‑3‑phosphate dehydrogenase (GAPDH)","Generates NADH from G3P"),
+        ("Pyruvate kinase","Produces ATP while forming pyruvate"),
+    ]
+    rng.shuffle(pairs)
+    pairs = pairs[:rng.choice([3,4])]
+    labels = [p for p,_ in pairs]
+    terms = [f for _,f in pairs]
+    answer = {f: p for (p,f) in pairs}
+    hint_map = {}
+    for p,f in pairs:
+        if "Hexokinase" in p:
+            hint_map[f] = "Which enzyme acts first, trapping glucose in the cell as a phosphate ester?"
+        elif "PFK‑1" in p:
+            hint_map[f] = "Which enzyme controls the commitment step and is allosterically regulated by ATP/AMP?"
+        elif "GAPDH" in p:
+            hint_map[f] = "Which enzyme uses inorganic phosphate and reduces NAD+ during glycolysis?"
+        elif "Pyruvate kinase" in p:
+            hint_map[f] = "Which enzyme catalyzes a substrate‑level phosphorylation to make ATP at the end?"
+        else:
+            hint_map[f] = "Match the function to the enzyme’s key hallmark in glycolysis."
+    instr = "Match each **glycolytic enzyme** to its **function**."
+    return instr, labels, terms, answer, hint_map
+
 def protein_function_pairs(topic: str) -> Tuple[str, list, list, dict, dict]:
     t = topic.lower()
     if "replication" in t:
-        pairs = [
-            ("Helicase","Unwinds parental DNA strands"),
-            ("Primase","Synthesizes short RNA primers"),
-            ("DNA polymerase","Extends DNA from primers"),
-            ("DNA ligase","Seals nicks between fragments"),
-        ]
+        pairs = [("Helicase","Unwinds parental DNA strands"),("Primase","Synthesizes short RNA primers"),("DNA polymerase","Extends DNA from primers"),("DNA ligase","Seals nicks between fragments")]
         title = "Match each **protein** to its **function** (DNA replication)."
     elif "transcription" in t:
-        pairs = [
-            ("RNA polymerase II","Synthesizes mRNA from DNA template"),
-            ("General TFs","Help polymerase bind promoter/start"),
-            ("Spliceosome","Removes introns from pre‑mRNA"),
-            ("Capping enzymes","Add 5′ cap to pre‑mRNA"),
-        ]
+        pairs = [("RNA polymerase II","Synthesizes mRNA from DNA template"),("General TFs","Help polymerase bind promoter/start"),("Spliceosome","Removes introns from pre‑mRNA"),("Capping enzymes","Add 5′ cap to pre‑mRNA")]
         title = "Match each **protein/complex** to its **function** (transcription)."
     elif "translation" in t:
-        pairs = [
-            ("Ribosome P site","Holds peptidyl‑tRNA"),
-            ("Ribosome A site","Accepts aminoacyl‑tRNA"),
-            ("Peptidyl transferase center","Forms peptide bonds"),
-            ("Release factor","Recognizes stop codon; terminates"),
-        ]
+        pairs = [("Ribosome P site","Holds peptidyl‑tRNA"),("Ribosome A site","Accepts aminoacyl‑tRNA"),("Peptidyl transferase center","Forms peptide bonds"),("Release factor","Recognizes stop codon; terminates")]
         title = "Match each **component** to its **function** (translation)."
     elif "membrane transport" in t:
-        pairs = [
-            ("ATP‑driven pump","Moves solutes against gradient using ATP"),
-            ("Channel protein","Allows passive ion flow down gradient"),
-            ("Carrier (uniporter)","Facilitates diffusion of one solute"),
-            ("Symporter","Cotransports two solutes in same direction"),
-        ]
+        pairs = [("ATP‑driven pump","Moves solutes against gradient using ATP"),("Channel protein","Allows passive ion flow down gradient"),("Carrier (uniporter)","Facilitates diffusion of one solute"),("Symporter","Cotransports two solutes in same direction")]
         title = "Match each **transport protein** to its **function**."
     else:
-        pairs = [
-            ("Enzyme","Catalyzes a specific reaction"),
-            ("Receptor","Binds ligand to start a signal"),
-            ("Channel","Allows ions to pass"),
-            ("Motor protein","Generates movement"),
-        ]
+        pairs = [("Enzyme","Catalyzes a specific reaction"),("Receptor","Binds ligand to start a signal"),("Channel","Allows ions to pass"),("Motor protein","Generates movement")]
         title = "Match each **protein type** to its **function**."
     rng = random.Random(new_seed())
     rng.shuffle(pairs)
@@ -598,7 +566,13 @@ def build_dnd_activity(topic: str) -> Tuple[str, list, list, dict, dict]:
     t = topic.lower()
     if "organelle" in t:
         return organelle_pairs(rng)
-    if any(x in t for x in ["replication","transcription","translation","glycolysis","membrane transport"]):
+    if "glycolysis" in t:
+        mode = rng.choice(["order","match"])
+        if mode == "order":
+            return order_pairs(topic)
+        else:
+            return glycolysis_pairs(rng)
+    if any(x in t for x in ["replication","transcription","translation","membrane transport"]):
         mode = rng.choice(["order","match"])
         if mode == "order":
             return order_pairs(topic)
@@ -611,7 +585,7 @@ st.title("Let's Practice Biology!")
 prompt = st.text_input(
     "Enter a topic for review and press generate:",
     value="",
-    placeholder="e.g., organelle function, transcription, glycolysis, protein sorting…",
+    placeholder="e.g., organelle function, glycolysis, transcription…",
     label_visibility="visible",
 )
 
@@ -758,8 +732,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
     </html>
     """
     st.components.v1.html(html, height=560, scrolling=True)
-    # Pull the next section closer to the component (reduce excess whitespace)
-    st.markdown("<div style='margin-top:-8px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='margin-top:-6px'></div>", unsafe_allow_html=True)
 
     c1, c2 = st.columns([1,3])
     with c1:
@@ -771,14 +744,6 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
             st.info(llm_hint_for_dnd(chosen_item, target_bin, labels, topic, fb))
 
 # -------- Activity 2: FITB --------
-def fitb_unique_hint(stem: str, key_or_ans, topic: str, rng: random.Random) -> str:
-    if isinstance(key_or_ans, str):
-        return fallback_hint_fitb(stem, key_or_ans, topic, rng)
-    else:
-        # specific answer case
-        base = "Think about the most precise term used in class."
-        return base
-
 if "fitb" in st.session_state:
     st.markdown("---")
     topic_name = st.session_state.get("topic","this topic")
@@ -792,11 +757,11 @@ if "fitb" in st.session_state:
         with col1:
             if st.button("Hint", key=f"hint_{idx}"):
                 if "answers" in item:
-                    # specific answers
-                    ex = item["answers"][0]
-                    st.info(llm_hint_for_fitb(item["stem"], ex, topic_name, fitb_unique_hint(item["stem"], item["answers"], topic_name, rng)))
+                    target = item["answers"][0]
+                    fb = specific_hint_for_answer(target)
+                    st.info(llm_hint_for_fitb(item["stem"], target, topic_name, fb))
                 else:
-                    st.info(llm_hint_for_fitb(item["stem"], item["label"], topic_name, fitb_unique_hint(item["stem"], item["label"], topic_name, rng)))
+                    st.info(llm_hint_for_fitb(item["stem"], item["label"], topic_name, fallback_hint_fitb(item["stem"], item["label"], topic_name, rng)))
         with col2:
             if st.button("Check", key=f"check_{idx}"):
                 ok = False
@@ -808,10 +773,11 @@ if "fitb" in st.session_state:
                     st.success("That’s right! Great work!")
                 else:
                     if "answers" in item:
-                        ex = item["answers"][0]
-                        st.info(llm_hint_for_fitb(item["stem"], ex, topic_name, fitb_unique_hint(item["stem"], item["answers"], topic_name, rng)))
+                        target = item["answers"][0]
+                        fb = specific_hint_for_answer(target)
+                        st.info(llm_hint_for_fitb(item["stem"], target, topic_name, fb))
                     else:
-                        st.info(llm_hint_for_fitb(item["stem"], item["label"], topic_name, fitb_unique_hint(item["stem"], item["label"], topic_name, rng)))
+                        st.info(llm_hint_for_fitb(item["stem"], item["label"], topic_name, fallback_hint_fitb(item["stem"], item["label"], topic_name, rng)))
         with col3:
             if st.button("Reveal", key=f"rev_{idx}"):
                 if "answers" in item:
