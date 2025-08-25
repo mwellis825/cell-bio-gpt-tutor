@@ -11,46 +11,109 @@ SUPPORTED_TEXT_EXTS = {".txt", ".md", ".mdx", ".html", ".htm", ".pdf"}
 def new_seed() -> int:
     return int(time.time() * 1000) ^ random.randint(0, 1_000_000)
 
-# ------------------ LLM + fallback hinting ------------------
+# ------------------ LLM hint (optional) ------------------
 def llm_hint(stem: str, target: str, topic: str) -> str:
     api = os.environ.get("OPENAI_API_KEY")
-    if api:
-        try:
-            import openai  # type: ignore
-            openai.api_key = api
-            sys_prompt = (
-                "You are a Socratic college-level cell biology tutor. "
-                "Given a single question (fill‑in‑the‑blank or drag-and-drop item) and the intended target concept, "
-                "ask ONE concise, specific guiding question that nudges the student toward the answer. "
-                "Avoid jargon, do not reveal the answer."
-            )
-            user_msg = f"Topic: {topic}\nQuestion: {stem}\nTarget concept: {target}\nWrite one guiding question (≤20 words)."
-            resp = openai.ChatCompletion.create(
-                model="gpt-4o-mini",
-                messages=[{"role":"system","content":sys_prompt},{"role":"user","content":user_msg}],
-                temperature=0.3,
-                max_tokens=60,
-            )
-            return resp["choices"][0]["message"]["content"].strip()
-        except Exception:
-            pass
-    # Concise topic-aware fallback
-    t = (topic or "").lower()
+    if not api:
+        raise RuntimeError("No API key")
+    import openai  # type: ignore
+    openai.api_key = api
+    sys_prompt = (
+        "You are a Socratic college-level cell biology tutor. "
+        "Given a single question (fill‑in‑the‑blank or drag-and-drop item) and the intended target concept, "
+        "ask ONE concise, specific guiding question that nudges the student toward the answer. "
+        "Avoid jargon, do not reveal the answer."
+    )
+    user_msg = f"Topic: {topic}\nQuestion: {stem}\nTarget concept: {target}\nWrite one guiding question (≤20 words)."
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"system","content":sys_prompt},{"role":"user","content":user_msg}],
+        temperature=0.3,
+        max_tokens=60,
+    )
+    return resp["choices"][0]["message"]["content"].strip()
+
+# ------------------ Fallback hint generator (unique per item) ------------------
+def extract_focus(stem: str) -> str:
+    s = stem.lower()
+    m = re.search(r"if ([^,]+?) (is|cannot|can't|does not|doesn't|fails|fail)", s)
+    if m: return m.group(1).strip()
+    m = re.search(r"without ([^,]+?)[, ]", s)
+    if m: return m.group(1).strip()
+    return ""
+
+def fallback_hint(stem: str, key: str, topic: str, rng: random.Random) -> str:
+    focus = extract_focus(stem) or "that step"
+    t = (topic or "this topic").lower()
+    H = {
+        "increase": [
+            f"What product rises first if {focus} speeds up?",
+            f"Which immediate output would go up with faster {focus}?",
+            f"What accumulates right after {focus} accelerates?",
+        ],
+        "decrease": [
+            f"What drops first if {focus} is blocked?",
+            f"Which product would fall immediately with loss of {focus}?",
+            f"What output becomes limiting when {focus} slows?",
+        ],
+        "no_change": [
+            f"Would the immediate output actually change if {focus} is altered? Why or why not?",
+            f"Does {focus} directly control the next product here?",
+            f"Is this step upstream or downstream of the measured output?",
+        ],
+        "mislocalized": [
+            f"Where would the product go without correct targeting at {focus}?",
+            f"What compartment would the protein reach if {focus} is missing?",
+            f"Which location is lost when {focus} fails?",
+        ],
+        "no_initiation": [
+            f"What is the very first event that fails when {focus} is absent?",
+            f"What never starts if {focus} cannot occur?",
+            f"What initial assembly is missing without {focus}?",
+        ],
+        "no_elongation": [
+            f"What step at the machine stalls when {focus} cannot proceed?",
+            f"What movement along the template stops if {focus} fails?",
+            f"What chain-building step halts when {focus} is blocked?",
+        ],
+        "no_termination": [
+            f"What signal fails to be recognized at the end when {focus} is missing?",
+            f"What release event won’t happen if {focus} is absent?",
+            f"What keeps going past the endpoint when {focus} fails?",
+        ],
+        "truncated": [
+            f"What would make the product end prematurely if {focus} occurs?",
+            f"What feature shortens the product when {focus} happens?",
+            f"Why would the product stop early with {focus}?",
+        ],
+        "frameshift": [
+            f"Which reading position changes when {focus} occurs?",
+            f"What happens to downstream codons after {focus}?",
+            f"How would the grouping of symbols change if {focus} happens?",
+        ],
+    }
+    # Topic nuance
     if "transcription" in t:
-        return "What changes first at the promoter if that step can’t occur?"
+        H["no_initiation"].append(f"What fails at the promoter when {focus} is absent?")
+        H["decrease"].append(f"Which RNA product falls first if {focus} is blocked?")
     if "translation" in t:
-        return "What happens at the ribosome if that step is blocked?"
+        H["no_elongation"].append(f"What happens at the ribosome when {focus} stalls?")
+        H["no_termination"].append(f"What occurs to the polypeptide if {focus} is missing?")
     if "replication" in t:
-        return "What would you observe at the fork if that factor fails?"
+        H["decrease"].append(f"What happens to fork progression if {focus} is lost?")
+        H["no_initiation"].append(f"What starting event at origins fails without {focus}?")
     if "glycolysis" in t:
-        return "Which metabolite rises or falls immediately when that step is inhibited?"
-    if "membrane" in t:
-        return "How would the gradient or flux change right away?"
-    if "sorting" in t:
-        return "Where would the protein go without that targeting signal?"
-    if "cell cycle" in t:
-        return "Which checkpoint or phase is directly affected first?"
-    return "Focus on the immediate, direct effect before compensation."
+        H["increase"].append(f"Which metabolite builds up first if {focus} speeds up?")
+        H["decrease"].append(f"Which product falls first when {focus} is inhibited?")
+
+    bank = H.get(key, [f"Focus on the immediate effect of {focus}."])
+    return rng.choice(bank)
+
+def smart_hint(stem: str, key: str, topic: str, fallback_text: str) -> str:
+    try:
+        return llm_hint(stem, key, topic)
+    except Exception:
+        return fallback_text
 
 # ------------------ PDF/text loading ------------------
 PDF_BACKEND = None
@@ -251,124 +314,132 @@ def matches(user: str, key: str, noun: str) -> bool:
     if key == "frameshift": return any(x in u for x in FRAME)
     return False
 
-# ------------------ FITB synthesis (diverse reasoning) ------------------
+# ------------------ FITB synthesis (diverse + unique hints) ------------------
 def fitb_stems_from_terms(entities: List[str], processes: List[str], topic: str, rng: random.Random) -> List[Dict[str,str]]:
-    # Four reasoning modes: blockage, acceleration, removal, rescue/comparison
     E = entities[:8]
     P = processes[:8]
     stems = []
 
     def add_blockage():
         if P:
-            p = rng.choice(P); stems.append((f"If {p} is blocked, the immediate output would ______.", "decrease",""))
+            p = rng.choice(P); stems.append((f"If {p} is blocked, the immediate output would ______.", "decrease"))
         if E:
-            e = rng.choice(E); stems.append((f"Without {e}, the process would show ______.", "no_initiation",""))
+            e = rng.choice(E); stems.append((f"Without {e}, the process would show ______.", "no_initiation"))
 
     def add_acceleration():
         if P:
-            p = rng.choice(P); stems.append((f"If {p} speeds up, the near-term product would ______.", "increase",""))
+            p = rng.choice(P); stems.append((f"If {p} speeds up, the near-term product would ______.", "increase"))
         if E:
-            e = rng.choice(E); stems.append((f"If {e} accumulates, upstream pressure would ______.", "increase",""))
+            e = rng.choice(E); stems.append((f"If {e} accumulates, upstream pressure would ______.", "increase"))
 
     def add_removal():
-        if "transcription" in topic:
-            stems.append(("If capping fails, transcript stability would ______.", "decrease",""))
-        elif "translation" in topic:
-            stems.append(("If the ribosome cannot move forward, elongation would ______.", "no_elongation",""))
-        elif "replication" in topic:
-            stems.append(("If helicase does not load, fork progression would ______.", "decrease",""))
-        elif "glycolysis" in topic:
-            stems.append(("If NAD+ is unavailable, glyceraldehyde-3-phosphate would ______.", "increase",""))
-        elif "membrane transport" in topic:
-            stems.append(("If a pump stops, the gradient would ______.", "decrease",""))
-        elif "protein sorting" in topic:
-            stems.append(("If a signal sequence is missing, the protein would be ______.", "mislocalized",""))
-        elif "cell cycle" in topic:
-            stems.append(("If the spindle checkpoint is active, anaphase onset would ______.", "decrease",""))
+        tp = topic.lower()
+        if "transcription" in tp:
+            stems.append(("If capping fails, transcript stability would ______.", "decrease"))
+        elif "translation" in tp:
+            stems.append(("If the ribosome cannot move forward, elongation would ______.", "no_elongation"))
+        elif "replication" in tp:
+            stems.append(("If helicase does not load, fork progression would ______.", "decrease"))
+        elif "glycolysis" in tp:
+            stems.append(("If NAD+ is unavailable, glyceraldehyde-3-phosphate would ______.", "increase"))
+        elif "membrane transport" in tp:
+            stems.append(("If a pump stops, the gradient would ______.", "decrease"))
+        elif "protein sorting" in tp:
+            stems.append(("If a signal sequence is missing, the protein would be ______.", "mislocalized"))
+        elif "cell cycle" in tp:
+            stems.append(("If the spindle checkpoint is active, anaphase onset would ______.", "decrease"))
 
     def add_rescue():
-        if "glycolysis" in topic:
-            stems.append(("If PFK-1 inhibition is relieved, ATP production would ______.", "increase",""))
-        elif "translation" in topic:
-            stems.append(("Restoring a stop codon would make termination ______.", "increase",""))
-        elif "transcription" in topic:
-            stems.append(("If promoter recognition is restored, initiation would ______.", "increase",""))
-        elif "replication" in topic:
-            stems.append(("Supplying primers externally would make synthesis ______.", "increase",""))
+        tp = topic.lower()
+        if "glycolysis" in tp:
+            stems.append(("If PFK-1 inhibition is relieved, ATP production would ______.", "increase"))
+        elif "translation" in tp:
+            stems.append(("Restoring a stop codon would make termination ______.", "increase"))
+        elif "transcription" in tp:
+            stems.append(("If promoter recognition is restored, initiation would ______.", "increase"))
+        elif "replication" in tp:
+            stems.append(("Supplying primers externally would make synthesis ______.", "increase"))
         else:
-            stems.append(("If the upstream block is bypassed, downstream output would ______.", "increase",""))
+            stems.append(("If the upstream block is bypassed, downstream output would ______.", "increase"))
 
-    # Ensure variety
     add_blockage(); add_acceleration(); add_removal(); add_rescue()
 
-    # Dedup, shuffle, pick 4
+    # Dedup & pick up to 4
     seen = set(); uniq = []
     for s in stems:
         if s[0].lower() not in seen:
             uniq.append(s); seen.add(s[0].lower())
     rng.shuffle(uniq)
-    return [{"stem": s, "key": k, "noun": n} for (s,k,n) in uniq[:4]]
+    uniq = uniq[:4]
 
-# ------------------ Drag-and-Drop: (bin, action) pairs first ------------------
+    # Attach unique fallback hints per stem
+    out = []
+    for stem, key in uniq:
+        fh = fallback_hint(stem, key, topic, rng)
+        out.append({"stem": stem, "key": key, "hint": fh})
+    return out
+
+# ------------------ DnD pairs (unambiguous) ------------------
 def fundamental_pairs(topic: str) -> List[Tuple[str,str]]:
     t = topic.lower()
     if "glycolysis" in t:
         return [
-            ("Initial substrate/step","Glucose enters glycolysis"),
-            ("Regulatory enzyme step","PFK-1 commits glycolysis"),
-            ("Intermediate metabolite","Fructose-1,6-bisphosphate forms"),
-            ("End product of glycolysis","Pyruvate is produced"),
+            ("Initial substrate/step","Glucose is phosphorylated (start)"),
+            ("Regulatory enzyme step","PFK-1 converts F6P to F1,6BP (commitment)"),
+            ("Named intermediate","Fructose-1,6-bisphosphate forms (intermediate)"),
+            ("End product","Pyruvate is produced (end)"),
         ]
     if "transcription" in t:
         return [
-            ("Start of transcription","Promoter recruits polymerase"),
-            ("Protein involved in transcription","RNA polymerase synthesizes RNA"),
-            ("RNA processing event","mRNA is capped"),
-            ("End product of transcription","mRNA is produced"),
+            ("Start of transcription","Promoter recognition occurs (start)"),
+            ("Core enzyme action","RNA polymerase II synthesizes RNA (enzyme)"),
+            ("RNA processing event","5′ cap is added to pre‑mRNA (processing)"),
+            ("End product","Mature mRNA is produced (end)"),
         ]
     if "translation" in t:
         return [
-            ("Start of translation","Ribosome assembles at start codon"),
-            ("Ribosome site/function","tRNA pairs in the P site"),
-            ("Elongation step","Polypeptide chain elongates"),
-            ("End product of translation","Polypeptide is released"),
+            ("Start of translation","Small subunit binds start codon (start)"),
+            ("Ribosome site/function","P site holds peptidyl‑tRNA (site)"),
+            ("Elongation step","Peptide bond forms during elongation (step)"),
+            ("End product","Completed polypeptide is released (end)"),
         ]
     if "dna replication" in t:
         return [
-            ("First step of replication","Helicase unwinds DNA"),
-            ("Protein involved in replication","DNA polymerase extends DNA"),
-            ("Intermediate state","Okazaki fragments accumulate"),
-            ("End product of replication","Two DNA copies form"),
+            ("First step","Helicase unwinds origin DNA (start)"),
+            ("Polymerase action","DNA polymerase extends DNA strands (enzyme)"),
+            ("Lagging‑strand feature","Okazaki fragments present on lagging strand (intermediate)"),
+            ("Outcome","Two identical DNA duplexes form (end)"),
         ]
     if "membrane transport" in t:
         return [
-            ("Type of transporter","Channel opens for ions"),
-            ("Driving force/gradient","Gradient drives diffusion"),
-            ("Molecule moved","Transporter moves solute"),
-            ("Outcome of transport","Solute concentration changes"),
+            ("Transporter type","ATP‑driven pump moves ions (type)"),
+            ("Driving force","Electrochemical gradient powers movement (force)"),
+            ("Cargo molecule","Na⁺ ions cross the membrane (cargo)"),
+            ("Outcome","Net ion distribution changes across membrane (end)"),
         ]
     if "protein sorting" in t:
         return [
-            ("Targeting signal","Signal sequence directs protein"),
-            ("Targeting machinery","SRP directs ribosome"),
-            ("Transit/intermediate","Translocon imports protein"),
-            ("Final location/output","Protein reaches destination"),
+            ("Targeting signal","N‑terminal signal sequence directs protein (signal)"),
+            ("Targeting machinery","SRP binds signal and pauses translation (machinery)"),
+            ("Membrane entry","Translocon channels nascent chain into ER (entry)"),
+            ("Final location","Protein reaches ER lumen (destination)"),
         ]
     if "cell cycle" in t:
         return [
-            ("Checkpoint/start event","Checkpoint allows progression"),
-            ("Core division step","Chromosomes align at metaphase"),
-            ("Intermediate state","Sister chromatids separate"),
-            ("Outcome of division","Two daughter cells form"),
+            ("Checkpoint","G1 checkpoint allows S‑phase entry (start)"),
+            ("Alignment step","Chromosomes align at metaphase plate (step)"),
+            ("Separation step","Sister chromatids separate in anaphase (step)"),
+            ("Outcome","Two daughter cells form after cytokinesis (end)"),
         ]
     return [
-        ("Start event","Process begins"),
-        ("Key protein","Enzyme acts on substrate"),
-        ("Intermediate","Intermediate appears"),
-        ("Final product","Product is formed"),
+        ("Start event","Process begins (start)"),
+        ("Key catalytic step","Enzyme catalyzes reaction (enzyme)"),
+        ("Intermediate state","Specific intermediate forms (mid)"),
+        ("Final product","Defined product is formed (end)"),
     ]
 
 def build_pairs_from_slides(entities: List[str], processes: List[str], topic: str, rng: random.Random) -> List[Tuple[str,str]]:
+    # Prefer slide-informed specificity; otherwise fall back to unambiguous fundamentals
     pairs = []
     def add(bin_label, action):
         if (bin_label, action) not in pairs:
@@ -379,43 +450,43 @@ def build_pairs_from_slides(entities: List[str], processes: List[str], topic: st
 
     if "glycolysis" in t:
         if "glucose" in all_text:
-            add("Initial substrate/step","Glucose enters glycolysis")
-        if "pfk" in all_text:
-            add("Regulatory enzyme step","PFK-1 commits glycolysis")
-        if any(x in all_text for x in ["f1,6bp","fructose","g3p","pep"]):
-            add("Intermediate metabolite","Fructose-1,6-bisphosphate forms")
-        add("End product of glycolysis","Pyruvate is produced")
+            add("Initial substrate/step","Glucose is phosphorylated (start)")
+        if "pfk" in all_text or "fructose" in all_text:
+            add("Regulatory enzyme step","PFK-1 converts F6P to F1,6BP (commitment)")
+        if any(x in all_text for x in ["f1,6bp","fructose-1,6","g3p","pep"]):
+            add("Named intermediate","Fructose-1,6-bisphosphate forms (intermediate)")
+        add("End product","Pyruvate is produced (end)")
     elif "transcription" in t:
-        add("Start of transcription","Promoter recruits polymerase")
-        add("Protein involved in transcription","RNA polymerase synthesizes RNA")
+        add("Start of transcription","Promoter recognition occurs (start)")
+        add("Core enzyme action","RNA polymerase II synthesizes RNA (enzyme)")
         if any(x in all_text for x in ["cap","tail","splice"]):
-            add("RNA processing event","mRNA is capped")
-        add("End product of transcription","mRNA is produced")
+            add("RNA processing event","5′ cap is added to pre‑mRNA (processing)")
+        add("End product","Mature mRNA is produced (end)")
     elif "translation" in t:
-        add("Start of translation","Ribosome assembles at start codon")
-        add("Ribosome site/function","tRNA pairs in the P site")
-        add("Elongation step","Polypeptide chain elongates")
-        add("End product of translation","Polypeptide is released")
+        add("Start of translation","Small subunit binds start codon (start)")
+        add("Ribosome site/function","P site holds peptidyl‑tRNA (site)")
+        add("Elongation step","Peptide bond forms during elongation (step)")
+        add("End product","Completed polypeptide is released (end)")
     elif "dna replication" in t:
-        add("First step of replication","Helicase unwinds DNA")
-        add("Protein involved in replication","DNA polymerase extends DNA")
-        add("Intermediate state","Okazaki fragments accumulate")
-        add("End product of replication","Two DNA copies form")
+        add("First step","Helicase unwinds origin DNA (start)")
+        add("Polymerase action","DNA polymerase extends DNA strands (enzyme)")
+        add("Lagging‑strand feature","Okazaki fragments present on lagging strand (intermediate)")
+        add("Outcome","Two identical DNA duplexes form (end)")
     elif "membrane transport" in t:
-        add("Type of transporter","Channel opens for ions")
-        add("Driving force/gradient","Gradient drives diffusion")
-        add("Molecule moved","Transporter moves solute")
-        add("Outcome of transport","Solute concentration changes")
+        add("Transporter type","ATP‑driven pump moves ions (type)")
+        add("Driving force","Electrochemical gradient powers movement (force)")
+        add("Cargo molecule","Na⁺ ions cross the membrane (cargo)")
+        add("Outcome","Net ion distribution changes across membrane (end)")
     elif "protein sorting" in t:
-        add("Targeting signal","Signal sequence directs protein")
-        add("Targeting machinery","SRP directs ribosome")
-        add("Transit/intermediate","Translocon imports protein")
-        add("Final location/output","Protein reaches destination")
+        add("Targeting signal","N‑terminal signal sequence directs protein (signal)")
+        add("Targeting machinery","SRP binds signal and pauses translation (machinery)")
+        add("Membrane entry","Translocon channels nascent chain into ER (entry)")
+        add("Final location","Protein reaches ER lumen (destination)")
     elif "cell cycle" in t:
-        add("Checkpoint/start event","Checkpoint allows progression")
-        add("Core division step","Chromosomes align at metaphase")
-        add("Intermediate state","Sister chromatids separate")
-        add("Outcome of division","Two daughter cells form")
+        add("Checkpoint","G1 checkpoint allows S‑phase entry (start)")
+        add("Alignment step","Chromosomes align at metaphase plate (step)")
+        add("Separation step","Sister chromatids separate in anaphase (step)")
+        add("Outcome","Two daughter cells form after cytokinesis (end)")
     else:
         pairs = fundamental_pairs(topic)
 
@@ -444,58 +515,28 @@ if st.button("Generate"):
     topic = classify_topic(prompt) or "this topic"
     entities, processes = harvest_terms(matched, prompt)
     st.session_state.topic = topic
-    st.session_state.fitb = fitb_stems_from_terms(entities, processes, topic, rng)
 
+    # Build DnD first
     pairs = build_pairs_from_slides(entities, processes, topic, rng)  # (bin, action)
     st.session_state.drag_labels = [b for (b, _) in pairs]
     st.session_state.drag_bank   = [a for (_, a) in pairs]
     st.session_state.drag_answer = {a: b for (b, a) in pairs}
+
+    # Build FITB with per-item fallback hints
+    st.session_state.fitb = fitb_stems_from_terms(entities, processes, topic, rng)
     st.success("Generated fresh activities.")
 
-# -------- Activity 1: FITB --------
-if "fitb" in st.session_state:
-    topic_name = st.session_state.get("topic","this topic")
-    st.markdown(f"## Use your knowledge of **{topic_name}** to answer the following")
-    for idx, item in enumerate(st.session_state.fitb):
-        u = st.text_input(item["stem"], key=f"fitb_{idx}")
-        col1, col2, col3 = st.columns([1,1,1])
-        with col1:
-            if st.button("Hint", key=f"hint_{idx}"):
-                st.info(llm_hint(item["stem"], item["key"], topic_name))
-        with col2:
-            if st.button("Check", key=f"check_{idx}"):
-                ok = matches(u, item["key"], item.get("noun",""))
-                if ok:
-                    st.success("That’s right! Great work!")
-                else:
-                    st.info(llm_hint(item["stem"], item["key"], topic_name))
-        with col3:
-            if st.button("Reveal", key=f"rev_{idx}"):
-                pretty = {
-                    "increase":"increase",
-                    "decrease":"decrease",
-                    "no_change":"no change",
-                    "truncated":"truncated",
-                    "mislocalized":"mislocalized",
-                    "no_initiation":"no initiation",
-                    "no_elongation":"no elongation",
-                    "no_termination":"no termination",
-                    "frameshift":"frameshift",
-                }.get(item["key"], item["key"])
-                st.info(pretty)
-
-# -------- Activity 2: Drag-and-Drop --------
+# -------- Activity 1: Drag-and-Drop --------
 if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"]):
-    st.markdown("---")
+    st.markdown("## Activity 1: Drag and Drop")
     topic = st.session_state.get("topic","this topic")
     labels = st.session_state.drag_labels
     terms  = st.session_state.drag_bank
     answer = st.session_state.drag_answer
 
-    st.markdown(f"## Place the following items in the corresponding categories related to **{topic}**")
+    st.markdown(f"Use your knowledge of **{topic}** to place each item into its specific category.")
 
     items_html = "".join([f'<li class="card" draggable="true">{t}</li>' for t in terms])
-    # grid columns count: 2 if 2 bins, otherwise ceil(n/2)
     cols_count = (len(labels)+1)//2 if len(labels) > 2 else 2
     bins_html = "".join([
         f"""
@@ -604,7 +645,6 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
           }} else {{
             score.innerHTML = "<span class='bad'>" + correct + "/" + total + " correct — try adjusting and re-check.</span>";
           }}
-          // Expose the wrong list so Streamlit can request hints per item via dropdown
           const carrier = document.getElementById('wrong-carrier') || document.createElement('div');
           carrier.id = 'wrong-carrier';
           carrier.setAttribute('data-wrong', JSON.stringify(wrong));
@@ -616,9 +656,43 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer"])
     """
     st.components.v1.html(html, height=650, scrolling=True)
 
-    # DnD hint helper: let the student pick any item for a hint
-    st.caption("Need a nudge on a specific item?")
-    chosen_item = st.selectbox("Pick an item for a hint:", ["(choose an item)"] + terms, index=0)
+    st.caption("Need a hint for a specific item?")
+    chosen_item = st.selectbox("Pick an item for a hint:", ["(choose an item)"] + terms, index=0, key="dnd_hint_select")
     if chosen_item != "(choose an item)":
         target_bin = answer.get(chosen_item, "the correct category")
-        st.info(llm_hint(f"Place '{chosen_item}' into the correct category", target_bin, topic))
+        st.info(smart_hint(f"Place '{chosen_item}' into the correct category", target_bin, topic, f"Think about how '{chosen_item}' fits only one of these labels."))
+
+# -------- Activity 2: FITB --------
+if "fitb" in st.session_state:
+    st.markdown("---")
+    topic_name = st.session_state.get("topic","this topic")
+    st.markdown(f"## Activity 2: Fill in the Blank")
+    st.markdown(f"Use your knowledge of **{topic_name}** to answer the following.")
+
+    for idx, item in enumerate(st.session_state.fitb):
+        u = st.text_input(item["stem"], key=f"fitb_{idx}")
+        col1, col2, col3 = st.columns([1,1,1])
+        with col1:
+            if st.button("Hint", key=f"hint_{idx}"):
+                st.info(smart_hint(item["stem"], item["key"], topic_name, item.get("hint","Consider the immediate effect.")))
+        with col2:
+            if st.button("Check", key=f"check_{idx}"):
+                ok = matches(u, item["key"], "")
+                if ok:
+                    st.success("That’s right! Great work!")
+                else:
+                    st.info(smart_hint(item["stem"], item["key"], topic_name, item.get("hint","Consider the immediate effect.")))
+        with col3:
+            if st.button("Reveal", key=f"rev_{idx}"):
+                pretty = {
+                    "increase":"increase",
+                    "decrease":"decrease",
+                    "no_change":"no change",
+                    "truncated":"truncated",
+                    "mislocalized":"mislocalized",
+                    "no_initiation":"no initiation",
+                    "no_elongation":"no elongation",
+                    "no_termination":"no termination",
+                    "frameshift":"frameshift",
+                }.get(item["key"], item["key"])
+                st.info(pretty)
