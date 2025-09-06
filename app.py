@@ -471,9 +471,86 @@ def is_duplicate(tag: str, obj: dict) -> bool:
     st.session_state[key] = seen
     return False
 
+
+# ---------- Local exam/group-activity style ingestion ----------
+def _extract_pdf_text(path: str) -> str:
+    text = ""
+    try:
+        import PyPDF2
+        with open(path, "rb") as f:
+            r = PyPDF2.PdfReader(f)
+            for p in r.pages:
+                try:
+                    text += p.extract_text() or ""
+                    text += "\n"
+                except Exception:
+                    continue
+    except Exception:
+        # very light fallback: read as bytes and ignore (no text)
+        try:
+            with open(path, "rb") as f:
+                data = f.read().decode("utf-8", "ignore")
+                text += data
+        except Exception:
+            pass
+    return text
+
+def _mine_style_cues(txt: str) -> Dict[str, Any]:
+    # Pull verbs, formats, scaffolds, without storing question content
+    verbs = re.findall(r'\b(interpret|conclude|predict|infer|justify|evaluate|determine|choose|select|explain|which|why|how)\b', txt, flags=re.I)
+    verbs = [v.lower() for v in verbs]
+    # Identify MCQ patterns, scenario markers
+    scenario_markers = re.findall(r'\b(patient|cell line|experiment|assay|culture|mutation|inhibitor|drug|blot|gel|image|figure|graph|data|diagram)\b', txt, flags=re.I)
+    scenario_markers = [s.lower() for s in scenario_markers]
+    # Common comparative language
+    comparators = re.findall(r'\b(increase|decrease|elevate|reduce|higher|lower|upregulate|downregulate|more|less)\b', txt, flags=re.I)
+    comparators = [c.lower() for c in comparators]
+    # FITB style (avoid exact)
+    fitb_clues = re.findall(r'\b(because|therefore|so that|leads to|results in|due to|as a result)\b', txt, flags=re.I)
+    fitb_clues = [c.lower() for c in fitb_clues]
+    return {
+        "verbs": sorted(list(set(verbs)))[:20],
+        "scenario_markers": sorted(list(set(scenario_markers)))[:20],
+        "comparators": sorted(list(set(comparators)))[:20],
+        "fitb_clues": sorted(list(set(fitb_clues)))[:20],
+    }
+
+def load_local_exam_styles() -> Dict[str, Any]:
+    if "local_style_profile" in st.session_state:
+        return st.session_state["local_style_profile"]
+    paths = [
+        "/mnt/data/Biol366 F24 Exam #1 (Ch 1-6).pdf",
+        "/mnt/data/Exam #2 (Ch 7-10).pdf",
+        "/mnt/data/SP25 Group Activity 3 KEY.pdf",
+        "/mnt/data/SP25 Group Activity 4 KEY.pdf",
+        "/mnt/data/Exam #3 (Ch 11-16) Biol366 SP25.pdf",
+        "/mnt/data/Exam #4 (Ch 16-20) BIOL366 SP25.pdf",
+        "/mnt/data/F24 Group Activity 2 -- KEY.pdf",
+    ]
+    big_txt = ""
+    found_any = False
+    for p in paths:
+        if Path(p).exists():
+            found_any = True
+            big_txt += _extract_pdf_text(p) + "\n"
+    profile = {
+        "verbs": ["analyze","interpret","predict","evaluate","justify","determine"],
+        "scenario_markers": ["patient","cell line","experiment","assay","inhibitor","mutation","image","graph"],
+        "comparators": ["increase","decrease","higher","lower","upregulate","downregulate"],
+        "fitb_clues": ["because","leads to","results in","due to"],
+        "found_any": found_any,
+    }
+    if big_txt.strip():
+        cues = _mine_style_cues(big_txt)
+        for k in ("verbs","scenario_markers","comparators","fitb_clues"):
+            if cues.get(k):
+                profile[k] = cues[k]
+    st.session_state["local_style_profile"] = profile
+    return profile
 # ---------- Generators with triple-quoted f-strings ----------
 
 def gen_dnd_from_scope(scope: str, prompt: str):
+    _nonce = str(new_seed())
     client = _openai_client()
     if client is None or not scope.strip():
         return None
@@ -661,6 +738,8 @@ def _filter_intro_fitb_by_topic(items, topic: str):
             filtered.append(it)
     return filtered
 def gen_fitb_from_scope(scope: str, prompt: str):
+    local_style = load_local_exam_styles()
+    _nonce = str(new_seed())
     client = _openai_client()
     if client is None or not scope.strip():
         return None
@@ -1055,6 +1134,8 @@ prompt_val = st.text_input(
 go = st.button("Generate")
 
 if go:
+    # Load local exam style profile (from uploaded PDFs) to guide question style
+    load_local_exam_styles()
     if "corpus" not in st.session_state:
         st.session_state.corpus = load_corpus_from_github(GITHUB_USER, GITHUB_REPO, SLIDES_DIR_GH, GITHUB_BRANCH)
     if "exam_corpus" not in st.session_state:
