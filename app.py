@@ -9,20 +9,16 @@ import requests
 from typing import List, Dict, Any, Tuple
 import streamlit as st
 
-# ============================================================
-# App shell — preserves UX (one prompt + Generate + two activities)
-# ============================================================
 st.set_page_config(page_title="Let's Practice Biology!", page_icon="🎓", layout="wide")
 st.title("Let's Practice Biology!")
 
-# ---------------- GitHub locations (no env vars) ----------------
 GITHUB_USER   = "mwellis825"
 GITHUB_REPO   = "cell-bio-gpt-tutor"
 GITHUB_BRANCH = "main"
-SLIDES_DIR_GH = "slides"   # slides live here
-EXAMS_DIR_GH  = "exams"    # optional prior exams for style imitation
+SLIDES_DIR_GH = "slides"
+EXAMS_DIR_GH  = "exams"
 
-# ---------------- Small utils ----------------
+# ---------------- Utilities ----------------
 def _strip_code_fences(s: str) -> str:
     s = (s or "").strip()
     if s.startswith("```"):
@@ -31,52 +27,21 @@ def _strip_code_fences(s: str) -> str:
     return s.strip()
 
 def _extract_json_block(s: str) -> str:
-    """Pull the first valid {...} or [...] block from model text."""
     s = _strip_code_fences(s)
     a_start, a_end = s.find("["), s.rfind("]")
     o_start, o_end = s.find("{"), s.rfind("}")
     if a_start != -1 and a_end != -1 and a_end > a_start:
         cand = s[a_start:a_end+1]
-        try:
-            json.loads(cand); return cand
-        except Exception:
-            pass
+        try: json.loads(cand); return cand
+        except Exception: pass
     if o_start != -1 and o_end != -1 and o_end > o_start:
         cand = s[o_start:o_end+1]
-        try:
-            json.loads(cand); return cand
-        except Exception:
-            pass
+        try: json.loads(cand); return cand
+        except Exception: pass
     return s
 
-
-def _lex_overlap(a: str, b: str) -> float:
-    ta = set(re.findall(r"[a-z0-9]+", (a or "").lower()))
-    tb = set(re.findall(r"[a-z0-9]+", (b or "").lower()))
-    if not ta or not tb: return 0.0
-    return len(ta & tb) / float(len(ta | tb))
-
-def _valid_bins_terms(bins, terms, mapping) -> bool:
-    # bins 3-4; terms 6-8; every term mapped; no bin label lexically overlapping with term too much
-    if not (isinstance(bins, list) and 3 <= len(bins) <= 4): return False
-    if not (isinstance(terms, list) and 6 <= len(terms) <= 8): return False
-    if not (isinstance(mapping, dict) and all(t in mapping for t in terms)): return False
-    # each bin has at least 2 terms
-    counts = {b:0 for b in bins}
-    for t in terms:
-        b = mapping.get(t)
-        if b not in counts: return False
-        counts[b] += 1
-        # lexical overlap constraint
-        for lbl in bins:
-            if b == lbl and _lex_overlap(lbl, t) > 0.4:  # too similar
-                return False
-    if min(counts.values()) < 2: return False
-    return True
-
-
 def new_seed() -> int:
-    return int(time.time() * 1000) ^ random.randint(0, 1_000_000)
+    return int(time.time()*1000) ^ random.randint(0, 1_000_000)
 
 # ---------------- GitHub fetchers ----------------
 def _gh_list(user: str, repo: str, path: str, branch: str) -> List[Dict[str, Any]]:
@@ -92,16 +57,15 @@ def _gh_fetch_raw(url: str) -> bytes:
     return r.content
 
 def _read_pdf_bytes(pdf_bytes: bytes) -> str:
-    # Try pypdf then PyPDF2
     try:
         import pypdf  # type: ignore
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        return "\\n".join([(p.extract_text() or "") for p in reader.pages])
+        return "\n".join([(p.extract_text() or "") for p in reader.pages])
     except Exception:
         try:
             import PyPDF2  # type: ignore
             reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-            return "\\n".join([(p.extract_text() or "") for p in reader.pages])
+            return "\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
 
@@ -121,7 +85,7 @@ def load_corpus_from_github(user: str, repo: str, path: str, branch: str) -> Lis
             if name.endswith(".pdf"):
                 txt = _read_pdf_bytes(_gh_fetch_raw(raw_url))
             elif name.endswith((".txt",".md",".html",".htm")):
-                txt = (_gh_fetch_raw(raw_url)).decode("utf-8", "ignore")
+                txt = (_gh_fetch_raw(raw_url)).decode("utf-8","ignore")
             else:
                 txt = ""
         except Exception:
@@ -130,18 +94,17 @@ def load_corpus_from_github(user: str, repo: str, path: str, branch: str) -> Lis
             corpus.append(txt)
     return corpus
 
-# ---------------- Retrieval to build a slide scope ----------------
-STOP = {
-    "the","and","for","that","with","this","from","into","are","was","were","has","have","had","can","will","would","could","should",
-    "a","an","of","in","on","to","by","as","at","or","be","is","it","its","their","our","your","if","when","then","than","but",
-    "we","you","they","which","these","those","there","here","such","may","might","also","very","much","many","most","more","less"
-}
+# ---------------- Retrieval ----------------
+STOP = {"the","and","for","that","with","this","from","into","are","was","were","has","have","had","can","will","would","could","should",
+"a","an","of","in","on","to","by","as","at","or","be","is","it","its","their","our","your","if","when","then","than","but",
+"we","you","they","which","these","those","there","here","such","may","might","also","very","much","many","most","more","less"}
+
 def _tokens_nostop(s: str) -> List[str]:
     return [t for t in re.findall(r"[A-Za-z0-9']+", (s or "").lower()) if t not in STOP and len(t) > 2]
 
 def _split_sentences(text: str) -> List[str]:
-    parts = re.split(r"(?<=[\\.!?])\\s+|\\n+", text or "")
-    return [re.sub(r"\\s+"," ",p).strip() for p in parts if p and len(p.strip()) > 30]
+    parts = re.split(r"(?<=[\.\!\?])\s+|\n+", text or "")
+    return [re.sub(r"\s+"," ",p).strip() for p in parts if p and len(p.strip()) > 30]
 
 def _relevance(sent: str, q_tokens: List[str]) -> int:
     bag = {}
@@ -173,10 +136,9 @@ def collect_prompt_matched(corpus: List[str], prompt: str, top_docs=6, max_sents
 
 def build_scope(corpus: List[str], prompt: str, limit_chars: int = 6000) -> str:
     sents = collect_prompt_matched(corpus, prompt, top_docs=6, max_sents=1200)
-    scope = "\\n".join(sents)[:limit_chars]
-    return scope
+    return "\n".join(sents)[:limit_chars]
 
-# ---------------- Topic classification (for fallback generators) ----------------
+# ---------------- Topic fallback ----------------
 def classify_topic(prompt: str) -> str:
     p = (prompt or "").lower()
     if "organelle" in p: return "organelle function"
@@ -192,7 +154,7 @@ def classify_topic(prompt: str) -> str:
     if "dna" in p: return "dna"
     return (p.split(",")[0].split(";")[0] or "this topic").strip()
 
-# ---------------- Optional OpenAI client ----------------
+# ---------------- OpenAI client ----------------
 def _openai_client():
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
@@ -210,97 +172,120 @@ def _chat(client, system, user, max_tokens=900, temperature=0.1, seed=42) -> str
         messages=[{"role":"system","content":system},{"role":"user","content":user}]
     ).choices[0].message.content or ""
 
-# ---------------- LLM Generators (strict JSON) + Fallbacks ----------------
+# ---------------- Intro constraints & helpers ----------------
+BANNED_VAGUE_LABELS = {
+    "process","processes","function","functions","interaction","interactions","role","roles",
+    "category","categories","type","types","concept","concepts","example","examples",
+    "misc","miscellaneous","other","others","general","specifics"
+}
 
+def _slide_terms(scope: str, max_terms: int = 24) -> list:
+    scope = scope or ""
+    cands = set()
+    for m in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z0-9\-]+){0,3})\b", scope):
+        if len(m.split()) >= 2 and len(m) <= 60:
+            cands.add(m.strip())
+    BIO_HINTS = [
+        "covalent bond","ionic bond","hydrogen bond","van der Waals","glycolysis","PFK-1",
+        "ATP synthase","electron transport chain","membrane potential","ion channel","carrier protein",
+        "nucleotide excision repair","base excision repair","mismatch repair","DNA polymerase",
+        "helicase","ligase","promoter","ribosome","microtubule","actin filament","intermediate filament",
+        "tight junction","adherens junction","desmosome","gap junction","signal transduction"
+    ]
+    tl = scope.lower()
+    for k in BIO_HINTS:
+        if k.lower() in tl:
+            cands.add(k)
+    freq = []
+    for t in cands:
+        freq.append((scope.count(t), t))
+    freq.sort(reverse=True)
+    return [t for _, t in freq[:max_terms]]
+
+def _is_vague_label(s: str) -> bool:
+    t = (s or "").strip().lower()
+    return (t in BANNED_VAGUE_LABELS) or (len(t.split()) <= 1 and t in {"effect","evidence","mechanism","pathway","feature"})
+
+def _label_in_scope(label: str, scope: str) -> bool:
+    return label and (label.lower() in (scope or "").lower())
+
+def _intro_level_ok(stem: str, answers: list) -> bool:
+    wc = len(re.findall(r"[A-Za-z0-9']+", stem or ""))
+    if wc > 25: return False
+    for a in answers or []:
+        if len(a.split()) > 2: return False
+    return True
+
+# ---------------- Generators ----------------
 def gen_dnd_from_scope(scope: str, prompt: str):
     client = _openai_client()
     if client is None or not scope.strip():
         return None
 
-    def _ask(require_strict: bool, seed_val: int):
-        sys_prompt = "You create rigorous drag-and-drop activities grounded ONLY in the provided slide excerpts. Never reveal answers."
-        # No f-strings to avoid brace escaping issues
+    anchor_terms = _slide_terms(scope, max_terms=24)
+    allowed_hint = "\n- Allowed label pool (choose 3–4 present in slides): " + ", ".join(anchor_terms[:16])
+
+    def _ask(seed_val: int, strict: bool):
+        sys_prompt = "You create intro-level drag-and-drop activities grounded ONLY in the provided slide excerpts. Never reveal answers."
         user_prompt = (
-            "Create ONE classification drag-and-drop activity from the slide excerpts.\n\n"
+            "Create ONE classification drag-and-drop activity for first-year biology.\n\n"
             "Slide excerpts:\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
             "Student prompt: \"" + prompt + "\"\n\n"
-            "Design constraints (must follow ALL):\n"
-            "- 3–4 bins with CONCEPTUAL labels (e.g., mechanism, role, evidence, regulation). Avoid using any term's words in bin labels.\n"
-            "- 6–8 draggable ITEMS as short phrases (4–12 words) that require reasoning; prefer statements, mini-scenarios, or definitions—not single words.\n"
-            "- Include at least one confusable pair that tests nuance.\n"
-            "- Every item maps to exactly one bin.\n"
-            "- Provide a short, non-revealing hint for each item.\n"
-            "- Use ONLY information present in the slide excerpts.\n"
-            "- " + ("Bins must NOT be substrings/overlaps of any item (strict)." if require_strict else "Avoid label–item lexical overlap.") + "\n\n"
-            "Return STRICT JSON (no markdown):\n"
+            "Design constraints (MUST follow ALL):\n"
+            "- BINS: choose 3–4 CONCRETE labels that appear in the excerpts (e.g., 'Nucleotide Excision Repair', 'Ionic bond').\n"
+            "- DO NOT use vague labels like 'process', 'function', 'interaction', 'type', 'role'.\n"
+            "- TERMS: write 6–8 short, clear statements (6–16 words) or definitions that fit exactly one bin; avoid jargon not in slides.\n"
+            "- Keep difficulty: Introductory (Bloom: Understand/Apply). Avoid trick wording.\n"
+            "- Provide one short hint per term (non-revealing).\n"
+            + allowed_hint + "\n"
+            + ("- Enforce: each BIN label must literally appear in the excerpts; reject abstract bins.\n" if strict else "")
+            + "\nReturn STRICT JSON (no markdown):\n"
             "{\n"
             "  \"title\": \"string\",\n"
-            "  \"bins\": [\"string\", ...],              // 3-4 conceptual labels\n"
-            "  \"terms\": [\"string\", ...],             // 6-8 short phrases\n"
-            "  \"mapping\": {\"TERM\":\"BIN\"},          // every term maps to a listed bin\n"
+            "  \"bins\": [\"string\", ...],\n"
+            "  \"terms\": [\"string\", ...],\n"
+            "  \"mapping\": {\"TERM\":\"BIN\"},\n"
             "  \"hints\": {\"TERM\":\"one short hint\"}\n"
             "}\n"
         )
-        raw = _chat(client, sys_prompt, user_prompt, max_tokens=900, temperature=0.35, seed=seed_val)
+        raw = _chat(client, sys_prompt, user_prompt, max_tokens=900, temperature=0.30 if strict else 0.33, seed=seed_val)
         return raw
 
-    tries = 2
-    for attempt in range(tries):
-        seed_val = (new_seed() % 1_000_000)
-        raw = _ask(require_strict=(attempt == 1), seed_val=seed_val)
+    for attempt in range(2):
+        raw = _ask(seed_val=(new_seed()%1_000_000), strict=(attempt==1))
         try:
-            raw = _extract_json_block(raw)
-            data = json.loads(raw)
+            data = json.loads(_extract_json_block(raw))
         except Exception:
             data = {}
         bins  = data.get("bins") or []
         terms = data.get("terms") or []
         mapping = data.get("mapping") or {}
         hints = data.get("hints") or {}
-        # Basic presence check
-        if not bins or not terms or not mapping:
+
+        if not (isinstance(bins, list) and 3 <= len(bins) <= 4): continue
+        if not (isinstance(terms, list) and 6 <= len(terms) <= 8): continue
+        if not (isinstance(mapping, dict) and all(t in mapping for t in terms)): continue
+        if any(_is_vague_label(lbl) or not _label_in_scope(lbl, scope) for lbl in bins):
             continue
-        # Enforce variety/rigor
-        if not _valid_bins_terms(bins, terms, mapping):
+        counts = {b:0 for b in bins}
+        ok_terms = True
+        for t in terms:
+            b = mapping.get(t)
+            if b not in counts:
+                ok_terms = False; break
+            counts[b] += 1
+        if not ok_terms or min(counts.values()) < 2:
             continue
-        # Build UI payload
-        title = data.get("title") or "Concept classification"
-        instr = "Drag each statement into the best-fitting conceptual category."
+
+        title = data.get("title") or "Classify based on slide concepts"
+        instr = "Drag each statement to the correct slide-based category (intro level)."
         labels = bins
         draggables = terms
         answer = {t: mapping.get(t) for t in terms}
-        hint_map = {t: (hints.get(t) or "Focus on the distinctive feature that fits this category.") for t in terms}
+        hint_map = {t: (hints.get(t) or "Re-read the slide phrase and match the defining idea.") for t in terms}
         return title, instr, labels, draggables, answer, hint_map
 
-    # If all attempts fail, return None to trigger fallback
     return None
-
-
-
-def _count_blanks(stem: str) -> int:
-    """Count occurrences of blanks represented by 3+ underscores."""
-    return len(re.findall(r"_{3,}", stem or ""))
-
-def _is_boilerplate(stem: str) -> bool:
-    """Filter out generic, meta phrasing that isn't a learning statement."""
-    s = (stem or "").lower()
-    return ("immediate output would" in s) or ("near-term output would" in s)
-
-def _valid_fitb_items(items) -> bool:
-    """Validate a FITB set for variety and rigor."""
-    if not isinstance(items, list): return False
-    if not (4 <= len(items) <= 6): return False
-    for it in items:
-        stem = it.get("stem","")
-        ans  = it.get("answers",[])
-        hint = it.get("hint","")
-        if not isinstance(stem,str) or not isinstance(ans,list): return False
-        if _is_boilerplate(stem): return False
-        blanks = _count_blanks(stem)
-        if blanks < 1 or blanks > 2: return False
-        if not (1 <= len(ans) <= 5): return False
-        if not all(isinstance(a,str) and len(a.strip())>0 for a in ans): return False
-    return True
 
 def gen_fitb_from_scope(scope: str, prompt: str):
     client = _openai_client()
@@ -308,50 +293,51 @@ def gen_fitb_from_scope(scope: str, prompt: str):
         return None
 
     def _ask(seed_val: int):
-        sys_prompt = "You create rigorous fill-in-the-blank items grounded ONLY in the provided slide excerpts. Never reveal answers."
+        sys_prompt = "You create intro-level fill-in-the-blank items grounded ONLY in the provided slide excerpts. Never reveal answers."
         user_prompt = (
-            "From the slide excerpts, create 4–6 FITB items that require understanding (not recall of a single word).\n\n"
+            "From the slide excerpts, create 4 FITB items appropriate for an introductory biology course.\n\n"
             "Slide excerpts:\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
             "Student prompt: \"" + prompt + "\"\n\n"
-            "Design constraints (must follow ALL):\n"
-            "- Each item is a sentence of 10–25 words with 1–2 blanks (use 4+ underscores per blank, e.g., ______).\n"
-            "- Answers must be recoverable from the excerpts (terms, phrases, or names actually present).\n"
-            "- Mix specificity (e.g., enzyme names) with conceptual phrases (e.g., rate-limiting step) when present in slides.\n"
-            "- Avoid trivial clozes (e.g., repeating the bin label). Avoid meta/boilerplate phrasing.\n"
-            "- Provide one concise, non-revealing hint per item.\n\n"
+            "Design constraints (MUST follow ALL):\n"
+            "- Exactly 4 items; each is 8–20 words with one blank (use 5+ underscores: _____).\n"
+            "- Answers must be present in the excerpts and be 1–2 words.\n"
+            "- Language must be clear and concrete; avoid jargon not in slides.\n"
+            "- Provide one short, non-revealing hint per item.\n\n"
             "Return STRICT JSON array (no markdown). Each item:\n"
-            "{\"stem\":\"A 10–25 word sentence with ______ blank(s)\",\"answers\":[\"a\",\"b\"],\"hint\":\"one short hint\"}\n"
+            "{\"stem\":\"A concise sentence with _____ one blank\",\"answers\":[\"answer\"],\"hint\":\"short hint\"}\n"
         )
-        raw = _chat(client, sys_prompt, user_prompt, max_tokens=900, temperature=0.35, seed=seed_val)
+        raw = _chat(client, sys_prompt, user_prompt, max_tokens=700, temperature=0.28, seed=seed_val)
         return raw
 
-    tries = 2
     best = None
-    for attempt in range(tries):
-        seed_val = (new_seed() % 1_000_000)
-        raw = _ask(seed_val)
+    for attempt in range(2):
+        raw = _ask(seed_val=(new_seed()%1_000_000))
         try:
-            raw = _extract_json_block(raw)
-            items = json.loads(raw)
+            items = json.loads(_extract_json_block(raw))
         except Exception:
             items = []
-        # Normalize and filter
+
         out = []
         for it in (items if isinstance(items, list) else []):
             stem = (it.get("stem","") or "").strip()
-            ans  = it.get("answers", [])
+            ans  = [a for a in (it.get("answers",[]) or []) if isinstance(a,str) and a.strip()]
             hint = (it.get("hint","") or "Use the exact term from the slides.").strip()
-            if isinstance(stem,str) and isinstance(ans,list) and "____" in stem and not _is_boilerplate(stem):
-                # keep 1–2 blanks only
-                blanks = _count_blanks(stem)
-                if 1 <= blanks <= 2 and 1 <= len(ans) <= 5:
-                    out.append({"stem": stem, "answers": [a for a in ans if isinstance(a,str) and a.strip()], "hint": hint})
-        # Validate richer requirements
-        if _valid_fitb_items(out):
-            best = out[:6]
+            if not stem or "____" not in stem: 
+                continue
+            if not ans or any(len(a.split())>2 for a in ans):
+                continue
+            wc = len(re.findall(r"[A-Za-z0-9']+", stem))
+            if not (8 <= wc <= 20):
+                continue
+            out.append({"stem": stem, "answers": ans[:3], "hint": hint})
+
+        if len(out) == 4 and all(_intro_level_ok(i["stem"], i["answers"]) for i in out):
+            best = out
             break
 
     return best
+
+# ---------------- Fallbacks ----------------
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
     options = {
@@ -360,26 +346,26 @@ def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,
         "transcription": (["Pol II","Spliceosome","Capping enzymes"], ["mRNA synthesis","Remove introns","Add 5' cap"], {"mRNA synthesis":"Pol II","Remove introns":"Spliceosome","Add 5' cap":"Capping enzymes"}),
         "chemical bonds": (["Covalent","Ionic","Hydrogen bond"], ["Electron sharing","Charge attraction","Polar interaction"], {"Electron sharing":"Covalent","Charge attraction":"Ionic","Polar interaction":"Hydrogen bond"}),
         "dna repair": (["BER","NER","MMR"], ["Base-specific removal","Bulky lesion removal","Mismatch correction"], {"Base-specific removal":"BER","Bulky lesion removal":"NER","Mismatch correction":"MMR"}),
-        "dna": (["DNA","Nucleotide","Phosphodiester bond"], ["Genetic polymer","Monomer","Backbone link"], {"Genetic polymer":"DNA","Monomer":"Nucleotide","Backbone link":"Phosphodiester bond"}),
+        "dna": (["DNA","Nucleotide","Phosphodiester bond"], ["Genetic polymer","Monomer","Backbone link"], {"Genetic polymer":"DNA","Monomer":"Nucleotide","Phosphodiester bond":"Backbone link"}),
     }
     labels, terms, mapping = options.get(topic, (["Category A","Category B"], ["Item 1","Item 2"], {"Item 1":"Category A","Item 2":"Category B"}))
     rng.shuffle(terms)
     title = f"Match items for {topic}"
-    instr = "Match each **item** to its **category**."
+    instr = "Drag each **item** to its **category**."
     hints = {t: "Focus on the defining feature mentioned in class." for t in terms}
     return title, instr, labels, terms, mapping, hints
 
 def build_fitb(topic: str, rng: random.Random) -> List[Dict[str,Any]]:
     items = []
     if "glycolysis" in topic:
-        items.append({"stem":"The end product of glycolysis is ______.","answers":["pyruvate"],"hint":"Three-carbon product."})
-        items.append({"stem":"Glycolysis occurs in the ______.","answers":["cytosol","cytoplasm"],"hint":"Not an organelle lumen."})
+        items.append({"stem":"The end product of glycolysis is _____ .","answers":["pyruvate"],"hint":"Three-carbon product."})
+        items.append({"stem":"Glycolysis occurs in the _____ .","answers":["cytosol","cytoplasm"],"hint":"Not an organelle lumen."})
     elif "transcription" in topic:
-        items.append({"stem":"Eukaryotic mRNA is made by ______ polymerase II.","answers":["rna"],"hint":"Pol II."})
+        items.append({"stem":"Eukaryotic mRNA is made by _____ polymerase II.","answers":["rna"],"hint":"Pol II."})
     elif "dna repair" in topic:
-        items.append({"stem":"Bulky adducts (e.g., thymine dimers) are removed by ______.","answers":["nucleotide excision repair","ner"],"hint":"The pathway that excises an oligonucleotide."})
+        items.append({"stem":"Bulky adducts (e.g., thymine dimers) are removed by _____ .","answers":["nucleotide excision repair","ner"],"hint":"The pathway that excises an oligonucleotide."})
     else:
-        items.append({"stem":f"{topic.title()} primarily involves the ______.","answers":["key term"],"hint":"Use the exact term used in lecture."})
+        items.append({"stem":f"{topic.title()} primarily involves the _____ .","answers":["key term"],"hint":"Use the exact term used in lecture."})
     rng.shuffle(items)
     return items[:4]
 
@@ -392,25 +378,24 @@ def extract_exam_style(exam_corpus: List[str]) -> Dict[str,Any] | None:
     client = _openai_client()
     if client is None or not exam_corpus:
         return None
-    sample = "\\n\\n".join(exam_corpus)[:12000]
+    sample = "\n\n".join(exam_corpus)[:12000]
     system = "You distill exam style. Return strict JSON only."
     user = (
-        "From the prior exams below, extract a compact style profile.\\n\\n"
-        "PRIOR EXAMS (snippets):\\n\"\"\"" + sample + "\"\"\"\\n\\n"
-        "Return STRICT JSON:\\n"
-        "{\\n"
-        "  \"preferred_types\": [\"mcq\",\"short_answer\"],\\n"
-        "  \"mcq_options\": 4,\\n"
-        "  \"tone\": \"succinct|formal|clinical|conversational\",\\n"
-        "  \"length\": \"short|medium|long\",\\n"
-        "  \"constraints\": [\"single-best-answer\"],\\n"
-        "  \"rationale_required\": true\\n"
-        "}\\n"
+        "From the prior exams below, extract a compact style profile.\n\n"
+        "PRIOR EXAMS (snippets):\n\"\"\"" + sample + "\"\"\"\n\n"
+        "Return STRICT JSON:\n"
+        "{\n"
+        "  \"preferred_types\": [\"mcq\",\"short_answer\"],\n"
+        "  \"mcq_options\": 4,\n"
+        "  \"tone\": \"succinct|formal|clinical|conversational\",\n"
+        "  \"length\": \"short|medium|long\",\n"
+        "  \"constraints\": [\"single-best-answer\"],\n"
+        "  \"rationale_required\": true\n"
+        "}\n"
     )
     try:
         raw = _chat(client, system, user, max_tokens=400, temperature=0.0)
-        raw = _extract_json_block(raw)
-        prof = json.loads(raw)
+        prof = json.loads(_extract_json_block(raw))
         prof.setdefault("preferred_types", ["mcq","short_answer"])
         prof.setdefault("mcq_options", 4)
         prof.setdefault("tone", "succinct")
@@ -431,29 +416,27 @@ def gen_exam_question(scope: str, style: Dict[str,Any], user_prompt: str) -> Dic
     system = "You write exam questions grounded ONLY in the provided slide excerpts. Return strict JSON only."
     style_json = json.dumps(style or {}, ensure_ascii=False)
     user = (
-        "SLIDE EXCERPTS (authoritative; cite page numbers if present):\\n\"\"\"\\n" + scope + "\\n\"\"\"\\n\\n"
-        "STUDENT PROMPT: \"" + user_prompt + "\"\\n\\n"
-        "STYLE PROFILE:\\n" + style_json + "\\n\\n"
-        "Create ONE exam-style question faithful to the slides.\\n\\n"
-        "Schema:\\n"
-        "{\\n"
-        "  \"type\": \"mcq\" | \"short_answer\",\\n"
-        "  \"stem\": \"string (<= 70 words; tone per style)\",\\n"
-        "  \"options\": [\"A\",\"B\",\"C\",\"D\"],      // MCQ only, " + str(mcq_n) + " options\\n"
-        "  \"answer\": \"B\",                     // letter for MCQ; text for SA\\n"
-        "  \"rationale\": \"why correct; <= 60 words\",\\n"
-        "  \"bloom\": \"Remember|Understand|Apply|Analyze|Evaluate|Create\",\\n"
-        "  \"difficulty\": 1,                   // 1-5\\n"
-        "  \"slide_refs\": [int]\\n"
-        "}\\n\\n"
-        "- Distractors must be plausible and present in scope.\\n"
-        "- Cite 1–3 slide pages in \"slide_refs\".\\n"
-        "- Prefer type: " + ("MCQ" if want_mcq else "short_answer") + " if it fits.\\n"
+        "SLIDE EXCERPTS (authoritative; cite page numbers if present):\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
+        "STUDENT PROMPT: \"" + user_prompt + "\"\n\n"
+        "STYLE PROFILE:\n" + style_json + "\n\n"
+        "Create ONE exam-style question faithful to the slides.\n\n"
+        "Schema:\n"
+        "{\n"
+        "  \"type\": \"mcq\" | \"short_answer\",\n"
+        "  \"stem\": \"string (<= 70 words; tone per style)\",\n"
+        "  \"options\": [\"A\",\"B\",\"C\",\"D\"],      // MCQ only, " + str(mcq_n) + " options\n"
+        "  \"answer\": \"B\",                     // letter for MCQ; text for SA\n"
+        "  \"rationale\": \"why correct; <= 60 words\",\n"
+        "  \"bloom\": \"Remember|Understand|Apply|Analyze|Evaluate|Create\",\n"
+        "  \"difficulty\": 1,                   // 1-5\n"
+        "  \"slide_refs\": [int]\n"
+        "}\n\n"
+        "- Distractors must be plausible and present in scope.\n"
+        "- Cite 1–3 slide pages in \"slide_refs\".\n"
+        "- Prefer type: " + ("MCQ" if want_mcq else "short_answer") + " if it fits.\n"
     )
     try:
-        raw = _chat(client, system, user, max_tokens=700, temperature=0.1)
-        raw = _extract_json_block(raw)
-        q = json.loads(raw)
+        q = json.loads(_extract_json_block(_chat(client, system, user, max_tokens=700, temperature=0.1)))
         if q.get("type") not in ("mcq","short_answer"): return None
         if not isinstance(q.get("stem",""), str) or len(q["stem"].split()) < 3: return None
         if q["type"] == "mcq":
@@ -471,7 +454,7 @@ def gen_exam_question(scope: str, style: Dict[str,Any], user_prompt: str) -> Dic
     except Exception:
         return None
 
-# ---------------- UI: prompt + Generate (unchanged) ----------------
+# ---------------- UI ----------------
 prompt = st.text_input(
     "Enter a topic for review and press generate:",
     value="",
@@ -479,7 +462,6 @@ prompt = st.text_input(
     label_visibility="visible",
 )
 
-# ---------------- Generate: LLM-first grounded, then fallback ----------------
 if st.button("Generate"):
     if "corpus" not in st.session_state:
         st.session_state.corpus = load_corpus_from_github(GITHUB_USER, GITHUB_REPO, SLIDES_DIR_GH, GITHUB_BRANCH)
@@ -490,7 +472,6 @@ if st.button("Generate"):
     st.session_state.topic = topic
     scope = build_scope(st.session_state.corpus or [], prompt, limit_chars=6000)
 
-    # Activity 1: Drag & Drop
     dnd = gen_dnd_from_scope(scope, prompt)
     if dnd is None:
         title, instr, labels, terms, answer, hint_map = build_dnd_activity(topic)
@@ -505,23 +486,21 @@ if st.button("Generate"):
     st.session_state.drag_answer = answer
     st.session_state.dnd_hints   = hint_map
 
-    # Activity 2: FITB
-    rng = random.Random(new_seed())
     fitb_items = gen_fitb_from_scope(scope, prompt)
     if fitb_items is None:
+        rng = random.Random(new_seed())
         fitb_items = build_fitb(topic, rng)
         st.session_state.fitb_source = "Fallback"
     else:
         st.session_state.fitb_source = "LLM"
     st.session_state.fitb = fitb_items
 
-    # Exam-style question (optional)
     style = extract_exam_style(st.session_state.exam_corpus or [])
     exam_q = gen_exam_question(scope, style or {}, prompt) if style else None
     st.session_state.exam_q = exam_q
     st.session_state.exam_source = "LLM" if exam_q else "Unavailable"
 
-# ---------------- Render Activity 1: Drag & Drop ----------------
+# ---------------- Render DnD ----------------
 if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","dnd_instr"]):
     st.markdown("## Activity 1: Drag and Drop")
     st.caption(f"Source: {st.session_state.get('dnd_source','') or 'Fallback'}")
@@ -650,7 +629,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
             fb = hint_map.get(chosen_item, "Focus on the distinctive clue in this item.")
             st.info(fb)
 
-# ---------------- Render Activity 2: Fill in the Blank ----------------
+# ---------------- Render FITB ----------------
 if "fitb" in st.session_state:
     st.markdown("---")
     st.markdown("## Activity 2: Fill in the Blank")
@@ -658,7 +637,9 @@ if "fitb" in st.session_state:
     topic_name = st.session_state.get("topic","this topic")
     st.markdown(f"Use your knowledge of **{topic_name}** to answer the following.")
 
-    rng = random.Random(new_seed())
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+","", (s or "").lower())
+
     for idx, item in enumerate(st.session_state.fitb):
         u = st.text_input(item["stem"], key=f"fitb_{idx}")
         col1, col2, col3 = st.columns([1,1,1])
@@ -669,16 +650,15 @@ if "fitb" in st.session_state:
             if st.button("Check", key=f"check_{idx}"):
                 ok = False
                 ans_list = item.get("answers", [])
-                norm = lambda s: re.sub(r"[^a-z0-9]+","", s.lower())
                 if isinstance(ans_list, list):
-                    ok = norm(u) in {norm(a) for a in ans_list}
+                    ok = _norm(u) in {_norm(a) for a in ans_list}
                 st.success("That’s right! 🎉") if ok else st.warning("Not quite. Try again or use the hint.")
         with col3:
             if st.button("Reveal", key=f"rev_{idx}"):
                 ans = item.get("answers", [])
                 st.info(", ".join(ans) if ans else "(no stored answer)")
 
-# ---------------- Render Exam-style Question (optional) ----------------
+# ---------------- Exam-style (optional) ----------------
 if st.session_state.get("exam_q"):
     st.markdown("---")
     st.markdown("## Exam-style Question")
@@ -687,11 +667,7 @@ if st.session_state.get("exam_q"):
     st.write(q.get("stem","(no stem)"))
     if q.get("type") == "mcq":
         opts = q.get("options", [])
-        try:
-            idx_default = 0 if opts else None
-        except Exception:
-            idx_default = None
-        choice = st.radio("Choose one:", opts, index=idx_default, key="exam_choice")
+        choice = st.radio("Choose one:", opts, index=0 if opts else None, key="exam_choice")
         if st.button("Check exam answer"):
             correct = q.get("answer","")
             if isinstance(correct, str) and choice and choice.strip().upper().startswith(correct.strip().upper()):
