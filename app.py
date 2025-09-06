@@ -8,6 +8,7 @@ import random
 import requests
 import hashlib
 from typing import List, Dict, Any, Tuple
+from pathlib import Path
 import streamlit as st
 
 st.set_page_config(page_title="Let's Practice Biology!", page_icon="🎓", layout="wide")
@@ -515,7 +516,7 @@ def _mine_style_cues(txt: str) -> Dict[str, Any]:
         "fitb_clues": sorted(list(set(fitb_clues)))[:20],
     }
 
-def load_local_exam_styles() -> Dict[str, Any]:
+def load_style_profiles() -> Dict[str, Any]:
     if "local_style_profile" in st.session_state:
         return st.session_state["local_style_profile"]
     paths = [
@@ -547,6 +548,76 @@ def load_local_exam_styles() -> Dict[str, Any]:
                 profile[k] = cues[k]
     st.session_state["local_style_profile"] = profile
     return profile
+
+# ---------- Remote exam/group-activity style ingestion (GitHub) ----------
+ACTIVITIES_DIR_GH = "activities"     # put group activities here in your GitHub repo
+ALT_ACTIVITIES_DIR_GH = "group_activities"  # optional alternative dir name
+
+def _gh_list_paths(user: str, repo: str, paths: list[str], branch: str) -> list[dict]:
+    out = []
+    for p in paths:
+        try:
+            out.extend(_gh_list(user, repo, p, branch) or [])
+        except Exception:
+            continue
+    return out
+
+def load_remote_exam_styles() -> Dict[str, Any]:
+    # Collect text from /exams and /activities (or /group_activities) in the GitHub repo
+    gh_texts = []
+    items = _gh_list_paths(GITHUB_USER, GITHUB_REPO, [EXAMS_DIR_GH, ACTIVITIES_DIR_GH, ALT_ACTIVITIES_DIR_GH], GITHUB_BRANCH)
+    for it in items:
+        if it.get("type") != "file":
+            continue
+        name = (it.get("name") or "").lower()
+        url = it.get("download_url")
+        if not url:
+            continue
+        if name.endswith(".pdf"):
+            try:
+                txt = _read_pdf_bytes(_gh_fetch_raw(url))
+                if txt and len(txt.strip()) > 20:
+                    gh_texts.append(txt)
+            except Exception:
+                pass
+        elif name.endswith((".txt",".md",".html",".htm")):
+            try:
+                txt = (_gh_fetch_raw(url)).decode("utf-8","ignore")
+                if txt and len(txt.strip()) > 20:
+                    gh_texts.append(txt)
+            except Exception:
+                pass
+
+    merged = "\n\n".join(gh_texts)[:120000]
+    prof = {
+        "verbs": ["analyze","interpret","predict","evaluate","justify","determine"],
+        "scenario_markers": ["patient","cell line","experiment","assay","inhibitor","mutation","image","graph"],
+        "comparators": ["increase","decrease","higher","lower","upregulate","downregulate"],
+        "fitb_clues": ["because","leads to","results in","due to"],
+        "found_any": bool(merged.strip()),
+        "source": "github"
+    }
+    if merged.strip():
+        cues = _mine_style_cues(merged)
+        for k in ("verbs","scenario_markers","comparators","fitb_clues"):
+            if cues.get(k):
+                prof[k] = cues[k]
+    return prof
+
+# ---------- Unified style profile (local + GitHub) ----------
+def load_style_profiles() -> Dict[str, Any]:
+    if "merged_style_profile" in st.session_state:
+        return st.session_state["merged_style_profile"]
+    local_p = load_style_profiles()
+    remote_p = load_remote_exam_styles()
+    merged = {}
+    for k in ("verbs","scenario_markers","comparators","fitb_clues"):
+        vals = set((local_p or {}).get(k, []) + (remote_p or {}).get(k, []))
+        merged[k] = sorted(list(vals))[:30]
+    merged["found_any"] = bool((local_p or {}).get("found_any") or (remote_p or {}).get("found_any"))
+    merged["sources"] = [s for s in ["local" if (local_p or {}).get("found_any") else None, (remote_p.get("source") if remote_p.get("found_any") else None)] if s]
+    st.session_state["merged_style_profile"] = merged
+    return merged
 # ---------- Generators with triple-quoted f-strings ----------
 
 def gen_dnd_from_scope(scope: str, prompt: str):
@@ -738,7 +809,7 @@ def _filter_intro_fitb_by_topic(items, topic: str):
             filtered.append(it)
     return filtered
 def gen_fitb_from_scope(scope: str, prompt: str):
-    local_style = load_local_exam_styles()
+    local_style = load_style_profiles()
     _nonce = str(new_seed())
     client = _openai_client()
     if client is None or not scope.strip():
@@ -1135,7 +1206,7 @@ go = st.button("Generate")
 
 if go:
     # Load local exam style profile (from uploaded PDFs) to guide question style
-    load_local_exam_styles()
+    load_style_profiles()
     if "corpus" not in st.session_state:
         st.session_state.corpus = load_corpus_from_github(GITHUB_USER, GITHUB_REPO, SLIDES_DIR_GH, GITHUB_BRANCH)
     if "exam_corpus" not in st.session_state:
