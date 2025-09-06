@@ -486,7 +486,7 @@ def gen_dnd_from_scope(scope: str, prompt: str):
     terms_hint = ", ".join(nudges.get("terms_hint", []))
 
     def _ask(seed_val: int, strict: bool):
-        sys_prompt = "You create slide-anchored drag-and-drop activities. Use only the excerpt content. Never reveal answers."
+        sys_prompt = "You create slide-anchored drag-and-drop activities. Use only the excerpt content. Never reveal answers. Produce novel outputs each call."
         user_prompt = f"""Create ONE classification drag-and-drop activity for intro biology.
 
 Slide excerpts:
@@ -496,7 +496,7 @@ Slide excerpts:
 
 Student prompt: "{prompt}"
 
-Design constraints (MUST follow ALL):
+Design constraints (MUST follow ALL) — activity id: {nonce}:
 - BINS: choose 2–3 concrete labels that appear verbatim in the excerpts (slide headings or key terms). Avoid abstract words.
 - TERMS: write exactly 4 short phrases (3–10 words) that each match exactly one bin. Avoid commas/semicolons.
 - Keep language plain and literal; no trick wording.
@@ -513,9 +513,10 @@ Return STRICT JSON (no markdown):
   "mapping": {{"TERM":"BIN"}},
   "hints": {{"TERM":"one short hint"}}
 }}"""
-        raw = _chat(client, sys_prompt, user_prompt, max_tokens=800, temperature=0.28 if strict else 0.32, seed=seed_val)
+        raw = _chat(client, sys_prompt, user_prompt, max_tokens=800, temperature=0.38 if strict else 0.5, seed=seed_val)
         return raw
 
+    nonce = str(new_seed());
     for attempt in range(2):
         raw = _ask(seed_val=(new_seed()%1_000_000), strict=(attempt==1))
         try:
@@ -548,9 +549,7 @@ Return STRICT JSON (no markdown):
             continue
         
         payload = {"title": title, "bins": labels, "terms": draggables, "mapping": answer}
-        if is_duplicate("dnd", payload):
-            # Nudge for variety by shuffling terms order
-            random.Random(new_seed()).shuffle(draggables)
+        random.Random(new_seed()).shuffle(draggables)
         return title, instr, labels, draggables, answer, hint_map
 
 
@@ -572,7 +571,7 @@ Slide excerpts:
 
 Student prompt: "{prompt}"
 
-Design constraints (MUST follow ALL):
+Design constraints (MUST follow ALL) — activity id: {nonce}:
 - BINS: choose exactly 3 concrete labels that appear verbatim as slide headings or key terms in the excerpts.
 - TERMS: write exactly 6 short phrases (3–8 words) that clearly fit exactly one bin; avoid commas/semicolons and multi-clause wording.
 - Difficulty: Introductory (Bloom: Understand). Avoid trick wording.
@@ -627,13 +626,48 @@ Return STRICT JSON (no markdown):
 
     return None
 
+
+# ---------- Topic-specific allowed FITB answers (intro-only) ----------
+ALLOWED_ANSWERS = {
+    "translation": {"ribosome","aug","trna","t-rna","codon","anticodon","stop codon","mrna","three","3"},
+    "transcription": {"rna","promoter","spliceosome","5'","5-prime","5prime","5’","mrna"},
+    "dna replication": {"5' to 3'","5’ to 3’","5-prime to 3-prime","5 prime to 3 prime","okazaki fragments","okazaki","helicase","primase","origin"},
+    "dna repair": {"nucleotide","ner","nucleotide-excision","mismatch","mmr","base","ber","nick","ligase"},
+    "glycolysis": {"pyruvate","cytosol","cytoplasm","commitment","committed","substrate","atp"},
+    "membrane transport": {"passive","against","up","alternating","osmosis"},
+    "chemical bonds": {"covalent","electrostatic","hydrogen","phosphodiester"}
+}
+
+def _filter_intro_fitb_by_topic(items, topic: str):
+    t = (topic or "").lower()
+    allow = None
+    for k in ALLOWED_ANSWERS.keys():
+        if k in t:
+            allow = {a.lower() for a in ALLOWED_ANSWERS[k]}
+            break
+    if not allow:
+        return items
+    filtered = []
+    for it in items:
+        ans = [a for a in it.get("answers",[]) if isinstance(a,str)]
+        if not ans:
+            continue
+        ok = False
+        for a in ans:
+            al = a.lower()
+            if al in allow or any(al.startswith(x) or x in al for x in allow):
+                ok = True; break
+        if ok:
+            filtered.append(it)
+    return filtered
 def gen_fitb_from_scope(scope: str, prompt: str):
     client = _openai_client()
     if client is None or not scope.strip():
         return None
 
+    nonce = str(new_seed());
     def _ask(seed_val: int):
-        sys_prompt = "You create intro-level fill-in-the-blank items grounded ONLY in the provided slide excerpts. Never reveal answers."
+        sys_prompt = "You create intro-level, application-focused FITB items grounded ONLY in the provided slide excerpts. Never reveal answers."
         user_prompt = f"""From the slide excerpts, create 4 FITB items appropriate for an introductory biology course.
 
 Slide excerpts:
@@ -643,7 +677,7 @@ Slide excerpts:
 
 Student prompt: "{prompt}"
 
-Design constraints (MUST follow ALL):
+Design constraints (MUST follow ALL) — activity id: {nonce}:
 - Exactly 4 items; each is 10–16 words with one blank (use 5+ underscores: _____).
 - Answers must be present in the excerpts and be a single word (or hyphenation).
 - Avoid commas/semicolons in stems; keep language simple and concrete.
@@ -651,7 +685,7 @@ Design constraints (MUST follow ALL):
 
 Return STRICT JSON array (no markdown). Each item:
 {{"stem":"A concise sentence with _____ one blank","answers":["answer"],"hint":"short hint"}}"""
-        raw = _chat(client, sys_prompt, user_prompt, max_tokens=700, temperature=0.28, seed=seed_val)
+        raw = _chat(client, sys_prompt, user_prompt, max_tokens=700, temperature=0.45, seed=seed_val)
         return raw
 
     best = None
@@ -686,7 +720,9 @@ Return STRICT JSON array (no markdown). Each item:
                 continue
 
     
+    
     return best
+
 
 def ensure_four_fitb(fitb_items, topic: str):
     items = list(fitb_items or [])
@@ -706,101 +742,111 @@ def ensure_four_fitb(fitb_items, topic: str):
 
 
 
+
 def build_dnd_from_scope_fallback(scope: str, topic: str):
     """
-    Build a meaningful DnD when LLM fails:
-    - Try to pick 2–3 bins from slide terms (headings/key phrases) that match topic nudges.
-    - Create 4 short terms mapped to those bins.
+    Strict, topic-aware fallback for DnD:
+    - 2–3 bins chosen from a vetted topic seed list, preferring those present in scope.
+    - Exactly 4 meaningful terms built from topic seeds and phrases found in scope.
+    - NO generic placeholders are ever used.
     """
     topic_l = (topic or "").lower()
-    # Candidate bins from slide terms
-    terms_in_scope = _slide_terms(scope, max_terms=30)
-    # Topic-specific bin seeds
+    # Vetted seeds (intro level) with safe, concrete terms
     seeds = {
-        "translation": {"Initiation": ["AUG start codon"], "Elongation": ["tRNA anticodon pairing"], "Termination": ["stop codon recognition"]},
-        "transcription": {"Initiation": ["promoter binding"], "Elongation": ["RNA chain growth"], "Termination": ["termination signal"]},
-        "dna repair": {"Base excision repair": ["glycosylase removes base"], "Nucleotide excision repair": ["thymine dimer excision"], "Mismatch repair": ["MutS recognition"]},
-        "dna replication": {"Leading strand": ["continuous synthesis"], "Lagging strand": ["Okazaki fragments"], "Origin": ["replication bubble"]},
-        "membrane transport": {"Channel": ["passive ion flow"], "Carrier": ["alternating access"], "Pump": ["ATP-dependent transport"]},
-        "chemical bonds": {"Covalent bond": ["electron sharing"], "Ionic bond": ["charge attraction"], "Hydrogen bond": ["polar interaction"]},
-        "organelle function": {"Nucleus": ["houses DNA"], "Mitochondrion": ["ATP production"], "Golgi": ["protein sorting"]},
-        "glycolysis": {"Hexokinase": ["first phosphorylation"], "PFK-1": ["commitment step"], "Pyruvate kinase": ["ATP at end"]},
+        "translation": {
+            "bins": ["Initiation", "Elongation", "Termination"],
+            "terms": ["AUG start codon", "tRNA anticodon pairing", "peptide bond formation", "stop codon recognition"]
+        },
+        "transcription": {
+            "bins": ["Initiation", "Elongation", "Termination"],
+            "terms": ["promoter binding", "RNA chain growth", "spliceosome assembly", "polyadenylation signal"]
+        },
+        "dna repair": {
+            "bins": ["Base excision repair", "Nucleotide excision repair", "Mismatch repair"],
+            "terms": ["glycosylase removes base", "thymine dimer excision", "MutS mismatch recognition", "DNA ligase seals nick"]
+        },
+        "dna replication": {
+            "bins": ["Leading strand", "Lagging strand", "Origin"],
+            "terms": ["continuous synthesis", "Okazaki fragments", "RNA primers by primase", "replication bubble"]
+        },
+        "membrane transport": {
+            "bins": ["Channel", "Carrier", "Pump"],
+            "terms": ["passive ion flow", "alternating access", "ATP-driven transport", "electrochemical gradient"]
+        },
+        "chemical bonds": {
+            "bins": ["Covalent bond", "Ionic bond", "Hydrogen bond"],
+            "terms": ["electron sharing", "charge attraction", "polar interaction", "partial charges"]
+        },
+        "organelle function": {
+            "bins": ["Nucleus", "Mitochondrion", "Golgi"],
+            "terms": ["houses DNA", "ATP production", "protein modification", "vesicle trafficking"]
+        },
+        "glycolysis": {
+            "bins": ["Energy investment", "Cleavage", "Energy payoff"],
+            "terms": ["hexokinase phosphorylation", "fructose-1,6-bisphosphate splitting", "ATP generation", "pyruvate formation"]
+        }
     }
-    # pick topic key
+
+    # choose key
     key = None
     for k in seeds.keys():
         if k in topic_l:
             key = k; break
     if key is None:
-        key = "organelle function" if "organelle" in topic_l else "chemical bonds"
+        key = "organelle function"
 
-    # Prefer bins that literally occur in scope (case-insensitive)
-    bins = []
-    for b in seeds[key].keys():
-        if _label_in_scope(b, scope):
-            bins.append(b)
-    # If too few, add from scope terms that match seed words
+    # Prefer bins that are literally present in scope; else use seeds
+    bins_seed = seeds[key]["bins"]
+    bins = [b for b in bins_seed if _label_in_scope(b, scope)]
     if len(bins) < 2:
-        for t in terms_in_scope:
-            for b in seeds[key].keys():
-                if b.lower().split()[0] in t.lower() or t.lower() in b.lower():
-                    if b not in bins:
-                        bins.append(b)
-                        break
-    # If still too few, just take first two seed bins
-    if len(bins) < 2:
-        bins = list(seeds[key].keys())[:2]
-    # Cap to 3
+        bins = bins_seed[:3]
     bins = bins[:3]
 
-    # Build 4 terms balanced across bins
-    terms = []
-    mapping = {}
-    # Use seed phrases first
-    seed_pairs = []
-    for b in bins:
-        for phrase in seeds[key][b]:
-            seed_pairs.append((phrase, b))
-    # Add slide-derived short phrases that clearly indicate the bin
-    for t in terms_in_scope:
+    # Build 4 concrete terms: prefer those that appear in scope, otherwise safe seeds
+    candidate_terms = []
+    # From scope: short phrases containing seed keywords
+    scope_terms = _slide_terms(scope, max_terms=40)
+    for t in scope_terms:
         tl = t.lower()
-        for b in bins:
-            if b.lower() in tl and len(t.split()) <= 6:
-                seed_pairs.append((t, b))
+        for kw in [w.lower() for w in seeds[key]["terms"]]:
+            if any(tok in tl for tok in kw.split()[:2]) and 2 <= len(t.split()) <= 6 and ("," not in t and ";" not in t):
+                candidate_terms.append(t)
                 break
-    # Deduplicate preserving order
-    seen = set()
-    clean_pairs = []
-    for phrase, b in seed_pairs:
-        if phrase.lower() in seen: 
+
+    # Add seed terms themselves
+    candidate_terms += seeds[key]["terms"]
+
+    # Dedup and pick 4
+    used = set()
+    terms = []
+    for t in candidate_terms:
+        tt = t.strip()
+        if not tt or tt.lower() in used:
             continue
-        seen.add(phrase.lower())
-        clean_pairs.append((phrase, b))
+        # Avoid vague starters
+        if re.match(r"^(where|when|how|why|which|that)", tt.lower()):
+            continue
+        # keep short and concrete
+        if not (2 <= len(tt.split()) <= 6):
+            continue
+        if "," in tt or ";" in tt:
+            continue
+        terms.append(tt)
+        used.add(tt.lower())
+        if len(terms) == 4:
+            break
 
-    # Fill exactly 4
-    i = 0
-    while len(terms) < 4 and i < len(clean_pairs):
-        phrase, b = clean_pairs[i]
-        # keep phrases short and without commas/semicolons
-        if 2 <= len(phrase.split()) <= 6 and ("," not in phrase and ";" not in phrase):
-            terms.append(phrase)
-            mapping[phrase] = b
-        i += 1
-
-    # If still short, synthesize minimal phrases
-    filler = ["core feature", "key clue", "hallmark step", "typical outcome"]
-    fi = 0
-    while len(terms) < 4 and fi < len(filler):
-        b = bins[len(terms) % len(bins)]
-        ph = f"{filler[fi]}"
-        terms.append(ph)
-        mapping[ph] = b
-        fi += 1
+    # Map terms evenly across bins
+    mapping = {}
+    for i, t in enumerate(terms):
+        b = bins[i % len(bins)]
+        mapping[t] = b
 
     title = f"Match items for {topic.title()}"
     instr = "Drag each item to the correct category."
-    hints = {t: "Use the exact slide phrase for this category." for t in terms}
+    hints = {t: "Use the slide phrase that fits this category." for t in terms}
     return title, instr, bins, terms, mapping, hints
+
 # ---------- Fallbacks ----------
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
@@ -820,37 +866,53 @@ def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,
     return title, instr, labels, terms, mapping, hints
 
 
+
 def build_fitb(topic: str, rng: random.Random) -> List[Dict[str,Any]]:
     items = []
     t = (topic or "").lower()
     if "glycolysis" in t:
         items.append({"stem":"The end product of glycolysis is _____ .","answers":["pyruvate"],"hint":"Three-carbon product."})
-        items.append({"stem":"Glycolysis occurs in the _____ .","answers":["cytosol","cytoplasm"],"hint":"Not an organelle lumen."})
-        items.append({"stem":"The committed step of glycolysis is catalyzed by _____ .","answers":["pfk-1","pfk1","phosphofructokinase"],"hint":"Allosterically regulated enzyme."})
-        items.append({"stem":"ATP is generated by substrate-level phosphorylation at _____ kinase.","answers":["pyruvate","phosphoglycerate"],"hint":"Final steps."})
+        items.append({"stem":"Glycolysis occurs in the _____ of the cell.","answers":["cytosol","cytoplasm"],"hint":"Not an organelle lumen."})
+        items.append({"stem":"The _____ step is catalyzed by phosphofructokinase (PFK-1).","answers":["commitment","committed"],"hint":"Regulated step early in the pathway."})
+        items.append({"stem":"In glycolysis, ATP is produced by _____-level phosphorylation.","answers":["substrate"],"hint":"Not oxidative phosphorylation."})
     elif "transcription" in t:
         items.append({"stem":"In eukaryotes, mRNA is synthesized by _____ polymerase II.","answers":["rna"],"hint":"Pol II."})
-        items.append({"stem":"Transcription starts at the _____ region of DNA.","answers":["promoter"],"hint":"TATA box may be here."})
-        items.append({"stem":"The introns are removed from pre-mRNA by the _____ .","answers":["spliceosome"],"hint":"snRNP complex."})
-        items.append({"stem":"A 7-methylguanosine cap is added to the _____ end.","answers":["5'","5-prime","5prime","5’"],"hint":"The end that emerges first."})
+        items.append({"stem":"Transcription begins at the DNA _____ region.","answers":["promoter"],"hint":"May include a TATA box."})
+        items.append({"stem":"Introns are removed from pre-mRNA by the _____ .","answers":["spliceosome"],"hint":"snRNP complex."})
+        items.append({"stem":"A 5′ cap is added to the _____ end of mRNA.","answers":["5'","5-prime","5prime","5’"],"hint":"The end that emerges first."})
     elif "translation" in t:
-        items.append({"stem":"Protein synthesis occurs on the _____ .","answers":["ribosome"],"hint":"Large and small subunits."})
-        items.append({"stem":"Translation begins at the start codon, typically _____ .","answers":["aug"],"hint":"Also codes for methionine."})
-        items.append({"stem":"The anticodon resides on the _____ molecule.","answers":["trna","t-rna"],"hint":"Adapter between codon and amino acid."})
-        items.append({"stem":"Peptide bond formation is catalyzed in the _____ center.","answers":["peptidyl-transferase","peptidyl transferase","peptidyltransferase"],"hint":"Activity of the large subunit rRNA."})
+        items.append({"stem":"Protein synthesis is carried out by the _____ .","answers":["ribosome"],"hint":"Large and small subunits."})
+        items.append({"stem":"The usual start codon for translation is _____ .","answers":["aug"],"hint":"Codes for methionine."})
+        items.append({"stem":"The anticodon is a feature of the _____ molecule.","answers":["trna","t-rna"],"hint":"Adapter that brings amino acids."})
+        items.append({"stem":"A codon consists of _____ nucleotides on mRNA.","answers":["three","3"],"hint":"Triplet code."})
     elif "dna repair" in t:
-        items.append({"stem":"Bulky adducts, like thymine dimers, are removed by _____ .","answers":["nucleotide-excision-repair","ner","nucleotide excision repair"],"hint":"Excises an oligonucleotide."})
-        items.append({"stem":"Cytosine deamination is corrected by _____ excision repair.","answers":["base"],"hint":"Removes damaged base then sugar-phosphate."})
-        items.append({"stem":"Replication errors are fixed by _____ repair.","answers":["mismatch"],"hint":"MutS recognizes distortion."})
+        items.append({"stem":"Thymine dimers are removed by _____ excision repair.","answers":["nucleotide","ner","nucleotide-excision"],"hint":"Excises an oligonucleotide."})
+        items.append({"stem":"Replication mismatches are corrected by _____ repair.","answers":["mismatch","mmr"],"hint":"MutS recognizes distortion."})
+        items.append({"stem":"Cytosine deamination is fixed by _____ excision repair.","answers":["base","ber"],"hint":"Removes damaged base then sugar-phosphate."})
         items.append({"stem":"DNA ligase seals a remaining _____ in the backbone.","answers":["nick"],"hint":"Between adjacent nucleotides."})
+    elif "dna replication" in t or "replication" in t:
+        items.append({"stem":"New DNA strands are synthesized in the _____ to _____ direction.","answers":["5' to 3'","5’ to 3’","5-prime to 3-prime","5 prime to 3 prime"],"hint":"Think nucleo tide addition direction."})
+        items.append({"stem":"On the lagging strand, short fragments called _____ are made.","answers":["okazaki fragments","okazaki"],"hint":"Named after their discoverer."})
+        items.append({"stem":"The enzyme that unwinds the DNA helix is _____ .","answers":["helicase"],"hint":"Opens the replication fork."})
+        items.append({"stem":"RNA primers for DNA synthesis are made by _____ .","answers":["primase"],"hint":"Short RNA segments."})
+    elif "membrane transport" in t:
+        items.append({"stem":"Diffusion through a channel is _____ with respect to energy use.","answers":["passive"],"hint":"No ATP hydrolysis."})
+        items.append({"stem":"A pump moves molecules _____ a concentration gradient.","answers":["against","up"],"hint":"Requires energy."})
+        items.append({"stem":"Carrier proteins work by _____ access to binding sites.","answers":["alternating"],"hint":"Conformational change."})
+        items.append({"stem":"Water movement across membranes is called _____ .","answers":["osmosis"],"hint":"Driven by gradients."})
+    elif "chemical bonds" in t:
+        items.append({"stem":"A peptide bond is a type of _____ bond.","answers":["covalent"],"hint":"Formed between amino acids."})
+        items.append({"stem":"Ionic bonds result from _____ attraction between charges.","answers":["electrostatic"],"hint":"Opposite charges."})
+        items.append({"stem":"DNA strands are held together by _____ bonds between bases.","answers":["hydrogen"],"hint":"Noncovalent interactions."})
+        items.append({"stem":"The backbone of DNA is linked by _____ bonds.","answers":["phosphodiester"],"hint":"Between nucleotides."})
     else:
-        # Generic but meaningful fallbacks
-        items.append({"stem":"DNA is composed of repeating _____ units called nucleotides.","answers":["monomer"],"hint":"Basic building block."})
-        items.append({"stem":"A gene is transcribed into _____ before translation.","answers":["mrna","messenger-rna","messenger rna"],"hint":"RNA type that carries coding sequence."})
-        items.append({"stem":"Proteins are synthesized from amino acids during _____ .","answers":["translation"],"hint":"Occurs on ribosomes."})
-        items.append({"stem":"The cell membrane is a lipid _____ with embedded proteins.","answers":["bilayer"],"hint":"Two leaflets."})
+        items.append({"stem":"Proteins are made from _____ linked together.","answers":["amino acids","amino-acids"],"hint":"Monomers of proteins."})
+        items.append({"stem":"Genes are expressed first by making _____ from DNA.","answers":["mrna","messenger rna"],"hint":"Template for translation."})
+        items.append({"stem":"A cell membrane is a lipid _____ with proteins.","answers":["bilayer"],"hint":"Two leaflets."})
+        items.append({"stem":"Cells generate most ATP in the _____ .","answers":["mitochondria","mitochondrion"],"hint":"Powerhouse organelle."})
     rng.shuffle(items)
     return items[:4]
+
 
 
 # ---------- Exam (optional) ----------
@@ -1020,7 +1082,7 @@ if go:
     if fitb_items is None:
         rng = random.Random(new_seed())
         fitb_items = build_fitb(topic, random.Random(new_seed()))
-    st.session_state.fitb = ensure_four_fitb(fitb_items, st.session_state.get("topic",""))
+    st.session_state.fitb = ensure_four_fitb(_filter_intro_fitb_by_topic(fitb_items or [], st.session_state.get("topic","")), st.session_state.get("topic",""))
 
     style = extract_exam_style(st.session_state.exam_corpus or [])
     st.session_state.exam_q = gen_exam_question(scope, style or {}, prompt_val) if style else None
