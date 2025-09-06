@@ -1,93 +1,91 @@
 
-import os, re, json, pathlib, random, time, sys, io, unicodedata, requests
+import os, re, json, pathlib, random, time, sys
 import streamlit as st
+import requests
+import io
+from typing import List, Tuple, Dict
 
-# ------------------ Utilities: JSON sanitize & prompt expansion ------------------
-def _strip_code_fences(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    return s.strip()
-
-def _extract_json_block(s: str) -> str:
-    s = _strip_code_fences(s)
-    # Try array first
-    a_start = s.find("[")
-    a_end   = s.rfind("]")
-    o_start = s.find("{")
-    o_end   = s.rfind("}")
-    cand = ""
-    if a_start != -1 and a_end != -1 and a_end > a_start:
-        cand = s[a_start:a_end+1]
-        try:
-            json.loads(cand); return cand
-        except Exception: pass
-    if o_start != -1 and o_end != -1 and o_end > o_start:
-        cand = s[o_start:o_end+1]
-        try:
-            json.loads(cand); return cand
-        except Exception: pass
-    return s  # last resort
-
-BOND_KEYWORDS = {
-    "chemical": ["covalent", "ionic", "hydrogen bond", "van der waals", "noncovalent", "polar", "nonpolar", "bond energy", "electronegativity"],
-    "junctions": ["tight junction", "adherens", "desmosome", "hemidesmosome", "gap junction", "cell-cell adhesion", "cadherin", "integrin", "extracellular matrix"],
-    "cytoskeleton": ["microtubule", "actin", "intermediate filament", "cytoskeleton"]
-}
-
-def expand_prompt_keywords(p: str) -> list:
-    p = (p or "").lower()
-    base = re.findall(r"[a-z0-9']+", p)
-    expanded = set(base)
-    if "bond" in p or "bonds" in p:
-        for group in BOND_KEYWORDS.values():
-            expanded.update([w for w in " ".join(group).split() if len(w) > 2])
-    if "transport" in p:
-        expanded.update(["diffusion","channel","pump","carrier","symporter","antiporter","uniporter","gradient","atp"])
-    if "glycolysis" in p:
-        expanded.update(["pfk","pyruvate","nad","atp","enzyme","kinase"])
-    if "replication" in p:
-        expanded.update(["helicase","primase","polymerase","ligase","fork"])
-    if "transcription" in p:
-        expanded.update(["promoter","rna","pol","splice","cap","terminate"])
-    if "translation" in p:
-        expanded.update(["ribosome","a site","p site","release","trna","start codon","stop codon"])
-    return [w for w in expanded if len(w) > 2]
-
-
-from typing import List, Tuple, Dict, Any
-
-# ------------------ Page & Globals (unchanged UX) ------------------
+# ------------------ Page & Globals ------------------
 st.set_page_config(page_title="Let's Practice Biology!", page_icon="🎓", layout="wide")
-st.title("Let's Practice Biology!")
-SLIDES_GH_USER   = "mwellis825"   # <-- set once here
-SLIDES_GH_REPO   = "cell-bio-gpt-tutor"         # <-- set once here
-SLIDES_GH_BRANCH = "main"                    # <-- set once here
-SLIDES_DIR_PATH  = "slides"                  # fixed folder in the repo
+SLIDES_DIR = os.path.join(os.getcwd(), "slides")
 
-# Helper for consistent randomness as before
+# ------------ GitHub Slides Loader (no env vars) ------------
+GITHUB_USER   = "mwellis825"
+GITHUB_REPO   = "cell-bio-gpt-tutor"
+GITHUB_BRANCH = "main"
+GITHUB_SLIDES_DIR = "slides"
+
+def _gh_list_slides(user: str, repo: str, path: str, branch: str):
+    url = f"https://api.github.com/repos/{user}/{repo}/contents/{path}?ref={branch}"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else []
+
+def _gh_fetch_raw(url: str) -> bytes:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.content
+
+def _read_pdf_bytes(pdf_bytes: bytes) -> str:
+    try:
+        import pypdf as _p
+        reader = _p.PdfReader(io.BytesIO(pdf_bytes))
+        return "\n".join([(p.extract_text() or "") for p in reader.pages])
+    except Exception:
+        try:
+            import PyPDF2 as _p2
+            reader = _p2.PdfReader(io.BytesIO(pdf_bytes))
+            return "\n".join([(p.extract_text() or "") for p in reader.pages])
+        except Exception:
+            return ""
+
+@st.cache_data(show_spinner=False)
+def load_corpus_from_github(user: str, repo: str, path: str, branch: str):
+    corpus = []
+    try:
+        items = _gh_list_slides(user, repo, path, branch)
+    except Exception:
+        return corpus
+    for it in items:
+        if it.get("type") != "file":
+            continue
+        name = (it.get("name") or "").lower()
+        raw_url = it.get("download_url") or f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}/{it.get('name')}"
+        try:
+            if name.endswith(".pdf"):
+                txt = _read_pdf_bytes(_gh_fetch_raw(raw_url))
+            elif name.endswith((".txt",".md",".html",".htm")):
+                txt = (_gh_fetch_raw(raw_url)).decode("utf-8", "ignore")
+            else:
+                txt = ""
+        except Exception:
+            txt = ""
+        if txt and len(txt.strip()) > 20:
+            corpus.append(txt)
+    return corpus
+
+
 def new_seed() -> int:
     return int(time.time() * 1000) ^ random.randint(0, 1_000_000)
 
-# ------------------ Optional LLM for hints (kept from current behavior) ------------------
+# ------------------ LLM hint (optional) ------------------
 def _try_llm(prompt: str) -> str:
     api = os.environ.get("OPENAI_API_KEY")
     if not api:
         raise RuntimeError("No API key")
-    from openai import OpenAI  # type: ignore
-    client = OpenAI(api_key=api)
-    resp = client.chat.completions.create(
-        model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
+    import openai  # type: ignore
+    openai.api_key = api
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
         messages=[
             {"role":"system","content":"You are a Socratic college-level cell biology tutor. Ask ONE concise guiding question (< 20 words) that nudges the student to the answer without revealing it."},
             {"role":"user","content":prompt},
         ],
         temperature=0.3,
         max_tokens=60,
-        seed=42,
     )
-    return resp.choices[0].message.content.strip()
+    return resp["choices"][0]["message"]["content"].strip()
 
 def llm_hint_for_fitb(stem: str, target: str, topic: str, fallback: str) -> str:
     try:
@@ -108,7 +106,7 @@ def llm_hint_for_dnd(item: str, target_label: str, labels: list, topic: str, fal
     except Exception:
         return fallback
 
-# ------------------ PDF/Text extraction (compatible with current app) ------------------
+# ------------------ Simple text extraction from slides ------------------
 PDF_BACKEND = None
 try:
     import PyPDF2  # type: ignore
@@ -120,76 +118,63 @@ except Exception:
     except Exception:
         PDF_BACKEND = None
 
-def read_pdf_bytes(pdf_bytes: bytes) -> str:
+def read_pdf(path: str) -> str:
     if PDF_BACKEND == "PyPDF2":
         try:
-            reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))  # type: ignore
-            return "\\n".join([(p.extract_text() or "") for p in reader.pages])
+            with open(path,"rb") as f:
+                reader = PyPDF2.PdfReader(f)  # type: ignore
+                return "\\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
     if PDF_BACKEND == "pypdf":
         try:
-            reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))  # type: ignore
-            return "\\n".join([(p.extract_text() or "") for p in reader.pages])
+            with open(path,"rb") as f:
+                reader = pypdf.PdfReader(f)  # type: ignore
+                return "\\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
     return ""
 
-def read_text_bytes(raw: bytes) -> str:
-    # Try utf-8, fallback latin-1
+def read_text(path: str) -> str:
     for enc in ("utf-8","latin-1"):
         try:
-            return raw.decode(enc)
+            with open(path,"r",encoding=enc) as f:
+                return f.read()
         except Exception:
             continue
     return ""
 
-# ------------------ GitHub fetchers (new, replaces local /slides reading) ------------------
-def gh_list_slides(user: str, repo: str, path: str, branch: str) -> List[Dict[str, Any]]:
-    """
-    Return a list of files in /slides via GitHub Contents API.
-    """
-    url = f"https://api.github.com/repos/{user}/{repo}/contents/{path}?ref={branch}"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json() if isinstance(r.json(), list) else []
+def load_corpus(slides_dir: str):
+    texts = []
+    if not os.path.isdir(slides_dir): return texts
+    base = pathlib.Path(slides_dir)
+    for p in base.rglob("*"):
+        if not p.is_file(): continue
+        ext = p.suffix.lower()
+        if ext == ".pdf":
+            t = read_pdf(str(p))
+        elif ext in {".txt",".md",".mdx",".html",".htm"}:
+            t = read_text(str(p))
+        else:
+            t = ""
+        if t and len(t.strip()) > 20:
+            texts.append(t)
+    return texts
 
-def gh_fetch_raw(url: str) -> bytes:
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.content
+# ------------------ Topic recognition ------------------
+def classify_topic(prompt: str) -> str:
+    p = (prompt or "").lower()
+    if "organelle" in p or "organelles" in p: return "organelle function"
+    if "replicat" in p: return "dna replication"
+    if "transcription" in p: return "transcription"
+    if "translation" in p: return "translation"
+    if "glycolysis" in p: return "glycolysis"
+    if "membrane" in p or "transport" in p: return "membrane transport"
+    if "protein sorting" in p or "signal sequence" in p or "er signal" in p: return "protein sorting"
+    if "cell cycle" in p or "mitosis" in p: return "cell cycle"
+    return (p.split(",")[0].split(";")[0] or "this topic").strip()
 
-@st.cache_data(show_spinner=False)
-def load_corpus_from_github(user: str, repo: str, path: str, branch: str):
-    corpus = []
-    try:
-        items = gh_list_slides(user, repo, path, branch)
-    except Exception as e:
-        st.error(f"Could not list slides from GitHub: {e}")
-        return corpus
-
-    for it in items:
-        if it.get("type") != "file":
-            continue
-        name = (it.get("name") or "").lower()
-        raw_url = it.get("download_url")
-        if not raw_url:
-            # try to build raw URL
-            raw_url = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}/{it.get('name')}"
-        try:
-            if name.endswith(".pdf"):
-                txt = read_pdf_bytes(gh_fetch_raw(raw_url))
-            elif name.endswith((".txt",".md",".mdx",".html",".htm")):
-                txt = read_text_bytes(gh_fetch_raw(raw_url))
-            else:
-                txt = ""
-        except Exception:
-            txt = ""
-        if txt and len(txt.strip()) > 20:
-            corpus.append(txt)
-    return corpus
-
-# ------------------ Simple retrieval & sentence matching (kept but strengthened) ------------------
+# ------------------ FITB helpers ------------------
 STOP = {"the","and","for","that","with","this","from","into","are","was","were","has","have","had","can","will","would","could","should",
         "a","an","of","in","on","to","by","as","at","or","be","is","it","its","their","our","your","if","when","then","than","but",
         "we","you","they","which","these","those","there","here","such","may","might","also","very","much","many","most","more","less"}
@@ -231,22 +216,9 @@ def collect_prompt_matched(corpus, prompt: str, top_docs=6, max_sents=800):
         for s in sents:
             if relevance(s, q) > 0:
                 matched.append(s)
-    return matched[:200]
+    return matched
 
-# ------------------ Topic recognition (unchanged) ------------------
-def classify_topic(prompt: str) -> str:
-    p = (prompt or "").lower()
-    if "organelle" in p or "organelles" in p: return "organelle function"
-    if "replicat" in p: return "dna replication"
-    if "transcription" in p: return "transcription"
-    if "translation" in p: return "translation"
-    if "glycolysis" in p: return "glycolysis"
-    if "membrane" in p or "transport" in p: return "membrane transport"
-    if "protein sorting" in p or "signal sequence" in p or "er signal" in p: return "protein sorting"
-    if "cell cycle" in p or "mitosis" in p: return "cell cycle"
-    return (p.split(",")[0].split(";")[0] or "this topic").strip()
-
-# ------------------ Acceptance logic (unchanged) ------------------
+# Acceptance categories and synonyms
 UP = {"increase","increases","increased","up","higher","stabilizes","stabilize","stabilized","faster","more","↑","improves","greater","accumulate","accumulates","builds up","build up"}
 DOWN = {"decrease","decreases","decreased","down","lower","destabilizes","destabilize","destabilized","slower","less","↓","reduces","reduced","loss"}
 NOCH = {"no change","unchanged","same","neutral","nc","~"}
@@ -276,6 +248,7 @@ def matches_label(user: str, key: str) -> bool:
     if key == "frameshift": return any(x in u for x in FRAME)
     return False
 
+# Specific-answer acceptance with synonyms + targeted hints
 SYNONYMS = {
     "endoplasmic reticulum": {"er","endoplasmic reticulum","rough er","smooth er"},
     "rough endoplasmic reticulum": {"rough er","rer","rough endoplasmic reticulum"},
@@ -328,7 +301,8 @@ SPECIFIC_HINTS = {
 }
 
 def normalize_answer(a: str) -> str:
-    a = norm_text(a); return a
+    a = norm_text(a)
+    return a
 
 def matches_specific(user: str, answers: List[str]) -> bool:
     u = normalize_answer(user)
@@ -345,6 +319,7 @@ def specific_hint_for_answer(ans: str) -> str:
     a = ans.lower()
     if a in SPECIFIC_HINTS:
         return SPECIFIC_HINTS[a]
+    # heuristic fallbacks
     if "matrix" in a and "mitochond" in a:
         return "Innermost mitochondrial space enclosed by the inner membrane."
     if "endoplasmic reticulum" in a or a.endswith(" er"):
@@ -355,7 +330,7 @@ def specific_hint_for_answer(ans: str) -> str:
         return "Double membrane with pores; DNA location."
     return "Use the most specific biological term for the location or component."
 
-# ------------------ Existing FITB generation (fallback preserved) ------------------
+# FITB stems (mix of reasoning + specific recall)
 def extract_focus(stem: str) -> str:
     s = stem.lower()
     m = re.search(r"if ([^,]+?) (is|cannot|can't|does not|doesn't|fails|fail)", s)
@@ -485,7 +460,7 @@ def build_fitb(topic: str, rng: random.Random) -> List[Dict]:
     rng.shuffle(items)
     return items[:4]
 
-# ------------------ DnD activity generators (fallback preserved) ------------------
+# ------------------ DnD generators ------------------
 def organelle_pairs(rng: random.Random) -> Tuple[str, list, list, dict, dict]:
     bank = [
         ("Nucleus","DNA is housed; transcription occurs"),
@@ -557,6 +532,7 @@ def order_pairs(topic: str) -> Tuple[str, list, list, dict, dict]:
     return title, labels, terms, answer, hint_map
 
 def glycolysis_pairs(rng: random.Random) -> Tuple[str, list, list, dict, dict]:
+    """Glycolysis-specific matching: enzyme/component → function (unambiguous)."""
     pairs = [
         ("Hexokinase","Phosphorylates glucose in the first step"),
         ("Phosphofructokinase‑1 (PFK‑1)","Commits pathway by converting F6P to F1,6BP"),
@@ -663,141 +639,140 @@ def build_dnd_activity(topic: str) -> Tuple[str, list, list, dict, dict]:
             return protein_function_pairs(topic)
     return protein_function_pairs(topic)
 
-# ------------------ New: LLM activity generation grounded in slides ------------------
-LLM_SYS = "You generate concise interactive activities grounded ONLY in the provided slide excerpts. Never reveal answers. Use simple student-friendly language."
 
-def _llm_json(prompt: str, max_tokens=900, temperature=0.1) -> str:
-    api = os.environ.get("OPENAI_API_KEY")
-    if not api:
-        return ""
-    from openai import OpenAI  # type: ignore
-    client = OpenAI(api_key=api)
-    resp = client.chat.completions.create(
-        model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
-        messages=[{"role":"system","content":LLM_SYS},{"role":"user","content":prompt}],
-        temperature=temperature,
-        max_tokens=max_tokens,
-        seed=42,
-    )
-    return resp.choices[0].message.content or ""
+# ------------ JSON sanitizer + LLM activity generators ------------
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
 
-def build_scope_from_corpus(corpus: List[str], prompt: str, limit_chars: int = 4000) -> str:
+def _extract_json_block(s: str) -> str:
+    s = _strip_code_fences(s)
+    a_start, a_end = s.find("["), s.rfind("]")
+    o_start, o_end = s.find("{"), s.rfind("}")
+    if a_start != -1 and a_end != -1 and a_end > a_start:
+        cand = s[a_start:a_end+1]
+        try:
+            json.loads(cand); return cand
+        except Exception:
+            pass
+    if o_start != -1 and o_end != -1 and o_end > o_start:
+        cand = s[o_start:o_end+1]
+        try:
+            json.loads(cand); return cand
+        except Exception:
+            pass
+    return s
+
+def _openai_client():
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        from openai import OpenAI
+        return OpenAI(api_key=key)
+    except Exception:
+        return None
+
+def build_scope(corpus: list, prompt: str, limit_chars: int = 5000) -> str:
     sents = collect_prompt_matched(corpus, prompt, top_docs=6, max_sents=1200)
-    scope = "\\n".join(sents)[:limit_chars]
+    scope = "\n".join(sents)[:limit_chars]
     return scope
 
-def llm_generate_dnd(scope: str, topic: str) -> Tuple[str, list, list, dict, dict]:
-    """
-    Ask the LLM to produce bins (labels), draggables (terms), a mapping, and short hints — all derived from scope.
-    """
-    if not scope.strip():
-        return ("", [], [], {}, {})
-    schema = {
-        "title": "string",
-        "bins": ["string"],                # labels shown as bins
-        "terms": ["string"],               # draggable items
-        "mapping": {"term->bin": "dict"},  # keys: terms, values: bin label
-        "hints": {"term->hint": "dict"}    # one short hint per term, non-revealing
-    }
-    prompt = f"""Create ONE drag-and-drop activity based ONLY on the slide excerpts below.
+def gen_dnd_from_scope(scope: str, prompt: str):
+    client = _openai_client()
+    if client is None or not scope.strip():
+        return None
+    sys_prompt = "You create concise drag-and-drop activities grounded ONLY in the provided slide excerpts. Never reveal answers."
+    user_prompt = f'''Create ONE drag-and-drop activity from the slide excerpts.
 
 Slide excerpts:
-\"\"\"
-{scope}
-\"\"\"
-
-Topic: {topic}
-
-Rules:
-- Return STRICT JSON only (no markdown), with keys: title, bins, terms, mapping, hints.
-- bins: 2-4 concise bin labels.
-- terms: 2-4 draggable items, each must match one of the bins via mapping.
-- mapping: object where each key is a term and each value is a bin label from bins.
-- hints: object where each key is a term and the value is ONE helpful hint that does NOT reveal the bin.
-- Use only concepts present in the excerpts.
-- Keep the language student-friendly.
-- Do NOT include answers in hints.
 """
-    raw = _llm_json(prompt)
-    if not raw.strip():
-        return ("", [], [], {}, {})
-    raw = _extract_json_block(raw)
-    # Basic JSON parse & validation
+{scope}
+"""
+
+Student prompt: "{prompt}"
+
+Return STRICT JSON (no markdown) with:
+{{
+  "title": "string",
+  "bins": ["string", ...],         # 2-4
+  "terms": ["string", ...],        # 2-4
+  "mapping": {{"TERM":"BIN"}},   # every term maps to one bin
+  "hints": {{"TERM":"one short hint"}}
+}}'''
     try:
+        resp = client.chat.completions.create(
+            model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
+            temperature=0.1, max_tokens=800, seed=42,
+            messages=[{"role":"system","content":sys_prompt},
+                      {"role":"user","content":user_prompt}]
+        )
+        raw = resp.choices[0].message.content or ""
+        raw = _extract_json_block(raw)
         data = json.loads(raw)
-        title = data.get("title") or "Match the concepts to the correct category."
-        bins = data.get("bins") or []
+        title = data.get("title") or "Match items to categories"
+        bins  = data.get("bins") or []
         terms = data.get("terms") or []
         mapping = data.get("mapping") or {}
         hints = data.get("hints") or {}
-        # minimal sanity
         if not (2 <= len(bins) <= 4 and 2 <= len(terms) <= 4):
-            return ("", [], [], {}, {})
-        # Ensure mapping and hints entries
-        if any(t not in mapping for t in terms):
-            return ("", [], [], {}, {})
+            return None
         for t in terms:
-            if mapping[t] not in bins:
-                return ("", [], [], {}, {})
-        for t in terms:
-            if not isinstance(hints.get(t,""), str) or len(hints.get(t,"").strip()) < 3:
-                hints[t] = "Consider the defining feature that separates this from other categories."
-        # Convert to UI structures used by current app
+            if t not in mapping or mapping[t] not in bins:
+                return None
         instr = "Match each **item** to its **category**."
         labels = bins
         draggables = terms
-        answer = {t: mapping[t] for t in terms}  # NOTE: current app expects {term: BinLabel}
-        hint_map = hints
-        # enforce grounding to prompt keywords
-        kws = set(expand_prompt_keywords(topic))
-        combined = " ".join([title] + labels + draggables + list(mapping.keys()) + list(mapping.values()) + list(hints.values())).lower()
-        hit = any(k in combined for k in kws if len(k) > 3)
-        if not hit:
-            return ("", [], [], {}, {})
+        answer = {t: mapping[t] for t in terms}
+        hint_map = {t: (hints.get(t) or "Focus on what distinguishes this item from others.") for t in terms}
         return instr, labels, draggables, answer, hint_map
     except Exception:
-        return ("", [], [], {}, {})
+        return None
 
-def llm_generate_fitb(scope: str, topic: str) -> List[Dict]:
-    """
-    Ask the LLM to produce up to 4 FITB items grounded only in scope.
-    """
-    if not scope.strip():
-        return []
-    prompt = f"""Create up to 4 fill-in-the-blank items based ONLY on the slide excerpts below.
+def gen_fitb_from_scope(scope: str, prompt: str):
+    client = _openai_client()
+    if client is None or not scope.strip():
+        return None
+    sys_prompt = "You create concise fill-in-the-blank questions grounded ONLY in the provided slide excerpts. Never reveal answers."
+    user_prompt = f'''From the slide excerpts, create up to 4 fill-in-the-blank items.
 
 Slide excerpts:
-\"\"\"
-{scope}
-\"\"\"
-
-Topic: {topic}
-
-Rules:
-- Return STRICT JSON array only.
-- Each item is an object with: "stem" (string, with one blank as ______), "answers" (1-4 short accepted answers), "hint" (ONE short guiding hint).
-- Keep stems concise and assess key ideas explicitly present in the excerpts.
-- Do NOT reveal the answer in the hint.
-- Prefer specific terms actually present in the excerpts.
 """
-    raw = _llm_json(prompt, max_tokens=800, temperature=0.1)
-    if not raw.strip():
-        return []
-    raw = _extract_json_block(raw)
+{scope}
+"""
+
+Student prompt: "{prompt}"
+
+Return STRICT JSON array (no markdown). Each item:
+{{{"stem":"... ______ ...","answers":["a","b"],"hint":"one short hint"}}}'''
     try:
+        resp = client.chat.completions.create(
+            model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
+            temperature=0.1, max_tokens=800, seed=42,
+            messages=[{"role":"system","content":sys_prompt},
+                      {"role":"user","content":user_prompt}]
+        )
+        raw = resp.choices[0].message.content or ""
+        raw = _extract_json_block(raw)
         items = json.loads(raw)
         out = []
         for it in items[:4]:
-            stem = it.get("stem","").strip()
-            ans  = it.get("answers",[]) or []
-            hint = it.get("hint","").strip() or "Focus on the specific term used in the slides."
-            if stem and "______" in stem and 1 <= len(ans) <= 4:
-                out.append({"stem":stem, "answers":ans, "hint":hint})
+            stem = it.get("stem","");
+            ans  = it.get("answers",[]);
+            hint = it.get("hint","");
+            if isinstance(stem,str) and "______" in stem and isinstance(ans,list) and 1 <= len(ans) <= 4:
+                out.append({"stem": stem.strip(), "answers": ans, "hint": hint or "Use the exact term from the slides."})
+        if not out:
+            return None
         return out
     except Exception:
-        return []
+        return None
 
-# ------------------ UI Input (unchanged) ------------------
+# ------------------ UI ------------------
+st.title("Let's Practice Biology!")
 prompt = st.text_input(
     "Enter a topic for review and press generate:",
     value="",
@@ -805,90 +780,42 @@ prompt = st.text_input(
     label_visibility="visible",
 )
 
-# ------------------ Generate button (mechanics preserved) ------------------
-if st.button("Generate"):
-    # Load corpus once from GitHub
-    if "corpus" not in st.session_state:
-        st.session_state.corpus = load_corpus_from_github(SLIDES_GH_USER, SLIDES_GH_REPO, SLIDES_DIR_PATH, SLIDES_GH_BRANCH)
 
+if st.button("Generate"):
+    if "corpus" not in st.session_state:
+        st.session_state.corpus = load_corpus_from_github(GITHUB_USER, GITHUB_REPO, GITHUB_SLIDES_DIR, GITHUB_BRANCH)
     topic = classify_topic(prompt) or "this topic"
-    # Disambiguate "bonds" prompts based on slide scope
-    _scope_for_disambig = build_scope_from_corpus(st.session_state.corpus or [], prompt, limit_chars=6000)
-    if re.search(r"\bbond(s)?\b", (prompt or "").lower()):
-        topic = disambiguate_bonds(_scope_for_disambig)
     st.session_state.topic = topic
 
-    # -------- NEW: Build a scope from slides and try LLM-grounded activities --------
-    scope = build_scope_from_corpus(st.session_state.corpus or [], prompt, limit_chars=5000)
+    # Build scope from slides for grounding
+    scope = build_scope(st.session_state.corpus or [], prompt, limit_chars=6000)
 
-    # Try LLM-based DnD first
-    instr, labels, terms, answer, hint_map = llm_generate_dnd(scope, topic)
-    if not labels or not terms or not answer:
-        # Fallback to previous heuristic generator (keeps current behavior)
+    # Activity 1: Drag-and-Drop (LLM first, fallback)
+    dnd = gen_dnd_from_scope(scope, prompt)
+    if dnd is None:
         instr, labels, terms, answer, hint_map = build_dnd_activity(topic)
+    else:
+        instr, labels, terms, answer, hint_map = dnd
 
-    # Save to session_state (same keys as current app)
     st.session_state.dnd_instr = instr
     st.session_state.drag_labels = labels
     st.session_state.drag_bank   = terms
     st.session_state.drag_answer = answer
     st.session_state.dnd_hints   = hint_map
 
-    # FITB via LLM first
+    # Activity 2: FITB (LLM first, fallback)
     rng = random.Random(new_seed())
-    fitb_items = llm_generate_fitb(scope, topic)
-    if not fitb_items:
-        fitb_items = build_fitb(topic, rng)  # fallback preserved
+    fitb_items = gen_fitb_from_scope(scope, prompt)
+    if fitb_items is None:
+        fitb_items = build_fitb(topic, rng)
 
-    
-        # Diagnostics: build keyword hits
-        kw = expand_prompt_keywords(prompt)
-        scope_hits = sum(scope.lower().count(k) for k in kw)
+    st.session_state.fitb = fitb_items
 
-        # Try LLM-based DnD first
-        instr, labels, terms, answer, hint_map = llm_generate_dnd(scope, topic)
-        used_llm_dnd = bool(labels and terms and answer)
-        fallback_reason_dnd = ""
-        if not used_llm_dnd:
-            fallback_reason_dnd = "LLM JSON invalid/ungrounded or empty; used heuristic DnD."
-            instr, labels, terms, answer, hint_map = build_dnd_activity(topic)
+    st.success("Generated fresh activities.")
 
-        # Save to session_state
-        st.session_state.dnd_instr = instr
-        st.session_state.drag_labels = labels
-        st.session_state.drag_bank   = terms
-        st.session_state.drag_answer = answer
-        st.session_state.dnd_hints   = hint_map
-        st.session_state.used_llm_dnd = used_llm_dnd
-        st.session_state.fallback_reason_dnd = fallback_reason_dnd
-
-        # FITB via LLM first
-        rng = random.Random(new_seed())
-        fitb_items = llm_generate_fitb(scope, topic)
-        # Filter boilerplate stems
-        def _boiler(s): return "immediate output would" in s.lower() or "near-term output would" in s.lower()
-        fitb_items = [it for it in fitb_items if not _boiler(it.get("stem",""))]
-        used_llm_fitb = len(fitb_items) > 0
-        fallback_reason_fitb = ""
-        if not used_llm_fitb:
-            fallback_reason_fitb = "LLM returned no usable FITB (or boilerplate); used heuristic FITB."
-            fitb_items = build_fitb(topic, rng)
-
-        st.session_state.fitb = fitb_items
-        st.session_state.used_llm_fitb = used_llm_fitb
-        st.session_state.fallback_reason_fitb = fallback_reason_fitb
-
-        st.success("Generated fresh activities.")
-        with st.expander("Diagnostics"):
-            st.write(f"Scope chars: {len(scope)} | keyword hits in scope: {scope_hits}")
-            st.write("DnD:", "LLM" if used_llm_dnd else "Fallback", fallback_reason_dnd)
-            st.write("FITB:", "LLM" if used_llm_fitb else "Fallback", fallback_reason_fitb)
-
-
-# -------- Activity 1: Drag-and-Drop (unchanged rendering/UI) --------
+# -------- Activity 1: Drag-and-Drop --------
 if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","dnd_instr","dnd_hints"]):
     st.markdown("## Activity 1: Drag and Drop")
-    st.caption("Source: " + ("LLM" if st.session_state.get("used_llm_dnd") else "Fallback"))
     topic = st.session_state.get("topic","this topic")
     labels = st.session_state.drag_labels
     terms  = st.session_state.drag_bank
@@ -1020,12 +947,11 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
             fb = hint_map.get(chosen_item, "Focus on the most distinctive clue in this item.")
             st.info(llm_hint_for_dnd(chosen_item, target_bin, labels, topic, fb))
 
-# -------- Activity 2: FITB (unchanged rendering/UI) --------
+# -------- Activity 2: FITB --------
 if "fitb" in st.session_state:
     st.markdown("---")
     topic_name = st.session_state.get("topic","this topic")
     st.markdown("## Activity 2: Fill in the Blank")
-    st.caption("Source: " + ("LLM" if st.session_state.get("used_llm_fitb") else "Fallback"))
     st.markdown(f"Use your knowledge of **{topic_name}** to answer the following.")
 
     rng = random.Random(new_seed())
@@ -1073,17 +999,3 @@ if "fitb" in st.session_state:
                         "frameshift":"frameshift",
                     }.get(item["label"], item["label"])
                     st.info(pretty)
-
-def disambiguate_bonds(scope_text: str) -> str:
-    """Decide whether 'bonds' likely means chemical bonds or cell junctions based on scope occurrences."""
-    s = scope_text.lower()
-    chem_hits = sum(s.count(k) for k in BOND_KEYWORDS["chemical"])
-    junc_hits = sum(s.count(k) for k in BOND_KEYWORDS["junctions"])
-    cyto_hits = sum(s.count(k) for k in BOND_KEYWORDS["cytoskeleton"])
-    if max(chem_hits, junc_hits, cyto_hits) == 0:
-        return "bonds (unspecified)"
-    if chem_hits >= junc_hits and chem_hits >= cyto_hits:
-        return "chemical bonds"
-    if junc_hits >= chem_hits and junc_hits >= cyto_hits:
-        return "cell junctions"
-    return "cytoskeleton interactions"
