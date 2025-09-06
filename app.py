@@ -49,6 +49,32 @@ def _extract_json_block(s: str) -> str:
             pass
     return s
 
+
+def _lex_overlap(a: str, b: str) -> float:
+    ta = set(re.findall(r"[a-z0-9]+", (a or "").lower()))
+    tb = set(re.findall(r"[a-z0-9]+", (b or "").lower()))
+    if not ta or not tb: return 0.0
+    return len(ta & tb) / float(len(ta | tb))
+
+def _valid_bins_terms(bins, terms, mapping) -> bool:
+    # bins 3-4; terms 6-8; every term mapped; no bin label lexically overlapping with term too much
+    if not (isinstance(bins, list) and 3 <= len(bins) <= 4): return False
+    if not (isinstance(terms, list) and 6 <= len(terms) <= 8): return False
+    if not (isinstance(mapping, dict) and all(t in mapping for t in terms)): return False
+    # each bin has at least 2 terms
+    counts = {b:0 for b in bins}
+    for t in terms:
+        b = mapping.get(t)
+        if b not in counts: return False
+        counts[b] += 1
+        # lexical overlap constraint
+        for lbl in bins:
+            if b == lbl and _lex_overlap(lbl, t) > 0.4:  # too similar
+                return False
+    if min(counts.values()) < 2: return False
+    return True
+
+
 def new_seed() -> int:
     return int(time.time() * 1000) ^ random.randint(0, 1_000_000)
 
@@ -185,75 +211,121 @@ def _chat(client, system, user, max_tokens=900, temperature=0.1, seed=42) -> str
     ).choices[0].message.content or ""
 
 # ---------------- LLM Generators (strict JSON) + Fallbacks ----------------
+
 def gen_dnd_from_scope(scope: str, prompt: str):
     client = _openai_client()
     if client is None or not scope.strip():
         return None
-    sys_prompt = "You create concise drag-and-drop activities grounded ONLY in the provided slide excerpts. Never reveal answers."
-    user_prompt = (
-        "Create ONE drag-and-drop activity from the slide excerpts.\n\n"
-        "Slide excerpts:\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
-        "Student prompt: \"" + prompt + "\"\n\n"
-        "Return STRICT JSON (no markdown) with:\n"
-        "{\n"
-        "  \"title\": \"string\",\n"
-        "  \"bins\": [\"string\", ...],         // 2-4\n"
-        "  \"terms\": [\"string\", ...],        // 2-4\n"
-        "  \"mapping\": {\"TERM\":\"BIN\"},     // every term maps to one bin\n"
-        "  \"hints\": {\"TERM\":\"one short hint\"}\n"
-        "}\n"
-    )
-    try:
-        raw = _chat(client, sys_prompt, user_prompt, max_tokens=800, temperature=0.1)
-        raw = _extract_json_block(raw)
-        data = json.loads(raw)
-        title = data.get("title") or "Match items to categories"
+
+    def _ask(require_strict: bool, seed_val: int):
+        sys_prompt = "You create rigorous drag-and-drop activities grounded ONLY in the provided slide excerpts. Never reveal answers."
+        # No f-strings to avoid brace escaping issues
+        user_prompt = (
+            "Create ONE classification drag-and-drop activity from the slide excerpts.\n\n"
+            "Slide excerpts:\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
+            "Student prompt: \"" + prompt + "\"\n\n"
+            "Design constraints (must follow ALL):\n"
+            "- 3–4 bins with CONCEPTUAL labels (e.g., mechanism, role, evidence, regulation). Avoid using any term's words in bin labels.\n"
+            "- 6–8 draggable ITEMS as short phrases (4–12 words) that require reasoning; prefer statements, mini-scenarios, or definitions—not single words.\n"
+            "- Include at least one confusable pair that tests nuance.\n"
+            "- Every item maps to exactly one bin.\n"
+            "- Provide a short, non-revealing hint for each item.\n"
+            "- Use ONLY information present in the slide excerpts.\n"
+            "- " + ("Bins must NOT be substrings/overlaps of any item (strict)." if require_strict else "Avoid label–item lexical overlap.") + "\n\n"
+            "Return STRICT JSON (no markdown):\n"
+            "{\n"
+            "  \"title\": \"string\",\n"
+            "  \"bins\": [\"string\", ...],              // 3-4 conceptual labels\n"
+            "  \"terms\": [\"string\", ...],             // 6-8 short phrases\n"
+            "  \"mapping\": {\"TERM\":\"BIN\"},          // every term maps to a listed bin\n"
+            "  \"hints\": {\"TERM\":\"one short hint\"}\n"
+            "}\n"
+        )
+        raw = _chat(client, sys_prompt, user_prompt, max_tokens=900, temperature=0.35, seed=seed_val)
+        return raw
+
+    tries = 2
+    for attempt in range(tries):
+        seed_val = (new_seed() % 1_000_000)
+        raw = _ask(require_strict=(attempt == 1), seed_val=seed_val)
+        try:
+            raw = _extract_json_block(raw)
+            data = json.loads(raw)
+        except Exception:
+            data = {}
         bins  = data.get("bins") or []
         terms = data.get("terms") or []
         mapping = data.get("mapping") or {}
         hints = data.get("hints") or {}
-        if not (2 <= len(bins) <= 4 and 2 <= len(terms) <= 4):
-            return None
-        for t in terms:
-            if t not in mapping or mapping[t] not in bins:
-                return None
-        instr = "Match each **item** to its **category**."
+        # Basic presence check
+        if not bins or not terms or not mapping:
+            continue
+        # Enforce variety/rigor
+        if not _valid_bins_terms(bins, terms, mapping):
+            continue
+        # Build UI payload
+        title = data.get("title") or "Concept classification"
+        instr = "Drag each statement into the best-fitting conceptual category."
         labels = bins
         draggables = terms
-        answer = {t: mapping[t] for t in terms}
-        hint_map = {t: (hints.get(t) or "Focus on what distinguishes this item from others.") for t in terms}
+        answer = {t: mapping.get(t) for t in terms}
+        hint_map = {t: (hints.get(t) or "Focus on the distinctive feature that fits this category.") for t in terms}
         return title, instr, labels, draggables, answer, hint_map
-    except Exception:
-        return None
+
+    # If all attempts fail, return None to trigger fallback
+    return None
+
 
 def gen_fitb_from_scope(scope: str, prompt: str):
     client = _openai_client()
     if client is None or not scope.strip():
         return None
-    sys_prompt = "You create concise fill-in-the-blank items grounded ONLY in the provided slide excerpts. Never reveal answers."
-    user_prompt = (
-        "From the slide excerpts, create up to 4 fill-in-the-blank items.\n\n"
-        "Slide excerpts:\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
-        "Student prompt: \"" + prompt + "\"\n\n"
-        "Return STRICT JSON array (no markdown). Each item:\n"
-        "{\"stem\":\"... ______ ...\",\"answers\":[\"a\",\"b\"],\"hint\":\"one short hint\"}\n"
-    )
-    try:
-        raw = _chat(client, sys_prompt, user_prompt, max_tokens=800, temperature=0.1)
-        raw = _extract_json_block(raw)
-        items = json.loads(raw)
-        out = []
-        for it in items[:4]:
-            stem = it.get("stem","").strip()
-            ans  = it.get("answers",[])
-            hint = it.get("hint","").strip() or "Use the exact term from the slides."
-            if isinstance(stem,str) and "______" in stem and isinstance(ans,list) and 1 <= len(ans) <= 4:
-                out.append({"stem": stem, "answers": ans, "hint": hint})
-        return out or None
-    except Exception:
-        return None
 
-# ---------- Fallback builders (simple, generic) ----------
+    def _ask(seed_val: int):
+        sys_prompt = "You create rigorous fill-in-the-blank items grounded ONLY in the provided slide excerpts. Never reveal answers."
+        user_prompt = (
+            "From the slide excerpts, create 4–6 FITB items that require understanding (not recall of a single word).\n\n"
+            "Slide excerpts:\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
+            "Student prompt: \"" + prompt + "\"\n\n"
+            "Design constraints (must follow ALL):\n"
+            "- Each item is a sentence of 10–25 words with 1–2 blanks (use 4+ underscores per blank, e.g., ______).\n"
+            "- Answers must be recoverable from the excerpts (terms, phrases, or names actually present).\n"
+            "- Mix specificity (e.g., enzyme names) with conceptual phrases (e.g., rate-limiting step) when present in slides.\n"
+            "- Avoid trivial clozes (e.g., repeating the bin label). Avoid meta/boilerplate phrasing.\n"
+            "- Provide one concise, non-revealing hint per item.\n\n"
+            "Return STRICT JSON array (no markdown). Each item:\n"
+            "{\"stem\":\"A 10–25 word sentence with ______ blank(s)\",\"answers\":[\"a\",\"b\"],\"hint\":\"one short hint\"}\n"
+        )
+        raw = _chat(client, sys_prompt, user_prompt, max_tokens=900, temperature=0.35, seed=seed_val)
+        return raw
+
+    tries = 2
+    best = None
+    for attempt in range(tries):
+        seed_val = (new_seed() % 1_000_000)
+        raw = _ask(seed_val)
+        try:
+            raw = _extract_json_block(raw)
+            items = json.loads(raw)
+        except Exception:
+            items = []
+        # Normalize and filter
+        out = []
+        for it in (items if isinstance(items, list) else []):
+            stem = (it.get("stem","") or "").strip()
+            ans  = it.get("answers", [])
+            hint = (it.get("hint","") or "Use the exact term from the slides.").strip()
+            if isinstance(stem,str) and isinstance(ans,list) and "____" in stem and not _is_boilerplate(stem):
+                # keep 1–2 blanks only
+                blanks = _count_blanks(stem)
+                if 1 <= blanks <= 2 and 1 <= len(ans) <= 5:
+                    out.append({"stem": stem, "answers": [a for a in ans if isinstance(a,str) and a.strip()], "hint": hint})
+        # Validate richer requirements
+        if _valid_fitb_items(out):
+            best = out[:6]
+            break
+
+    return best
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
     options = {
