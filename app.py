@@ -541,13 +541,137 @@ def load_style_profiles() -> Dict[str, Any]:
     st.session_state["merged_style_profile"] = merged
     return merged
 
+
+# ---------- Novelty & validation utilities ----------
+def _nonce() -> str:
+    try:
+        return f"{int(time.time()*1e6)}_{new_seed()}"
+    except Exception:
+        return str(time.time())
+
+def _digest(obj) -> str:
+    try:
+        payload = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        payload = str(obj)
+    return hashlib.sha1(payload.encode("utf-8","ignore")).hexdigest()
+
+def _remember(tag: str, obj: dict, keep: int = 10) -> bool:
+    """Return True if obj is new; store digest for tag."""
+    dig = _digest(obj)
+    key = f"novel_{tag}"
+    seen = st.session_state.get(key, [])
+    if dig in seen:
+        return False
+    st.session_state[key] = (seen + [dig])[-keep:]
+    return True
+
+SCENARIO_TOKENS = {"patient","cell","mutant","mutation","inhibitor","drug","assay","experiment","culture","graph","image","figure","data","treatment","condition"}
+DEF_PHRASES = {"is called","is defined as","is known as","refers to","the definition of"}
+
 # ---------- Generators with triple-quoted f-strings ----------
 
-def gen_dnd_from_scope(scope: str, prompt: str):
-    _nonce = str(new_seed())
+
+def llm_generate_dnd_strict(scope: str, prompt: str, style: Dict[str,Any]) -> Tuple[str, str, List[str], List[str], Dict[str,str], Dict[str,str]] | None:
     client = _openai_client()
     if client is None or not scope.strip():
         return None
+    nonce = _nonce()
+    sys = "You generate UNIQUE, unambiguous drag-and-drop activities strictly grounded in the provided slide excerpts. Never reveal answers."
+    verbs = ", ".join((style or {}).get("verbs", [])[:8]) or "interpret, predict, justify"
+    user = f"""Create ONE classification drag-and-drop activity for an introductory biology course.
+
+Topic (student prompt): "{prompt}"
+
+Slide excerpts (authoritative content — use exact phrases and keep bins concrete, ≤3 words each):
+\"\"\"
+{scope}
+\"\"\"
+
+Goals:
+- Demand thinking (application or mechanism mapping), not rote definitions.
+- Be UNIQUE for each request. Novelty nonce: {nonce}
+
+Hard constraints (MUST pass all checks):
+- BINS: choose 2–3 specific labels that appear verbatim in the excerpts (headings/terms).
+- TERMS: exactly 4 concise items (3–8 words), each fits EXACTLY ONE bin.
+- Provide a short hint per term (non-revealing).
+- Provide bin-level disambiguators.
+- Provide an ambiguity matrix where each term matches True for ONLY its bin.
+
+Return STRICT JSON with fields:
+{{
+  "title": "string",
+  "bins": ["Label1","Label2","Label3?"] ,
+  "terms": ["t1","t2","t3","t4"],
+  "mapping": {{"t1":"LabelX","t2":"LabelY","t3":"LabelX","t4":"LabelZ"}},
+  "hints": {{"t1":"hint","t2":"hint","t3":"hint","t4":"hint"}},
+  "bin_keywords": {{"LabelX": ["unique token1","token2"], "LabelY": ["token"]}},
+  "ambiguity_matrix": [  // 4 rows (terms) x N cols (bins) of booleans
+    [true,false,false],
+    [false,true,false],
+    [true,false,false],
+    [false,false,true]
+  ],
+  "rationales": {{"t1":"one-sentence why this term fits LabelX referencing slide phrase"}}
+}}"""
+
+    raw = _chat(client, sys, user, max_tokens=900, temperature=0.55, seed=new_seed()%1_000_000)
+    try:
+        data = json.loads(_extract_json_block(raw))
+    except Exception:
+        return None
+
+    # Validation
+    bins = data.get("bins") or []
+    terms = data.get("terms") or []
+    mapping = data.get("mapping") or {}
+    hints = data.get("hints") or {}
+    bin_kw = data.get("bin_keywords") or {}
+    amb = data.get("ambiguity_matrix") or []
+
+    if not (isinstance(bins, list) and 2 <= len(bins) <= 3): return None
+    if not (isinstance(terms, list) and len(terms) == 4): return None
+    if not all(isinstance(t,str) and 3 <= len(t.split()) <= 8 for t in terms): return None
+    if not (isinstance(mapping, dict) and all(t in mapping and mapping[t] in bins for t in terms)): return None
+    if not (isinstance(amb, list) and len(amb) == 4): return None
+    for row in amb:
+        if not (isinstance(row, list) and len(row) == len(bins) and sum(1 for x in row if x is True) == 1):
+            return None
+    # Ambiguity lexical check using bin keywords
+    if not isinstance(bin_kw, dict) or not all(b in bin_kw and isinstance(bin_kw[b], list) and bin_kw[b] for b in bins):
+        return None
+    # Each term must contain at least one token from its bin, and zero tokens from others
+    low_scope = (scope or "").lower()
+    for t in terms:
+        b = mapping[t]
+        toks_good = [tok.lower() for tok in bin_kw.get(b,[])]
+        toks_bad = [tok.lower() for bb in bins if bb != b for tok in bin_kw.get(bb,[])]
+        tl = t.lower()
+        good_hit = any(tok in tl or tok in low_scope for tok in toks_good)
+        bad_hit = any(tok in tl for tok in toks_bad)
+        if not good_hit or bad_hit:
+            return None
+
+    title = data.get("title") or "Match items to slide-based labels"
+    instr = "Drag each item to the correct category."
+    # Uniqueness guard (no exact repeats)
+    payload = {"bins": bins, "terms": terms, "mapping": mapping}
+    if not _remember("dnd", payload):
+        return None
+    return title, instr, bins, terms, mapping, hints
+
+
+def gen_dnd_from_scope(scope: str, prompt: str):
+    style = st.session_state.get("merged_style_profile", {})
+    for _ in range(3):
+        out = llm_generate_dnd_strict(scope, prompt, style)
+        if out is not None:
+            return out
+    # Fallback (topic-aware) if LLM repeatedly fails
+    topic = classify_topic(prompt)
+    return build_dnd_from_scope_fallback(scope, topic)
+
 
     topic = classify_topic(prompt)
     nudges = TOPIC_NUDGES.get(topic, {})
@@ -731,70 +855,88 @@ def _filter_intro_fitb_by_topic(items, topic: str):
         if ok:
             filtered.append(it)
     return filtered
-def gen_fitb_from_scope(scope: str, prompt: str):
-    local_style = load_style_profiles()
-    _nonce = str(new_seed())
+
+def _fitb_definitional(stem: str) -> bool:
+    low = (stem or "").lower()
+    return any(phr in low for phr in DEF_PHRASES)
+
+def _fitb_has_scenario(stem: str) -> bool:
+    low = (stem or "").lower()
+    return any(tok in low for tok in SCENARIO_TOKENS)
+
+def llm_generate_fitb_application(scope: str, prompt: str, style: Dict[str,Any]) -> List[Dict[str,Any]] | None:
     client = _openai_client()
     if client is None or not scope.strip():
         return None
+    nonce = _nonce()
+    verbs = ", ".join((style or {}).get("verbs", [])[:6]) or "interpret, predict, justify"
+    scen = ", ".join((style or {}).get("scenario_markers", [])[:8]) or "experiment, inhibitor, mutation, assay"
+    sys = "You generate UNIQUE, application-focused FITB items strictly grounded in the provided slide excerpts. Never reveal answers."
+    user = f"""Create 4 fill-in-the-blank items that require application (not recall) for an introductory biology course.
 
-    nonce = str(new_seed());
-    def _ask(seed_val: int):
-        sys_prompt = "You create intro-level, application-focused FITB items grounded ONLY in the provided slide excerpts. Never reveal answers."
-        user_prompt = f"""From the slide excerpts, create 4 FITB items appropriate for an introductory biology course.
+Topic (student prompt): "{prompt}"
+Novelty nonce: {nonce}
 
-Slide excerpts:
+Slide excerpts (authoritative facts — cite page/line numbers if present):
 \"\"\"
 {scope}
 \"\"\"
 
-Student prompt: "{prompt}"
+Constraints (must follow ALL):
+- Each item starts with a SHORT SCENARIO (e.g., condition, mutation, inhibitor, experiment). Keep total 12–22 words.
+- Exactly ONE blank (_____). Answer must be ONE WORD (or hyphenated) that appears in the excerpts.
+- Avoid definitional phrasings (e.g., "is called", "is defined as").
+- Use plain, concrete language; no ambiguous phrasing; intro level only.
+- Provide a short, supportive hint grounded in the scenario.
+- Provide slide_refs for each item (list of small integers).
 
-Design constraints (MUST follow ALL) — activity id: {nonce}:
-- Exactly 4 items; each is 10–16 words with one blank (use 5+ underscores: _____).
-- Answers must be present in the excerpts and be a single word (or hyphenation).
-- Avoid commas/semicolons in stems; keep language simple and concrete.
-- Provide one short, non-revealing hint per item.
+Return STRICT JSON array of 4 objects:
+[
+  { "stem": "short scenario ... _____ ...", "answers": ["word"], "hint": "short hint", "slide_refs": [2] },
+  ...
+]"""
+    raw = _chat(client, sys, user, max_tokens=900, temperature=0.55, seed=new_seed()%1_000_000)
+    try:
+        items = json.loads(_extract_json_block(raw))
+    except Exception:
+        return None
+    if not isinstance(items, list) or len(items) != 4:
+        return None
+    out = []
+    low_scope = (scope or "").lower()
+    for it in items:
+        stem = it.get("stem","").strip()
+        ans  = it.get("answers", [])
+        if not stem or not isinstance(ans, list) or not ans: 
+            return None
+        if "_" not in stem: 
+            return None
+        if _fitb_definitional(stem): 
+            return None
+        if not _fitb_has_scenario(stem):
+            return None
+        # answer present in scope
+        a0 = (ans[0] if isinstance(ans[0], str) else "").strip()
+        if not a0 or a0.lower() not in low_scope:
+            return None
+        out.append({"stem": stem, "answers": [a0], "hint": it.get("hint",""), "slide_refs": it.get("slide_refs", [])})
+    # Uniqueness
+    if not _remember("fitb", {"items": out}):
+        return None
+    return out
 
-Return STRICT JSON array (no markdown). Each item:
-{{"stem":"A concise sentence with _____ one blank","answers":["answer"],"hint":"short hint"}}"""
-        raw = _chat(client, sys_prompt, user_prompt, max_tokens=700, temperature=0.45, seed=seed_val)
-        return raw
 
-    best = None
-    for attempt in range(2):
-        raw = _ask(seed_val=(new_seed()%1_000_000))
-        try:
-            items = json.loads(_extract_json_block(raw))
-        except Exception:
-            items = []
+def gen_fitb_from_scope(scope: str, prompt: str):
+    style = st.session_state.get("merged_style_profile", {})
+    for _ in range(3):
+        out = llm_generate_fitb_application(scope, prompt, style)
+        if out:
+            return out
+    # Fallback to existing heuristic + topic fallback
+    topic = classify_topic(prompt)
+    rng = random.Random(new_seed())
+    return build_fitb(topic, rng)
 
-        out = []
-        for it in (items if isinstance(items, list) else []):
-            stem = (it.get("stem","") or "").strip()
-            ans  = [a for a in (it.get("answers",[]) or []) if isinstance(a,str) and a.strip()]
-            hint = (it.get("hint","") or "Use the exact term from the slides.").strip()
-            if not stem or "____" not in stem:
-                continue
-            if not ans or any(len(a.split())>1 and "-" not in a for a in ans):
-                continue
-            wc = len(re.findall(r"[A-Za-z0-9']+", stem))
-            if not (10 <= wc <= 16):
-                continue
-            if ("," in stem or ";" in stem):
-                continue
-            out.append({"stem": stem, "answers": ans[:2], "hint": hint})
-
-        if len(out) == 4 and all(_intro_level_ok(i["stem"], i["answers"]) for i in out):
-            if not is_duplicate("fitb", {"items": out}) or attempt == 1:
-                best = out
-                break
-            else:
-                continue
-
-    
-    
-    return best
 
 
 def ensure_four_fitb(fitb_items, topic: str):
