@@ -1,188 +1,163 @@
 
+import os, re, json, pathlib, random, time, sys
 import streamlit as st
-import json, re, os, time, random, hashlib, io
-from typing import List, Dict, Any, Tuple, Optional
-import requests
+from typing import List, Tuple, Dict
 
-# ---------------- UI CONFIG ----------------
-st.set_page_config(page_title="Cell Bio Tutor", layout="wide")
-st.title("Cell Bio Tutor — Activities")
+# ------------------ Page & Globals ------------------
+st.set_page_config(page_title="Let's Practice Biology!", page_icon="🎓", layout="wide")
+SLIDES_DIR = os.path.join(os.getcwd(), "slides")
 
-# ---------------- GITHUB REPO ----------------
-GITHUB_USER   = "mwellis825"
-GITHUB_REPO   = "cell-bio-gpt-tutor"
-GITHUB_BRANCH = "main"
-SLIDES_DIR    = "slides"
-API = "https://api.github.com"
-HEADERS = {"Accept":"application/vnd.github+json"}
+def new_seed() -> int:
+    return int(time.time() * 1000) ^ random.randint(0, 1_000_000)
 
-# ---------------- UTILITIES ----------------
-def nonce() -> str:
-    return f"{int(time.time()*1e6)}_{int(time.time()*1000)%1_000_000}"
+# ------------------ LLM hint (optional) ------------------
+def _try_llm(prompt: str) -> str:
+    api = os.environ.get("OPENAI_API_KEY")
+    if not api:
+        raise RuntimeError("No API key")
+    import openai  # type: ignore
+    openai.api_key = api
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role":"system","content":"You are a Socratic college-level cell biology tutor. Ask ONE concise guiding question (< 20 words) that nudges the student to the answer without revealing it."},
+            {"role":"user","content":prompt},
+        ],
+        temperature=0.3,
+        max_tokens=60,
+    )
+    return resp["choices"][0]["message"]["content"].strip()
 
-def canon(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
-
-def sha(obj: Any) -> str:
+def llm_hint_for_fitb(stem: str, target: str, topic: str, fallback: str) -> str:
     try:
-        payload = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+        return _try_llm(f"Topic: {topic}\nFITB stem: {stem}\nExpected answer (or label): {target}\nWrite one guiding, specific question.")
     except Exception:
-        payload = str(obj)
-    return hashlib.sha1(payload.encode("utf-8","ignore")).hexdigest()
+        return fallback
 
-def remember(tag: str, obj: Any, keep:int=12) -> bool:
-    d = sha(obj)
-    key = f"_seen_{tag}"
-    seen = st.session_state.get(key, [])
-    if d in seen:
-        return False
-    st.session_state[key] = (seen + [d])[-keep:]
-    return True
-
-def http_json(url: str):
-    r = requests.get(url, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    return r.json()
-
-def http_bytes(url: str) -> bytes:
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    return r.content
-
-def gh_list(path: str):
+def llm_hint_for_dnd(item: str, target_label: str, labels: list, topic: str, fallback: str) -> str:
     try:
-        return http_json(f"{API}/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{path}?ref={GITHUB_BRANCH}")
-    except Exception:
-        return []
-
-def gh_tree():
-    try:
-        data = http_json(f"{API}/repos/{GITHUB_USER}/{GITHUB_REPO}/git/trees/{GITHUB_BRANCH}?recursive=1")
-        return data.get("tree", [])
-    except Exception:
-        return []
-
-def gh_read_text(path: str) -> Optional[str]:
-    try:
-        data = http_json(f"{API}/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{path}?ref={GITHUB_BRANCH}")
-        if isinstance(data, dict) and data.get("download_url"):
-            return http_bytes(data["download_url"]).decode("utf-8","ignore")
-    except Exception:
-        pass
-    return None
-
-def gh_read_bytes(path: str) -> Optional[bytes]:
-    try:
-        data = http_json(f"{API}/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{path}?ref={GITHUB_BRANCH}")
-        if isinstance(data, dict) and data.get("download_url"):
-            return http_bytes(data["download_url"])
-    except Exception:
-        pass
-    return None
-
-# ---------------- SLIDES SCOPE ----------------
-def extract_pdf_text(pdf_bytes: bytes) -> List[str]:
-    try:
-        import PyPDF2
-        pages = []
-        with io.BytesIO(pdf_bytes) as f:
-            r = PyPDF2.PdfReader(f)
-            for p in r.pages:
-                try:
-                    pages.append(p.extract_text() or "")
-                except Exception:
-                    pages.append("")
-        return pages
-    except Exception:
-        return [""]
-
-def pick_decks(prompt: str, k:int=2) -> List[str]:
-    prompt_l = (prompt or "").lower()
-    words = [w for w in re.findall(r"[a-z0-9]+", prompt_l) if len(w)>2]
-    tree = gh_tree()
-    files = [t["path"] for t in tree if t.get("type")=="blob" and t["path"].lower().startswith(SLIDES_DIR+"/") and t["path"].lower().endswith(".pdf")]
-    def score(p):
-        base = p.split("/")[-1].lower()
-        return sum(1 for w in words if w in base)
-    files.sort(key=lambda p:(-score(p), len(p)))
-    return files[:k]
-
-def build_scope(prompt: str, max_chars:int=6500) -> Tuple[str, List[Tuple[str,int]]]:
-    decks = pick_decks(prompt)
-    refs = []
-    chunks = []
-    terms = [w for w in re.findall(r"[a-z0-9]+",(prompt or "").lower()) if len(w)>2]
-    for path in decks:
-        b = gh_read_bytes(path)
-        if not b: continue
-        pages = extract_pdf_text(b)
-        scored = []
-        for i,txt in enumerate(pages[:18], start=1):
-            tl = (txt or "").lower()
-            s = sum(2 for t in terms if t in tl) + (1/(i+2))
-            scored.append((s,i,txt))
-        scored.sort(key=lambda x:x[0], reverse=True)
-        for s,i,txt in scored[:4]:
-            if txt and len("".join(chunks)) < max_chars:
-                chunks.append(f"[{path} p.{i}] {txt.strip()}")
-                refs.append((path,i))
-    return "\n\n".join(chunks)[:max_chars], refs
-
-# ---------------- OPENAI (optional) ----------------
-def get_openai():
-    key = None
-    try:
-        key = st.secrets.get("OPENAI_API_KEY", None)  # type: ignore[attr-defined]
-    except Exception:
-        key = os.environ.get("OPENAI_API_KEY")
-    if not key: return None
-    try:
-        import openai
-        openai.api_key = key
-        return openai
-    except Exception:
-        return None
-
-def extract_json(raw: str) -> Any:
-    m = re.search(r"\[[\s\S]*\]|\{[\s\S]*\}", raw)
-    return json.loads(m.group(0)) if m else json.loads(raw)
-
-def chat_json(system: str, user: str, *, max_tokens=800, temperature=0.45, seed=None) -> Optional[Any]:
-    client = get_openai()
-    if client is None:
-        return None
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-            seed=seed if isinstance(seed, int) else None,
+        return _try_llm(
+            "You will write a hint for a drag-and-drop classification.\n"
+            f"Topic: {topic}\n"
+            f"Draggable item: {item}\n"
+            f"Bins: {', '.join(labels)}\n"
+            f"Correct bin: {target_label}\n"
+            "Write ONE targeted, non-revealing hint that helps the student distinguish the correct bin from the others."
         )
-        txt = resp.choices[0].message.content
-        return extract_json(txt)
     except Exception:
-        return None
+        return fallback
 
-# ---------------- DnD GENERATION ----------------
-VAGUE = {"process","interaction","function","role","effect","site","location","component","feature","category"}
+# ------------------ Simple text extraction from slides ------------------
+PDF_BACKEND = None
+try:
+    import PyPDF2  # type: ignore
+    PDF_BACKEND = "PyPDF2"
+except Exception:
+    try:
+        import pypdf  # type: ignore
+        PDF_BACKEND = "pypdf"
+    except Exception:
+        PDF_BACKEND = None
 
-def label_in_scope(label: str, scope: str) -> bool:
-    return canon(label) in canon(scope)
+def read_pdf(path: str) -> str:
+    if PDF_BACKEND == "PyPDF2":
+        try:
+            with open(path,"rb") as f:
+                reader = PyPDF2.PdfReader(f)  # type: ignore
+                return "\\n".join([(p.extract_text() or "") for p in reader.pages])
+        except Exception:
+            return ""
+    if PDF_BACKEND == "pypdf":
+        try:
+            with open(path,"rb") as f:
+                reader = pypdf.PdfReader(f)  # type: ignore
+                return "\\n".join([(p.extract_text() or "") for p in reader.pages])
+        except Exception:
+            return ""
+    return ""
 
-def is_vague(label: str) -> bool:
-    L = canon(label)
-    return any(v in L for v in VAGUE) or len(L.split())>4
+def read_text(path: str) -> str:
+    for enc in ("utf-8","latin-1"):
+        try:
+            with open(path,"r",encoding=enc) as f:
+                return f.read()
+        except Exception:
+            continue
+    return ""
 
-def topic_of(prompt: str) -> Optional[str]:
-    t = (prompt or "").lower()
-    if "transla" in t: return "translation"
-    if "transcrip" in t: return "transcription"
-    if "replic" in t: return "replication"
-    if "bond" in t: return "chemical bonds"
-    return None
+def load_corpus(slides_dir: str):
+    texts = []
+    if not os.path.isdir(slides_dir): return texts
+    base = pathlib.Path(slides_dir)
+    for p in base.rglob("*"):
+        if not p.is_file(): continue
+        ext = p.suffix.lower()
+        if ext == ".pdf":
+            t = read_pdf(str(p))
+        elif ext in {".txt",".md",".mdx",".html",".htm"}:
+            t = read_text(str(p))
+        else:
+            t = ""
+        if t and len(t.strip()) > 20:
+            texts.append(t)
+    return texts
 
-# Guardrail keywords for evaluation/fallback
+
+# ---- Slide retrieval for scope ----
+def _split_sentences(text: str):
+    parts = re.split(r"(?<=[\.\!\?])\s+|\n+", text or "")
+    return [re.sub(r"\s+"," ",p).strip() for p in parts if p and len(p.strip()) > 30]
+
+def _tokens_nostop(s: str):
+    STOP = {"the","and","for","that","with","this","from","into","are","was","were","has","have","had","can","will","would","could","should",
+            "a","an","of","in","on","to","by","as","at","or","be","is","it","its","their","our","your","if","when","then","than","but",
+            "we","you","they","which","these","those","there","here","such","may","might","also","very","much","many","most","more","less"}
+    return [t for t in re.findall(r"[A-Za-z0-9']+", (s or "").lower()) if t not in STOP and len(t) > 2]
+
+def _relevance(sent: str, q_tokens):
+    bag = {}
+    for tk in re.findall(r"[A-Za-z0-9']+", sent.lower()):
+        bag[tk] = bag.get(tk,0)+1
+    score = sum(bag.get(q,0) for q in q_tokens)
+    s_low = sent.lower()
+    if len(q_tokens) >= 2 and " ".join(q_tokens[:2]) in s_low:
+        score += 2
+    if sum(1 for q in set(q_tokens) if bag.get(q,0)>0) >= 2:
+        score += 1
+    return score
+
+def build_scope_from_corpus(corpus, prompt: str, limit_chars: int = 6000) -> str:
+    q = _tokens_nostop(prompt)
+    if not q or not corpus:
+        return ""
+    doc_scores = []
+    for doc in corpus:
+        sents = _split_sentences(doc)[:1200]
+        filt = [s for s in sents if any(t in s.lower() for t in q)]
+        sc = sum(_relevance(s, q) for s in filt)
+        if sc > 0 and filt:
+            doc_scores.append((sc, filt))
+    doc_scores.sort(reverse=True, key=lambda x: x[0])
+    matched = []
+    for _, sents in doc_scores[:6]:
+        matched.extend(sents)
+    seen = set(); dedup = []
+    for s in matched:
+        k = s.strip().lower()
+        if k not in seen:
+            seen.add(k); dedup.append(s)
+    return "\n".join(dedup)[:limit_chars]
+
+# ---- Topic guards ----
+def _topic_of(prompt: str) -> str:
+    p = (prompt or "").lower()
+    if "transla" in p: return "translation"
+    if "transcrip" in p: return "transcription"
+    if "replic" in p: return "replication"
+    if "glycolysis" in p: return "glycolysis"
+    if "bond" in p: return "chemical bonds"
+    return ""
+
 CANON = {
     "translation": {
         "Initiation":  ["initiation","start codon","aug","small subunit","shine-dalgarno","kozak","ribosome assembly"],
@@ -206,13 +181,46 @@ CANON = {
     }
 }
 
-def llm_dnd(scope: str, prompt: str) -> Optional[Tuple[str,str,List[str],List[str],Dict[str,str],Dict[str,str]]]:
+def _label_in_scope(label: str, scope: str) -> bool:
+    return label and (label.lower() in (scope or "").lower())
+
+def _is_vague(label: str) -> bool:
+    t = (label or "").strip().lower()
+    return t in {"process","interaction","function","role","category","feature"} or len(t.split())<=1
+
+# ---- OpenAI bridge ----
+def _openai_client_soft():
+    key = os.environ.get("OPENAI_API_KEY","").strip()
+    if not key: return None
+    try:
+        import openai
+        openai.api_key = key
+        return openai
+    except Exception:
+        return None
+
+def _chat_json(system: str, user: str, *, max_tokens=800, temperature=0.45, seed=None):
+    client = _openai_client_soft()
+    if client is None: return None
+    try:
+        resp = client.ChatCompletion.create(
+            model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            max_tokens=max_tokens, temperature=temperature
+        )
+        txt = resp["choices"][0]["message"]["content"]
+        m = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", txt)
+        return json.loads(m.group(0) if m else txt)
+    except Exception:
+        return None
+
+# ---- LLM DnD ----
+def llm_dnd(scope: str, prompt: str):
     if not scope.strip(): return None
-    # Encourage uniqueness with per-run nonce
-    n = nonce()
-    sys = "Generate one unambiguous drag-and-drop activity grounded ONLY in the provided slide excerpts. Never reveal answers."
-    topic = topic_of(prompt)
+    n = new_seed()
+    topic = _topic_of(prompt)
     topic_bins_hint = ", ".join(CANON.get(topic, {}).keys()) if topic else ""
+    sys = "Generate one unambiguous drag-and-drop activity grounded ONLY in the provided slide excerpts. Never reveal answers."
     user = f"""Create ONE classification drag-and-drop for an intro biology student.
 
 STUDENT PROMPT: "{prompt}"
@@ -234,101 +242,50 @@ Return STRICT JSON only:
   "mapping":{{"t1":"B?","t2":"B?","t3":"B?","t4":"B?"}},
   "hints":{{"t1":"hint","t2":"hint","t3":"hint","t4":"hint"}}
 }}"""
-    data = chat_json(sys, user, temperature=0.4, seed=int(time.time())%1_000_000)
+    data = _chat_json(sys, user, temperature=0.4, seed=int(time.time())%1_000_000)
     if not isinstance(data, dict): return None
     bins  = data.get("bins") or []
     terms = data.get("terms") or []
     mapping = data.get("mapping") or {}
     hints = data.get("hints") or {}
-    # structural guards
+
+    # Validate
     if not (isinstance(bins,list) and len(bins)==3): return None
-    if any(is_vague(b) for b in bins): return None
-    if not all(label_in_scope(b, scope) for b in bins): return None
+    if any(_is_vague(b) for b in bins): return None
+    if not all(_label_in_scope(b, scope) for b in bins): return None
     if not (isinstance(terms,list) and len(terms)==4 and all(isinstance(t,str) and 3<=len(t.split())<=8 for t in terms)): return None
     if not (isinstance(mapping,dict) and all(t in mapping and mapping[t] in bins for t in terms)): return None
-    # topic "never wrong" guards
+
+    # Topic guards: translation
     if topic=="translation":
         for t in terms:
-            tl = canon(t)
-            dest = canon(mapping.get(t,""))
+            tl = t.lower()
+            dest = (mapping.get(t,"") or "").lower()
             if "stop codon" in tl and "termin" not in dest and "release" not in dest:
                 return None
             if ("start codon" in tl or "aug" in tl) and "init" not in dest:
                 return None
             if any(k in tl for k in ["peptidyl transferase","translocation","ef-tu","ef g","ef-g"]) and "elong" not in dest:
                 return None
+
     payload = {"bins":bins,"terms":terms,"mapping":mapping}
-    if not remember("dnd", payload):
-        return None
-    return data.get("title") or "Match items to slide-based labels", "Drag each item to the correct category.", bins, terms, mapping, hints
+    # minimal novelty
+    try:
+        seen = st.session_state.get("_seen_dnd", set())
+        dig = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8","ignore")).hexdigest()
+        if dig in seen: return None
+        seen.add(dig); st.session_state["_seen_dnd"] = seen
+    except Exception:
+        pass
 
-def dnd_fallback(prompt: str) -> Tuple[str,str,List[str],List[str],Dict[str,str],Dict[str,str]]:
-    topic = topic_of(prompt) or "translation"
-    rules = CANON.get(topic, {})
-    bins = list(rules.keys())[:3]
-    rng = random.Random(int(time.time()*1000)%1_000_000)
-    # choose one or two phrases per bin; then sample to 4 total
-    pool = []
-    for b, kws in rules.items():
-        # prefer multi-word phrases
-        picks = [k for k in kws if " " in k] or kws
-        rng.shuffle(picks)
-        for k in picks[:2]:
-            pool.append((b, k))
-    rng.shuffle(pool)
-    chosen = pool[:4]
-    terms = [t for _,t in chosen]
-    mapping = {t:b for b,t in chosen}
-    hints = {t:"Use the literal phrase from the slide." for t in terms}
-    return f"Match items for {topic.title()}", "Drag each item to the correct category.", bins, terms, mapping, hints
+    title = data.get("title") or "Match items to slide-based labels"
+    instr = "Match items for " + (topic or "this topic").title()
+    return instr, bins, terms, mapping, hints
 
-# ---------------- DnD EVALUATION (no false negatives) ----------------
-def build_keyword_index(bins: List[str], topic: Optional[str]) -> Dict[str,List[str]]:
-    idx = {}
-    for b in bins:
-        idx[b] = []
-        if topic and topic in CANON and b in CANON[topic]:
-            idx[b] += CANON[topic][b]
-    return idx
-
-def evaluate_dnd(choices: Dict[str,str], mapping: Dict[str,str], bins: List[str], topic: Optional[str]) -> Tuple[int,int,List[str]]:
-    """
-    Compare with normalization + keyword fallback. Returns (correct, total, wrong_terms)
-    A term is marked correct if:
-      - chosen bin == mapping bin after normalization, OR
-      - chosen bin keywords match the term more strongly than other bins (topic guard)
-    """
-    total = len(mapping)
-    wrong = []
-    # normalize baseline mapping
-    nmapping = {canon(t): canon(b) for t,b in mapping.items()}
-    nbins = {canon(b): b for b in bins}
-    kw = build_keyword_index(bins, topic)
-    for t, chosen in choices.items():
-        ct = canon(t)
-        cb = canon(chosen)
-        mb = nmapping.get(ct)
-        if mb == cb:
-            continue
-        # keyword fallback
-        score = {}
-        tl = canon(t)
-        for b, klist in kw.items():
-            score[b] = sum(1 for k in klist if canon(k) in tl)
-        best = None
-        if score:
-            best = max(score, key=lambda x: score[x])
-        if best and canon(best) == cb and score[best] > 0:
-            # accept as correct if selected bin has strictly highest keyword score
-            if list(sorted(score.values()))[-1] > (list(sorted(score.values()))[-2] if len(score)>1 else -1):
-                continue
-        wrong.append(t)
-    return (total - len(wrong)), total, wrong
-
-# ---------------- FITB GENERATION ----------------
-def llm_fitb(scope: str, prompt: str) -> Optional[List[Dict[str,Any]]]:
+# ---- LLM FITB ----
+def llm_fitb(scope: str, prompt: str):
     if not scope.strip(): return None
-    n = nonce()
+    n = new_seed()
     sys = "Generate unique, application-focused FITB items grounded ONLY in the slides. Never reveal answers."
     user = f"""Create 4 Fill-in-the-Blank items for intro biology.
 
@@ -339,12 +296,12 @@ SLIDE EXCERPTS (authoritative):
 \"\"\"
 
 Constraints (ALL) — id:{n}
-- Each item is a SHORT SCENARIO (mutation/inhibitor/condition/experiment) that requires application, not recall.
+- Each item is a SHORT SCENARIO (mutation/inhibitor/experiment) that requires application, not recall.
 - Exactly ONE blank (_____). Answer is ONE WORD (or hyphenated) that appears in the excerpts.
 - 11–20 words; no commas/semicolons.
 - Provide a short hint per item.
 Return STRICT JSON array of 4 objects: {{"stem":"...", "answers":["word"], "hint":"..."}}"""
-    data = chat_json(sys, user, temperature=0.45, seed=int(time.time())%1_000_000)
+    data = _chat_json(sys, user, temperature=0.45, seed=int(time.time())%1_000_000)
     if not isinstance(data, list): return None
     out = []
     low = (scope or "").lower()
@@ -358,98 +315,713 @@ Return STRICT JSON array of 4 objects: {{"stem":"...", "answers":["word"], "hint
         if not ans or not any(a.lower() in low for a in ans): return None
         out.append({"stem": stem, "answers":[ans[0]], "hint": hint})
     if len(out) != 4: return None
-    if not remember("fitb", out): return None
+    # uniqueness
+    try:
+        seen = st.session_state.get("_seen_fitb", set())
+        dig = hashlib.sha1(json.dumps(out, sort_keys=True).encode("utf-8","ignore")).hexdigest()
+        if dig in seen: return None
+        seen.add(dig); st.session_state["_seen_fitb"] = seen
+    except Exception:
+        pass
+    return out
+# ------------------ Topic recognition ------------------
+def classify_topic(prompt: str) -> str:
+    p = (prompt or "").lower()
+    if "organelle" in p or "organelles" in p: return "organelle function"
+    if "replicat" in p: return "dna replication"
+    if "transcription" in p: return "transcription"
+    if "translation" in p: return "translation"
+    if "glycolysis" in p: return "glycolysis"
+    if "membrane" in p or "transport" in p: return "membrane transport"
+    if "protein sorting" in p or "signal sequence" in p or "er signal" in p: return "protein sorting"
+    if "cell cycle" in p or "mitosis" in p: return "cell cycle"
+    return (p.split(",")[0].split(";")[0] or "this topic").strip()
+
+# ------------------ FITB helpers ------------------
+STOP = {"the","and","for","that","with","this","from","into","are","was","were","has","have","had","can","will","would","could","should",
+        "a","an","of","in","on","to","by","as","at","or","be","is","it","its","their","our","your","if","when","then","than","but",
+        "we","you","they","which","these","those","there","here","such","may","might","also","very","much","many","most","more","less"}
+META = {"lecture","slide","slides","figure","fig","table","exam","objective","objectives","learning","homework","quiz","next","previous",
+        "today","describe","how","identify","define","overview","summary"}
+
+def tokenize(s: str):
+    return re.findall(r"[A-Za-z0-9']+", (s or "").lower())
+
+def tokens_nostop(s: str):
+    return [t for t in tokenize(s) if t not in STOP and len(t) > 2]
+
+def split_sentences(text: str):
+    parts = re.split(r"(?<=[\\.\\!\\?])\\s+|\\n+", text)
+    return [re.sub(r"\\s+"," ",p).strip() for p in parts if p and len(p.strip()) > 30]
+
+def relevance(sent: str, q_tokens):
+    bag = {}
+    for tk in tokenize(sent):
+        bag[tk] = bag.get(tk,0)+1
+    score = sum(bag.get(q,0) for q in q_tokens)
+    s_low = sent.lower()
+    if len(q_tokens) >= 2 and " ".join(q_tokens[:2]) in s_low:
+        score += 2
+    return score
+
+def collect_prompt_matched(corpus, prompt: str, top_docs=6, max_sents=800):
+    q = tokens_nostop(prompt)
+    if not q: return []
+    doc_scores = []
+    for doc in corpus:
+        sents = split_sentences(doc)
+        sc = sum(relevance(s, q) for s in sents[:max_sents])
+        if sc > 0:
+            doc_scores.append((sc, sents))
+    doc_scores.sort(reverse=True, key=lambda x: x[0])
+    matched = []
+    for _, sents in doc_scores[:top_docs]:
+        for s in sents:
+            if relevance(s, q) > 0:
+                matched.append(s)
+    return matched
+
+# Acceptance categories and synonyms
+UP = {"increase","increases","increased","up","higher","stabilizes","stabilize","stabilized","faster","more","↑","improves","greater","accumulate","accumulates","builds up","build up"}
+DOWN = {"decrease","decreases","decreased","down","lower","destabilizes","destabilize","destabilized","slower","less","↓","reduces","reduced","loss"}
+NOCH = {"no change","unchanged","same","neutral","nc","~"}
+TRUNC = {"truncated","shorter","premature stop","nonsense","short","truncation"}
+MISLOC = {"mislocalized","wrong location","fails to localize","mislocalization","not targeted"}
+NOINIT = {"no initiation","fails to initiate","cannot start","no start","initiation blocked","no transcription","no translation"}
+NOELON = {"no elongation","elongation blocked","stalled elongation","cannot elongate"}
+NOTERM = {"no termination","termination blocked","fails to terminate","readthrough","no stop"}
+FRAME = {"frameshift","shifted frame","reading frame shift","out of frame"}
+
+def norm_text(s: str) -> str:
+    s=(s or "").strip().lower()
+    s=re.sub(r"[^a-z0-9\s\-\+]", "", s)
+    s=re.sub(r"\s+", " ", s)
+    return s
+
+def matches_label(user: str, key: str) -> bool:
+    u = norm_text(user)
+    if key == "increase":   return any(x in u for x in UP)
+    if key == "decrease":   return any(x in u for x in DOWN)
+    if key == "no_change":  return any(x in u for x in NOCH)
+    if key == "truncated":  return any(x in u for x in TRUNC)
+    if key == "mislocalized": return any(x in u for x in MISLOC)
+    if key == "no_initiation": return any(x in u for x in NOINIT)
+    if key == "no_elongation": return any(x in u for x in NOELON)
+    if key == "no_termination": return any(x in u for x in NOTERM)
+    if key == "frameshift": return any(x in u for x in FRAME)
+    return False
+
+# Specific-answer acceptance with synonyms + targeted hints
+SYNONYMS = {
+    "endoplasmic reticulum": {"er","endoplasmic reticulum","rough er","smooth er"},
+    "rough endoplasmic reticulum": {"rough er","rer","rough endoplasmic reticulum"},
+    "smooth endoplasmic reticulum": {"smooth er","ser","smooth endoplasmic reticulum"},
+    "mitochondrial matrix": {"mitochondrial matrix","matrix (mitochondrion)","matrix"},
+    "cytosol": {"cytosol","cytoplasm"},
+    "nucleus": {"nucleus","nuclear compartment"},
+    "golgi apparatus": {"golgi","golgi apparatus"},
+    "lysosome": {"lysosome"},
+    "peroxisome": {"peroxisome"},
+    "chloroplast": {"chloroplast"},
+    "rna polymerase ii": {"rna polymerase ii","pol ii","rna pol ii","rna polymerase"},
+    "helicase": {"helicase"},
+    "primase": {"primase"},
+    "dna polymerase": {"dna polymerase"},
+    "dna ligase": {"dna ligase","ligase"},
+    "ribosome p site": {"p site","ribosome p site"},
+    "ribosome a site": {"a site","ribosome a site"},
+    "peptidyl transferase center": {"peptidyl transferase center","ptc"},
+    "release factor": {"release factor","rf"},
+    "pyruvate": {"pyruvate","pyruvic acid"},
+    "spontaneous": {"spontaneous","passive"},
+    "energy-dependent": {"energy-dependent","active","requires atp","active transport"},
+    "glycolysis location": {"cytosol","cytoplasm"},
+}
+
+SPECIFIC_HINTS = {
+    "mitochondrial matrix": "Innermost mitochondrial compartment (inside inner membrane) where TCA enzymes reside.",
+    "endoplasmic reticulum": "Organelle contiguous with the nuclear envelope; entry point for secretory proteins.",
+    "rough endoplasmic reticulum": "Membrane with bound ribosomes; co‑translational entry for secreted/membrane proteins.",
+    "smooth endoplasmic reticulum": "Ribosome‑free ER region; lipid synthesis and detoxification.",
+    "nucleus": "Double membrane with pores; houses DNA and nucleolus.",
+    "cytosol": "Aqueous compartment outside organelles; most glycolysis steps happen here.",
+    "golgi apparatus": "Stacked cisternae that modify and sort proteins after ER.",
+    "lysosome": "Acidic lumen with hydrolases for macromolecule breakdown.",
+    "peroxisome": "Oxidative organelle; detoxifies H2O2 and oxidizes very‑long‑chain fatty acids.",
+    "chloroplast": "Plant organelle with thylakoids; performs photosynthesis.",
+    "rna polymerase ii": "Eukaryotic polymerase for mRNA; works in the nucleus.",
+    "helicase": "Unwinds DNA by breaking hydrogen bonds at the fork.",
+    "primase": "Synthesizes short RNA primers to start DNA synthesis.",
+    "dna polymerase": "Extends DNA from a primer; requires 3′‑OH.",
+    "dna ligase": "Forms phosphodiester bonds to seal nicks.",
+    "ribosome p site": "Ribosomal site holding peptidyl‑tRNA (growing chain).",
+    "ribosome a site": "Ribosomal site accepting incoming aminoacyl‑tRNA.",
+    "peptidyl transferase center": "Catalyzes peptide bond formation in the large subunit.",
+    "release factor": "Recognizes stop codon and promotes termination.",
+    "pyruvate": "Three‑carbon product that feeds the TCA cycle under aerobic conditions.",
+    "spontaneous": "Occurs down a gradient without ATP input.",
+    "energy-dependent": "Requires ATP hydrolysis or an equivalent energy source.",
+}
+
+def normalize_answer(a: str) -> str:
+    a = norm_text(a)
+    return a
+
+def matches_specific(user: str, answers: List[str]) -> bool:
+    u = normalize_answer(user)
+    for ans in answers:
+        norm_ans = normalize_answer(ans)
+        if u == norm_ans:
+            return True
+        if ans in SYNONYMS:
+            if u in {normalize_answer(x) for x in SYNONYMS[ans]}:
+                return True
+    return False
+
+def specific_hint_for_answer(ans: str) -> str:
+    a = ans.lower()
+    if a in SPECIFIC_HINTS:
+        return SPECIFIC_HINTS[a]
+    # heuristic fallbacks
+    if "matrix" in a and "mitochond" in a:
+        return "Innermost mitochondrial space enclosed by the inner membrane."
+    if "endoplasmic reticulum" in a or a.endswith(" er"):
+        return "Membranous network near nucleus; entry to the secretory pathway."
+    if "cytosol" in a or "cytoplasm" in a:
+        return "Fluid compartment outside organelles."
+    if "nucleus" in a:
+        return "Double membrane with pores; DNA location."
+    return "Use the most specific biological term for the location or component."
+
+# FITB stems (mix of reasoning + specific recall)
+def extract_focus(stem: str) -> str:
+    s = stem.lower()
+    m = re.search(r"if ([^,]+?) (is|cannot|can't|does not|doesn't|fails|fail)", s)
+    if m: return m.group(1).strip()
+    m = re.search(r"without ([^,]+?)[, ]", s)
+    if m: return m.group(1).strip()
+    return ""
+
+def fallback_hint_fitb(stem: str, key: str, topic: str, rng: random.Random) -> str:
+    focus = extract_focus(stem) or "that step"
+    t = (topic or "this topic").lower()
+    H = {
+        "increase": [
+            f"What product rises first if {focus} speeds up?",
+            f"Which immediate output would go up with faster {focus}?",
+            f"What accumulates right after {focus} accelerates?",
+        ],
+        "decrease": [
+            f"What drops first if {focus} is blocked?",
+            f"Which product would fall immediately with loss of {focus}?",
+            f"What output becomes limiting when {focus} slows?",
+        ],
+        "no_change": [
+            f"Would the immediate output actually change if {focus} is altered? Why or why not?",
+            f"Does {focus} directly control the next product here?",
+            f"Is this step upstream or downstream of the measured output?",
+        ],
+        "mislocalized": [
+            f"Where would the product go without correct targeting at {focus}?",
+            f"What compartment would the protein reach if {focus} is missing?",
+            f"Which location is lost when {focus} fails?",
+        ],
+        "no_initiation": [
+            f"What is the very first event that fails when {focus} is absent?",
+            f"What never starts if {focus} cannot occur?",
+            f"What initial assembly is missing without {focus}?",
+        ],
+        "no_elongation": [
+            f"What step at the machine stalls when {focus} cannot proceed?",
+            f"What movement along the template stops if {focus} fails?",
+            f"What chain-building step halts when {focus} is blocked?",
+        ],
+        "no_termination": [
+            f"What signal fails to be recognized at the end when {focus} is missing?",
+            f"What release event won’t happen if {focus} is absent?",
+            f"What keeps going past the endpoint when {focus} fails?",
+        ],
+        "truncated": [
+            f"What would make the product end prematurely if {focus} occurs?",
+            f"What feature shortens the product when {focus} happens?",
+            f"Why would the product stop early with {focus}?",
+        ],
+        "frameshift": [
+            f"Which reading position changes when {focus} occurs?",
+            f"What happens to downstream codons after {focus}?",
+            f"How would the grouping of symbols change if {focus} happens?",
+        ],
+    }
+    if "transcription" in t:
+        H["no_initiation"].append(f"What fails at the promoter when {focus} is absent?")
+        H["decrease"].append(f"Which RNA product falls first if {focus} is blocked?")
+    if "translation" in t:
+        H["no_elongation"].append(f"What happens at the ribosome when {focus} stalls?")
+        H["no_termination"].append(f"What occurs to the polypeptide if {focus} is missing?")
+    if "replication" in t:
+        H["decrease"].append(f"What happens to fork progression if {focus} is lost?")
+        H["no_initiation"].append(f"What starting event at origins fails without {focus}?")
+    if "glycolysis" in t:
+        H["increase"].append(f"Which metabolite builds up first if {focus} speeds up?")
+        H["decrease"].append(f"Which product falls first when {focus} is inhibited?")
+    bank = H.get(key, [f"Focus on the immediate effect of {focus}."])
+    return rng.choice(bank)
+
+def specific_fitb_items(topic: str) -> List[Dict]:
+    t = topic.lower()
+    items = []
+    if "glycolysis" in t:
+        items.append({"stem":"Glycolysis primarily occurs in the ______ of eukaryotic cells.","answers":["cytosol","glycolysis location"],"hint":"Think compartment: not membrane‑bound, enzyme‑rich fluid."})
+        items.append({"stem":"The end product of glycolysis is ______.","answers":["pyruvate"],"hint":"Three‑carbon product feeding the TCA cycle when oxygen is present."})
+    if "transcription" in t:
+        items.append({"stem":"Which enzyme synthesizes mRNA in eukaryotes? ______.","answers":["rna polymerase ii"],"hint":"Eukaryotic polymerase for mRNA; often abbreviated Pol II."})
+        items.append({"stem":"Transcription in eukaryotes occurs in the ______.","answers":["nucleus"],"hint":"Compartment with nuclear pores and chromatin."})
+    if "translation" in t:
+        items.append({"stem":"The growing polypeptide is held at the ribosomal ______ site.","answers":["ribosome p site"],"hint":"Not the A site; this one holds the peptidyl‑tRNA."})
+        items.append({"stem":"Secretory proteins often begin translation on ribosomes bound to the ______.","answers":["rough endoplasmic reticulum","endoplasmic reticulum"],"hint":"Membrane with ribosomes at the entry of the secretory pathway."})
+    if "replication" in t:
+        items.append({"stem":"The enzyme that unwinds DNA at the replication fork is ______.","answers":["helicase"],"hint":"Breaks hydrogen bonds between base pairs."})
+    if "membrane transport" in t:
+        items.append({"stem":"Simple diffusion is ______ (spontaneous or energy‑dependent?).","answers":["spontaneous"],"hint":"Occurs down a gradient without ATP input."})
+        items.append({"stem":"Pumps that move solutes up their gradient are ______ (spontaneous or energy‑dependent?).","answers":["energy-dependent"],"hint":"Require ATP directly or indirectly."})
+    if "protein sorting" in t:
+        items.append({"stem":"Proteins entering the secretory pathway are first threaded into the ______.","answers":["endoplasmic reticulum","rough endoplasmic reticulum"],"hint":"SRP targets ribosomes here for co‑translational import."})
+    if "organelle" in t:
+        items.append({"stem":"Most cellular ATP is produced in the ______ (be specific).","answers":["mitochondrial matrix"],"hint":"Innermost mitochondrial compartment with TCA enzymes."})
+    return items
+
+def reasoning_fitb_items(topic: str) -> List[Dict]:
+    stems = []
+    stems.append((f"If a key step in {topic} is blocked, the immediate output would ______.", "decrease"))
+    stems.append((f"If a rate‑limiting step in {topic} speeds up, the near‑term output would ______.", "increase"))
+    tp = topic.lower()
+    if "transcription" in tp:
+        stems.append(("If capping fails, transcript stability would ______.", "decrease"))
+    elif "translation" in tp:
+        stems.append(("If the ribosome cannot move forward, elongation would ______.", "no_elongation"))
+    elif "replication" in tp:
+        stems.append(("If helicase does not load, fork progression would ______.", "decrease"))
+    elif "glycolysis" in tp:
+        stems.append(("If NAD+ is unavailable, glyceraldehyde‑3‑phosphate would ______.", "increase"))
+    elif "membrane transport" in tp:
+        stems.append(("If an ATP‑driven pump stops, the gradient would ______.", "decrease"))
+    elif "protein sorting" in tp:
+        stems.append(("If a signal sequence is missing, the protein would be ______.", "mislocalized"))
+    elif "cell cycle" in tp:
+        stems.append(("If the spindle checkpoint stays active, anaphase onset would ______.", "decrease"))
+    out = [{"stem": s, "label": k} for s,k in stems]
     return out
 
-def fitb_fallback(prompt: str) -> List[Dict[str,Any]]:
-    t = (prompt or "").lower()
-    rng = random.Random(int(time.time()*1000)%1_000_000)
-    if "replic" in t:
-        pool = [
-            {"stem":"A helicase inhibitor collapses the replication _____ under stress.","answers":["fork"],"hint":"Unwinding is blocked."},
-            {"stem":"Without primase, synthesis stalls on the _____ strand.","answers":["lagging"],"hint":"Requires many primers."},
-            {"stem":"Ligase loss leaves unsealed _____ after fragment synthesis.","answers":["nicks"],"hint":"Backbone joining."},
-            {"stem":"If proofreading falters, the _____ rate rises in S phase.","answers":["mutation"],"hint":"Fidelity issue."},
-        ]
-    elif "transla" in t:
-        pool = [
-            {"stem":"Release factors absent? The nascent chain will not _____ at a stop codon.","answers":["release"],"hint":"Termination step."},
-            {"stem":"EF-G frozen by drug: ribosome _____ stops on mRNA.","answers":["translocation"],"hint":"Movement step."},
-            {"stem":"A start-codon mutation most directly prevents ribosome _____ .","answers":["initiation"],"hint":"Start-site selection."},
-            {"stem":"Wrong anticodon disrupts accurate codon _____ during decoding.","answers":["recognition"],"hint":"Matching step."},
-        ]
-    elif "bond" in t:
-        pool = [
-            {"stem":"In high salt, _____ interactions between charged side chains weaken.","answers":["ionic"],"hint":"Charge screening."},
-            {"stem":"Heating a protein mostly weakens _____ bonds stabilizing secondary structure.","answers":["hydrogen"],"hint":"Helices/sheets."},
-            {"stem":"A peptide linkage is a type of _____ bond.","answers":["covalent"],"hint":"Backbone link."},
-            {"stem":"DNA’s backbone is connected by _____ linkages.","answers":["phosphodiester"],"hint":"Nucleotide connection."},
-        ]
-    else:
-        pool = [
-            {"stem":"If a channel is blocked, _____ diffusion falls across the membrane.","answers":["facilitated"],"hint":"Through pores."},
-            {"stem":"ATP depletion halts primary active _____ by pumps.","answers":["transport"],"hint":"Energy dependence."},
-            {"stem":"A carrier stuck in one state cannot undergo _____ access.","answers":["alternating"],"hint":"Transport cycle."},
-            {"stem":"Hypertonic medium causes water _____ from the cell.","answers":["efflux"],"hint":"Osmosis direction."},
-        ]
-    rng.shuffle(pool)
-    return pool[:4]
+def build_fitb(topic: str, rng: random.Random) -> List[Dict]:
+    corpus = st.session_state.get("corpus", [])
+    prompt = st.session_state.get("prompt", topic)
+    scope = build_scope_from_corpus(corpus, prompt)
+    out = llm_fitb(scope, prompt)
+    if out:
+        return out
+    # fallback:
+    items = []
+    specific = specific_fitb_items(topic)
+    rng.shuffle(specific)
+    items.extend(specific[:rng.choice([1,2])])
+    reason = reasoning_fitb_items(topic)
+    rng.shuffle(reason)
+    items.extend(reason[:2])
+    rng.shuffle(items)
+    return items[:4]
 
-# ---------------- UI ----------------
-prompt = st.text_input("Enter a topic (e.g., DNA replication, Translation, Chemical bonds)")
-if st.button("Generate"):
-    with st.spinner("Building slide scope and activities..."):
-        scope, refs = build_scope(prompt or "")
-        # DnD
-        dnd = llm_dnd(scope, prompt or "") or dnd_fallback(prompt or "")
-        title, instr, bins, terms, mapping, hints = dnd
-        # FITB
-        fitb = llm_fitb(scope, prompt or "") or fitb_fallback(prompt or "")
-
-    # Render DnD
-    st.subheader("Activity 1: Drag and Drop")
-    st.markdown(f"**{title}**")
-    st.caption("Drag each item to the correct category.")
-    cols = st.columns(len(bins))
-    placements = {}
-    for t in terms:
-        placements[t] = st.selectbox(f"Place: {t}", options=["—"]+bins, key=f"dnd_{sha(t)}")
-        if st.button(f"Hint: {t}", key=f"hint_{sha(t)}"):
-            st.info(hints.get(t,"Re-read the slide text."))
-    if st.button("Check bins"):
-        correct, total, wrong = evaluate_dnd(placements, mapping, bins, topic_of(prompt))
-        if correct == total:
-            st.success("All bins correct! 🎉")
+# ------------------ DnD generators ------------------
+def organelle_pairs(rng: random.Random) -> Tuple[str, list, list, dict, dict]:
+    bank = [
+        ("Nucleus","DNA is housed; transcription occurs"),
+        ("Mitochondrion","Most ATP is made via oxidative phosphorylation"),
+        ("Rough ER","Ribosome‑bound synthesis of secreted/membrane proteins"),
+        ("Smooth ER","Lipid synthesis and detox; Ca²⁺ storage"),
+        ("Golgi apparatus","Proteins are modified and sorted (e.g., glycosylation)"),
+        ("Lysosome","Macromolecules are degraded by acid hydrolases"),
+        ("Peroxisome","Peroxide detox and very‑long‑chain fatty acid oxidation"),
+        ("Chloroplast","Light‑driven sugar production (photosynthesis)"),
+    ]
+    rng.shuffle(bank)
+    pairs = bank[:rng.choice([3,4])]
+    labels = [org for org,_ in pairs]
+    terms  = [fn for _,fn in pairs]
+    answer = {fn: org for (org,fn) in pairs}
+    hint_map = {}
+    for org, fn in pairs:
+        if org == "Mitochondrion":
+            hint_map[fn] = "Which organelle has cristae and its own DNA, central to aerobic ATP production?"
+        elif org == "Nucleus":
+            hint_map[fn] = "Which compartment contains chromatin and nucleolus and is bounded by a double membrane?"
+        elif org == "Rough ER":
+            hint_map[fn] = "Which organelle is studded with ribosomes and feeds proteins into the secretory pathway?"
+        elif org == "Smooth ER":
+            hint_map[fn] = "Which organelle lacks ribosomes and is key for lipid synthesis and detoxification?"
+        elif org == "Golgi apparatus":
+            hint_map[fn] = "Which organelle modifies and sorts proteins in cisternae before shipping them?"
+        elif org == "Lysosome":
+            hint_map[fn] = "Which acidic compartment contains hydrolases for breakdown of macromolecules?"
+        elif org == "Peroxisome":
+            hint_map[fn] = "Which organelle handles H₂O₂ detox and very‑long‑chain fatty acids?"
+        elif org == "Chloroplast":
+            hint_map[fn] = "Which plant organelle with thylakoids captures light energy to make sugars?"
         else:
-            st.error(f"{correct}/{total} correct — try again.")
-            if wrong:
-                st.caption("Consider these again: " + ", ".join(wrong))
+            hint_map[fn] = "Match the function to the specific organelle known for it."
+    instr = "Match each **function** to its **organelle**."
+    return instr, labels, terms, answer, hint_map
 
-    st.divider()
+def order_pairs(topic: str) -> Tuple[str, list, list, dict, dict]:
+    t = topic.lower()
+    if "replication" in t:
+        steps = ["Helicase unwinds DNA at origin","Primase lays RNA primers","DNA polymerase extends new strands","Ligase seals nicks to finish"]
+        title = "Put the **DNA replication** steps in order."
+    elif "transcription" in t:
+        steps = ["RNA polymerase binds promoter","RNA synthesis begins (initiation)","RNA chain extends (elongation)","Termination releases RNA"]
+        title = "Put the **transcription** steps in order."
+    elif "translation" in t:
+        steps = ["Ribosome assembles at start codon","Initiator tRNA occupies P site","Peptide bonds form (elongation)","Stop codon triggers release"]
+        title = "Put the **translation** steps in order."
+    elif "glycolysis" in t:
+        steps = ["Glucose is phosphorylated","PFK‑1 commits pathway (F1,6BP forms)","ATP and NADH are generated","Pyruvate is produced"]
+        title = "Put the **glycolysis** steps in order."
+    else:
+        steps = ["Process begins","Key intermediate forms","Main product accumulates","Process completes"]
+        title = f"Put the **{topic}** steps in order."
+    k = len(steps)
+    labels = [f"Step {i}" for i in range(1, k+1)]
+    terms = steps[:]
+    answer = {steps[i]: f"Step {i+1}" for i in range(k)}
+    hint_map = {}
+    for i, s in enumerate(steps):
+        if i == 0:
+            hint_map[s] = "Which step happens first before any downstream components can act?"
+        elif i == k-1:
+            hint_map[s] = "Which step can only happen after everything else is complete?"
+        else:
+            hint_map[s] = "Which step requires the product of the previous step but precedes the next one?"
+    return title, labels, terms, answer, hint_map
 
-    # Render FITB
-    st.subheader("Activity 2: Fill in the Blank")
-    for i,it in enumerate(fitb, start=1):
-        st.markdown(f"**Q{i}.** {it['stem']}")
-        ans = st.text_input("Your answer:", key=f"fitb_{i}")
-        if st.button(f"Hint for Q{i}", key=f"fitb_hint_{i}"):
-            st.info(it.get("hint",""))
-        if st.button(f"Check Q{i}", key=f"fitb_check_{i}"):
-            exp = [a.lower().replace("’","'").strip() for a in it.get("answers",[])]
-            user = (ans or "").lower().replace("’","'").strip()
-            # small normalization for 5'/3'
-            user_n = user.replace("5'", "5prime").replace("3'", "3prime")
-            exp_n  = [a.replace("5'", "5prime").replace("3'", "3prime") for a in exp]
-            ok = (user in exp) or (user_n in exp_n)
-            if ok:
-                st.success("That’s right! 🎉")
-            else:
-                st.warning("Not quite. Think about the scenario and which mechanism step changes.")
+def glycolysis_pairs(rng: random.Random) -> Tuple[str, list, list, dict, dict]:
+    """Glycolysis-specific matching: enzyme/component → function (unambiguous)."""
+    pairs = [
+        ("Hexokinase","Phosphorylates glucose in the first step"),
+        ("Phosphofructokinase‑1 (PFK‑1)","Commits pathway by converting F6P to F1,6BP"),
+        ("Glyceraldehyde‑3‑phosphate dehydrogenase (GAPDH)","Generates NADH from G3P"),
+        ("Pyruvate kinase","Produces ATP while forming pyruvate"),
+    ]
+    rng.shuffle(pairs)
+    pairs = pairs[:rng.choice([3,4])]
+    labels = [p for p,_ in pairs]
+    terms = [f for _,f in pairs]
+    answer = {f: p for (p,f) in pairs}
+    hint_map = {}
+    for p,f in pairs:
+        if "Hexokinase" in p:
+            hint_map[f] = "Which enzyme acts first, trapping glucose in the cell as a phosphate ester?"
+        elif "PFK‑1" in p:
+            hint_map[f] = "Which enzyme controls the commitment step and is allosterically regulated by ATP/AMP?"
+        elif "GAPDH" in p:
+            hint_map[f] = "Which enzyme uses inorganic phosphate and reduces NAD+ during glycolysis?"
+        elif "Pyruvate kinase" in p:
+            hint_map[f] = "Which enzyme catalyzes a substrate‑level phosphorylation to make ATP at the end?"
+        else:
+            hint_map[f] = "Match the function to the enzyme’s key hallmark in glycolysis."
+    instr = "Match each **glycolytic enzyme** to its **function**."
+    return instr, labels, terms, answer, hint_map
 
-    # References
-    if refs:
-        by = {}
-        for f,p in refs:
-            by.setdefault(f, set()).add(p)
-        refs_str = " | ".join(f"{f.split('/')[-1]} p.{', '.join(str(x) for x in sorted(ps))}" for f,ps in by.items())
-        st.caption("Source slides: " + refs_str)
+def protein_function_pairs(topic: str) -> Tuple[str, list, list, dict, dict]:
+    t = topic.lower()
+    if "replication" in t:
+        pairs = [("Helicase","Unwinds parental DNA strands"),("Primase","Synthesizes short RNA primers"),("DNA polymerase","Extends DNA from primers"),("DNA ligase","Seals nicks between fragments")]
+        title = "Match each **protein** to its **function** (DNA replication)."
+    elif "transcription" in t:
+        pairs = [("RNA polymerase II","Synthesizes mRNA from DNA template"),("General TFs","Help polymerase bind promoter/start"),("Spliceosome","Removes introns from pre‑mRNA"),("Capping enzymes","Add 5′ cap to pre‑mRNA")]
+        title = "Match each **protein/complex** to its **function** (transcription)."
+    elif "translation" in t:
+        pairs = [("Ribosome P site","Holds peptidyl‑tRNA"),("Ribosome A site","Accepts aminoacyl‑tRNA"),("Peptidyl transferase center","Forms peptide bonds"),("Release factor","Recognizes stop codon; terminates")]
+        title = "Match each **component** to its **function** (translation)."
+    elif "membrane transport" in t:
+        pairs = [("ATP‑driven pump","Moves solutes against gradient using ATP"),("Channel protein","Allows passive ion flow down gradient"),("Carrier (uniporter)","Facilitates diffusion of one solute"),("Symporter","Cotransports two solutes in same direction")]
+        title = "Match each **transport protein** to its **function**."
+    else:
+        pairs = [("Enzyme","Catalyzes a specific reaction"),("Receptor","Binds ligand to start a signal"),("Channel","Allows ions to pass"),("Motor protein","Generates movement")]
+        title = "Match each **protein type** to its **function**."
+    rng = random.Random(new_seed())
+    rng.shuffle(pairs)
+    pairs = pairs[:rng.choice([3,4])]
+    labels = [p for p,_ in pairs]
+    terms = [f for _,f in pairs]
+    answer = {f: p for (p,f) in pairs}
+    hint_map = {}
+    for p,f in pairs:
+        if p == "Helicase":
+            hint_map[f] = "Which protein breaks hydrogen bonds at the fork?"
+        elif p == "Primase":
+            hint_map[f] = "Which enzyme lays down short RNA to begin synthesis?"
+        elif p == "DNA polymerase":
+            hint_map[f] = "Which enzyme extends DNA but needs a primer?"
+        elif p == "DNA ligase":
+            hint_map[f] = "Which enzyme forms phosphodiester bonds to seal nicks?"
+        elif p == "RNA polymerase II":
+            hint_map[f] = "Which polymerase makes mRNA in eukaryotes?"
+        elif p == "General TFs":
+            hint_map[f] = "Which factors position polymerase at the promoter?"
+        elif p == "Spliceosome":
+            hint_map[f] = "Which complex recognizes intron boundaries?"
+        elif p == "Capping enzymes":
+            hint_map[f] = "Which enzymes add a protective 5′ modification?"
+        elif p == "Ribosome P site":
+            hint_map[f] = "Which ribosomal site holds the growing chain?"
+        elif p == "Ribosome A site":
+            hint_map[f] = "Which site accepts the incoming charged tRNA?"
+        elif p == "Peptidyl transferase center":
+            hint_map[f] = "Which catalytic center forms the bond between amino acids?"
+        elif p == "Release factor":
+            hint_map[f] = "Which factor recognizes a stop codon to end synthesis?"
+        elif p == "ATP‑driven pump":
+            hint_map[f] = "Which transporter consumes ATP to move solutes uphill?"
+        elif p == "Channel protein":
+            hint_map[f] = "Which pathway allows ions to flow without binding/transport cycles?"
+        elif p == "Carrier (uniporter)":
+            hint_map[f] = "Which transporter binds a single solute and flips conformation?"
+        elif p == "Symporter":
+            hint_map[f] = "Which transporter couples two solutes in the same direction?"
+        else:
+            hint_map[f] = "Focus on the defining feature of this protein's role."
+    return title, labels, terms, answer, hint_map
+
+def build_dnd_activity(topic: str) -> Tuple[str, list, list, dict, dict]:
+    rng = random.Random(new_seed())
+    t = topic.lower()
+    if "organelle" in t:
+        return organelle_pairs(rng)
+    if "glycolysis" in t:
+        mode = rng.choice(["order","match"])
+        if mode == "order":
+            return order_pairs(topic)
+        else:
+            return glycolysis_pairs(rng)
+    if any(x in t for x in ["replication","transcription","translation","membrane transport"]):
+        mode = rng.choice(["order","match"])
+        if mode == "order":
+            return order_pairs(topic)
+        else:
+            return protein_function_pairs(topic)
+    return protein_function_pairs(topic)
+
+# ------------------ UI ------------------
+st.title("Let's Practice Biology!")
+prompt = st.text_input(
+    "Enter a topic for review and press generate:",
+    value="",
+    placeholder="e.g., organelle function, glycolysis, transcription…",
+    label_visibility="visible",
+)
+
+if st.button("Generate"):
+    if "corpus" not in st.session_state:
+        st.session_state.corpus = load_corpus(SLIDES_DIR)
+    st.session_state.prompt = prompt
+    topic = classify_topic(prompt) or "this topic"
+    st.session_state.topic = topic
+
+    # Build Drag-and-Drop first (Activity 1)
+    instr, labels, terms, answer, hint_map = build_dnd_activity(topic)
+    st.session_state.dnd_instr = instr
+    st.session_state.drag_labels = labels
+    st.session_state.drag_bank   = terms
+    st.session_state.drag_answer = answer
+    st.session_state.dnd_hints   = hint_map
+
+    # Build FITB (Activity 2) with mixed formats
+    rng = random.Random(new_seed())
+    st.session_state.fitb = build_fitb(topic, rng)
+
+    st.success("Generated fresh activities.")
+
+# -------- Activity 1: Drag-and-Drop --------
+if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","dnd_instr","dnd_hints"]):
+    st.markdown("## Activity 1: Drag and Drop")
+    topic = st.session_state.get("topic","this topic")
+    labels = st.session_state.drag_labels
+    terms  = st.session_state.drag_bank
+    answer = st.session_state.drag_answer
+    hint_map = st.session_state.dnd_hints
+    st.markdown(f"{st.session_state.dnd_instr}")
+
+    items_html = "".join([f'<li class="card" draggable="true">{t}</li>' for t in terms])
+    cols_count = (len(labels)+1)//2 if len(labels) > 2 else 2
+    bins_html = "".join([
+        f"""
+        <div class="bin">
+          <div class="title">{lbl}</div>
+          <ul id="bin_{i}" class="droplist"></ul>
+        </div>
+        """ for i,lbl in enumerate(labels)
+    ])
+
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+      <style>
+        * {{ box-sizing: border-box; }}
+        body {{ -webkit-user-select: none; -moz-user-select: none; user-select: none; margin:0; padding:0; }}
+        .bank, .bin {{
+          border: 2px dashed #bbb; border-radius: 10px; padding: 10px; min-height: 110px;
+          background: #fafafa; margin-bottom: 8px;
+        }}
+        .bin {{ background: #f6faff; }}
+        .droplist {{ list-style: none; margin: 0; padding: 0; min-height: 80px; }}
+        .card {{
+          background: white; border: 1px solid #ddd; border-radius: 8px;
+          padding: 8px 10px; margin: 6px 0; cursor: grab;
+          box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+          -webkit-user-drag: element;
+        }}
+        .card:active {{ cursor: grabbing; }}
+        .ghost {{ opacity: 0.5; }}
+        .chosen {{ outline: 2px solid #7aa2f7; }}
+        .zone {{ display:flex; gap:14px; }}
+        .left {{ flex: 1; }}
+        .right {{ flex: 2; display:grid; grid-template-columns: repeat({cols_count}, 1fr); gap:14px; }}
+        .title {{ font-weight: 600; margin-bottom: 6px; user-select: none; -webkit-user-select: none; }}
+        .ok   {{ color:#0a7; font-weight:600; }}
+        .bad  {{ color:#b00; font-weight:600; }}
+        .controls {{ margin-top: 6px; }}
+        button {{
+          border-radius: 8px; border: 1px solid #ddd; background:#fff; padding:8px 12px; cursor:pointer;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="zone">
+        <div class="left">
+          <div class="title">Bank</div>
+          <ul id="bank" class="bank droplist">{items_html}</ul>
+          <div class="controls">
+            <button id="check">Check bins</button>
+            <span id="score" style="margin-left:10px;"></span>
+          </div>
+        </div>
+        <div class="right">{bins_html}</div>
+      </div>
+      <script>
+        const LABELS = {json.dumps(labels)};
+        const ANSWERS = {json.dumps(answer)};
+
+        const opts = {{
+          group: {{ name: 'bins', pull: true, put: true }},
+          animation: 150,
+          forceFallback: true,
+          fallbackOnBody: true,
+          swapThreshold: 0.65,
+          emptyInsertThreshold: 8,
+          ghostClass: 'ghost',
+          chosenClass: 'chosen',
+        }};
+
+        const lists = [document.getElementById('bank')];
+        LABELS.forEach((_, i) => lists.push(document.getElementById('bin_'+i)));
+        lists.forEach(el => new Sortable(el, opts));
+
+        function readBins() {{
+          const bins = {{}};
+          LABELS.forEach((label, i) => {{
+            const ul = document.getElementById('bin_'+i);
+            const items = Array.from(ul.querySelectorAll('.card')).map(li => li.textContent.trim());
+            bins[label] = items;
+          }});
+          return bins;
+        }}
+
+        document.getElementById('check').addEventListener('click', () => {{
+          const bins = readBins();
+          let total = 0, correct = 0;
+          for (const [term, want] of Object.entries(ANSWERS)) {{
+            total += 1;
+            let got = "Bank";
+            for (const [label, items] of Object.entries(bins)) {{
+              if (items.includes(term)) {{ got = label; break; }}
+            }}
+            if (got === want) correct += 1;
+          }}
+          const score = document.getElementById('score');
+          if (total === 0) {{
+            score.innerHTML = "<span class='bad'>Drag items into bins first.</span>";
+          }} else if (correct === total) {{
+            score.innerHTML = "<span class='ok'>All bins correct! 🎉</span>";
+          }} else {{
+            score.innerHTML = "<span class='bad'>" + correct + "/" + total + " correct — try adjusting and re-check.</span>";
+          }}
+        }});
+      </script>
+    </body>
+    </html>
+    """
+    st.components.v1.html(html, height=560, scrolling=True)
+    st.markdown("<div style='margin-top:-6px'></div>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns([1,3])
+    with c1:
+        chosen_item = st.selectbox("Hint for:", ["(choose…)"] + terms, index=0, key="dnd_hint_select")
+    with c2:
+        if chosen_item != "(choose…)":
+            target_bin = answer.get(chosen_item, "the correct category")
+            fb = hint_map.get(chosen_item, "Focus on the most distinctive clue in this item.")
+            st.info(llm_hint_for_dnd(chosen_item, target_bin, labels, topic, fb))
+
+# -------- Activity 2: FITB --------
+if "fitb" in st.session_state:
+    st.markdown("---")
+    topic_name = st.session_state.get("topic","this topic")
+    st.markdown("## Activity 2: Fill in the Blank")
+    st.markdown(f"Use your knowledge of **{topic_name}** to answer the following.")
+
+    rng = random.Random(new_seed())
+    for idx, item in enumerate(st.session_state.fitb):
+        u = st.text_input(item["stem"], key=f"fitb_{idx}")
+        col1, col2, col3 = st.columns([1,1,1])
+        with col1:
+            if st.button("Hint", key=f"hint_{idx}"):
+                if "answers" in item:
+                    target = item["answers"][0]
+                    fb = specific_hint_for_answer(target)
+                    st.info(llm_hint_for_fitb(item["stem"], target, topic_name, fb))
+                else:
+                    st.info(llm_hint_for_fitb(item["stem"], item["label"], topic_name, fallback_hint_fitb(item["stem"], item["label"], topic_name, rng)))
+        with col2:
+            if st.button("Check", key=f"check_{idx}"):
+                ok = False
+                if "answers" in item:
+                    ok = matches_specific(u, item["answers"])
+                else:
+                    ok = matches_label(u, item["label"])
+                if ok:
+                    st.success("That’s right! Great work!")
+                else:
+                    if "answers" in item:
+                        target = item["answers"][0]
+                        fb = specific_hint_for_answer(target)
+                        st.info(llm_hint_for_fitb(item["stem"], target, topic_name, fb))
+                    else:
+                        st.info(llm_hint_for_fitb(item["stem"], item["label"], topic_name, fallback_hint_fitb(item["stem"], item["label"], topic_name, rng)))
+        with col3:
+            if st.button("Reveal", key=f"rev_{idx}"):
+                if "answers" in item:
+                    st.info(item["answers"][0])
+                else:
+                    pretty = {
+                        "increase":"increase",
+                        "decrease":"decrease",
+                        "no_change":"no change",
+                        "truncated":"truncated",
+                        "mislocalized":"mislocalized",
+                        "no_initiation":"no initiation",
+                        "no_elongation":"no elongation",
+                        "no_termination":"no termination",
+                        "frameshift":"frameshift",
+                    }.get(item["label"], item["label"])
+                    st.info(pretty)
