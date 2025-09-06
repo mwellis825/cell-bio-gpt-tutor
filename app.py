@@ -216,6 +216,121 @@ def _intro_level_ok(stem: str, answers: list) -> bool:
         if len(a.split()) > 2: return False
     return True
 
+
+# ---------- Answer normalization & feedback ----------
+PRIME_SYMS = {
+    "′":"'", "”":"\"", "“":"\"", "’":"'", "→":" to ", "–":"-", "—":"-"
+}
+
+def _normalize_text(s: str) -> str:
+    """Lowercase, unify primes, remove extra punctuation/spaces."""
+    s = (s or "").strip()
+    for k,v in PRIME_SYMS.items():
+        s = s.replace(k, v)
+    s = s.lower()
+    # words like 5' to 3' -> 5prime to 3prime
+    s = re.sub(r"(\d)\s*'?(\s*to\s*|[-–—>→]\s*)(\d)\s*'?", r"\1prime to \3prime", s)
+    s = re.sub(r"(\d)\s*'", r"\1prime", s)
+    s = re.sub(r"prime\s*-\s*", "prime ", s)
+    # hyphen/space normalization
+    s = s.replace("semi-conservative","semiconservative").replace("semi conservative","semiconservative")
+    s = s.replace("nucleo-some","nucleosome")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _canon_tokens(s: str) -> str:
+    """Canonical token string for equality/substring checks."""
+    s = _normalize_text(s)
+    # remove trivial plurals
+    s = re.sub(r"\b(\w+)s\b", r"\1", s)
+    return s
+
+def _direction_equiv(user: str, gold: str) -> bool:
+    u = _normalize_text(user)
+    g = _normalize_text(gold)
+    # Accept many 5' to 3' variants
+    def any_53(t: str) -> bool:
+        return ("5prime to 3prime" in t) or ("5 to 3" in t) or ("5 3" in t) or ("5prime 3prime" in t)
+    return any_53(u) and any_53(g)
+
+def _fuzzy_close(a: str, b: str) -> float:
+    # Simple token-based similarity
+    ta = set(_canon_tokens(a).split())
+    tb = set(_canon_tokens(b).split())
+    if not ta or not tb: 
+        return 0.0
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return inter/union
+
+COMMON_EQUIV = {
+    "semiconservative": {"semiconservative","semi-conservative","semi conservative"},
+    "nucleosome": {"nucleosome","nucleosomes"},
+    "cytoplasm": {"cytoplasm","cytosol"},
+    "rna polymerase ii": {"rna polymerase ii","pol ii","polymerase ii"},
+}
+
+def _expand_equivalents(ans_list):
+    out = set()
+    for a in ans_list or []:
+        ca = _canon_tokens(a)
+        out.add(ca)
+        for base, alts in COMMON_EQUIV.items():
+            if ca == base or ca in alts:
+                out.update(alts)
+    return out
+
+def check_fitb_answer(user_answer: str, answers: list) -> tuple[bool, bool]:
+    """Return (is_correct, is_close). is_close means near miss like 'histones' for 'nucleosome' or partial direction."""
+    if not isinstance(answers, list):
+        return (False, False)
+    ca_set = _expand_equivalents(answers)
+    ua = _canon_tokens(user_answer)
+    if not ua:
+        return (False, False)
+    # Exact canonical match
+    if ua in ca_set:
+        return (True, False)
+    # Direction equivalence (5' to 3')
+    for a in answers:
+        if _direction_equiv(user_answer, a):
+            return (True, False)
+    # Substring near matches and fuzzy Jaccard >= 0.5
+    for a in ca_set:
+        if ua in a or a in ua or _fuzzy_close(ua, a) >= 0.5:
+            return (False, True)
+    return (False, False)
+
+def llm_feedback_for_fitb(scope: str, stem: str, answers: list, user_answer: str) -> str:
+    """Ask the LLM for a short, encouraging feedback. Fallback to rule-based."""
+    client = _openai_client()
+    if client is None:
+        # Rule-based fallback
+        is_ok, is_close = check_fitb_answer(user_answer, answers)
+        if is_ok:
+            return "Great job — that matches the slide terminology."
+        if is_close:
+            return "Very close — refine the term to match the exact slide phrase."
+        return "Not quite — re-read the slide line and look for the precise term."
+    sys = "You are a supportive biology tutor. Respond in one sentence, 8–22 words. Be encouraging; never reveal the exact answer."
+    ans_json = json.dumps(answers, ensure_ascii=False)
+    prompt = f"""SLIDE EXCERPTS (authoritative):
+\"\"\"
+{scope}
+\"\"\"
+
+FITB prompt: {stem}
+Student answered: "{user_answer}"
+Correct answers (reference-only): {ans_json}
+
+Give one short, encouraging feedback. If student is close (synonym/partial), say why and nudge them without revealing the answer. Avoid jargon and quotes."""
+    try:
+        reply = _chat(client, sys, prompt, max_tokens=80, temperature=0.4, seed=new_seed()%1_000_000)
+        return (reply or "Keep going — think of the exact term used on the slide.").strip()
+    except Exception:
+        return "Keep going — think of the exact term used on the slide."
+
 # ---------- Generators with triple-quoted f-strings ----------
 def gen_dnd_from_scope(scope: str, prompt: str):
     client = _openai_client()
@@ -282,7 +397,7 @@ Return STRICT JSON (no markdown):
             continue
 
         title = data.get("title") or "Classify based on slide concepts"
-        instr = "Drag each statement to the correct slide-based category (intro level)."
+        instr = "Drag each statement to the correct slide-based category ."
         labels = bins
         draggables = terms
         answer = {t: mapping.get(t) for t in terms}
@@ -509,63 +624,54 @@ def render_exam():
                 if q.get("rationale"):
                     st.info(q["rationale"])
 
+
 # ---------- Main UI flow ----------
-if st.button("Generate"):
+prompt_val = st.text_input(
+    "Enter a topic for review and press generate:",
+    value=st.session_state.get("prompt_value_input",""),
+    placeholder="e.g., organelle function, glycolysis regulation, DNA repair…",
+    key="prompt_value_input"
+)
+go = st.button("Generate")
+
+if go:
     if "corpus" not in st.session_state:
         st.session_state.corpus = load_corpus_from_github(GITHUB_USER, GITHUB_REPO, SLIDES_DIR_GH, GITHUB_BRANCH)
     if "exam_corpus" not in st.session_state:
         st.session_state.exam_corpus = load_corpus_from_github(GITHUB_USER, GITHUB_REPO, EXAMS_DIR_GH, GITHUB_BRANCH)
 
-    prompt_val = st.session_state.get("prompt_value_input") or ""
-    # Pull from widget later
-else:
-    prompt_val = ""
+    topic = classify_topic(prompt_val) or "this topic"
+    st.session_state.topic = topic
+    scope = build_scope(st.session_state.corpus or [], prompt_val, limit_chars=6000)
 
-# Recreate prompt with state preservation
-prompt_val = st.text_input(
-    "Enter a topic for review and press generate:",
-    value=prompt_val,
-    placeholder="e.g., organelle function, glycolysis regulation, DNA repair…",
-    key="prompt_value_input"
-)
-
-if st.session_state.get("corpus") is not None and st.session_state.get("prompt_value_input"):
-    topic = classify_topic(st.session_state.get("prompt_value_input"))
-    st.session_state.topic = topic or "this topic"
-    scope = build_scope(st.session_state.corpus or [], st.session_state.get("prompt_value_input"), limit_chars=6000)
-
-    dnd = gen_dnd_from_scope(scope, st.session_state.get("prompt_value_input"))
+    dnd = gen_dnd_from_scope(scope, prompt_val)
     if dnd is None:
         title, instr, labels, terms, answer, hint_map = build_dnd_activity(topic)
-        st.session_state.dnd_source  = "Fallback"
     else:
         title, instr, labels, terms, answer, hint_map = dnd
-        st.session_state.dnd_source  = "LLM"
     st.session_state.dnd_title = title
     st.session_state.dnd_instr = instr
     st.session_state.drag_labels = labels
     st.session_state.drag_bank   = terms
     st.session_state.drag_answer = answer
     st.session_state.dnd_hints   = hint_map
+    st.session_state.scope      = scope
+    st.session_state.prompt_used = prompt_val
 
-    fitb_items = gen_fitb_from_scope(scope, st.session_state.get("prompt_value_input"))
+    fitb_items = gen_fitb_from_scope(scope, prompt_val)
     if fitb_items is None:
         rng = random.Random(new_seed())
-        fitb_items = build_fitb(topic, rng)
-        st.session_state.fitb_source = "Fallback"
-    else:
-        st.session_state.fitb_source = "LLM"
+        fitb_items = build_fitb(topic, random.Random(new_seed()))
     st.session_state.fitb = fitb_items
 
     style = extract_exam_style(st.session_state.exam_corpus or [])
-    exam_q = gen_exam_question(scope, style or {}, st.session_state.get("prompt_value_input")) if style else None
-    st.session_state.exam_q = exam_q
-    st.session_state.exam_source = "LLM" if exam_q else "Unavailable"
+    st.session_state.exam_q = gen_exam_question(scope, style or {}, prompt_val) if style else None
 
 # Render activities if available
+
 if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","dnd_instr"]):
     st.markdown("## Activity 1: Drag and Drop")
-    st.caption(f"Source: {st.session_state.get('dnd_source','') or 'Fallback'}")
+    
     st.markdown(f"**{st.session_state.get('dnd_title','Match items')}**")
     st.markdown(st.session_state.dnd_instr)
 
@@ -694,7 +800,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
 if "fitb" in st.session_state:
     st.markdown("---")
     st.markdown("## Activity 2: Fill in the Blank")
-    st.caption(f"Source: {st.session_state.get('fitb_source','') or 'Fallback'}")
+    
     topic_name = st.session_state.get("topic","this topic")
     st.markdown(f"Use your knowledge of **{topic_name}** to answer the following.")
 
@@ -709,14 +815,18 @@ if "fitb" in st.session_state:
                 st.info(item.get("hint","Use the exact term from the slides."))
         with col2:
             if st.button("Check", key=f"check_{idx}"):
-                ok = False
                 ans_list = item.get("answers", [])
-                if isinstance(ans_list, list):
-                    ok = _norm(u) in {_norm(a) for a in ans_list}
+                ok, close = check_fitb_answer(u, ans_list)
+                scope_text = st.session_state.get("scope","")
+                feedback = llm_feedback_for_fitb(scope_text, item.get("stem",""), ans_list, u)
                 if ok:
                     st.success("That’s right! 🎉")
+                elif close:
+                    st.warning("Almost there.")
+                    st.info(feedback)
                 else:
-                    st.warning("Not quite. Try again or use the hint.")
+                    st.warning("Not quite.")
+                    st.info(feedback)
         with col3:
             if st.button("Reveal", key=f"rev_{idx}"):
                 ans = item.get("answers", [])
