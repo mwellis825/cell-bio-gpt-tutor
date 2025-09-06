@@ -924,13 +924,83 @@ def llm_generate_fitb_application(scope: str, prompt: str, style: Dict[str,Any])
     return out
 
 
+# ---- Scenario-style FITB (v2) ----
+
+def llm_generate_fitb_application_v2(scope: str, prompt: str, style: Dict[str,Any]) -> List[Dict[str,Any]] | None:
+    client = _openai_client()
+    if client is None or not scope.strip():
+        return None
+    sys = "You generate UNIQUE, application-focused FITB items grounded ONLY in the provided slide excerpts. Never reveal answers."
+    user = f"""Create 4 Fill-in-the-Blank items for introductory biology.
+
+STUDENT PROMPT: "{prompt}"
+SLIDE EXCERPTS (authoritative):
+\"\"\"
+{scope}
+\"\"\"
+
+Constraints (ALL):
+- Each item begins with a SHORT SCENARIO (mutation/inhibitor/condition/experiment).
+- Exactly ONE blank (_____). Answer is ONE WORD (or hyphenated) that appears in the excerpts.
+- 11–20 words; no commas/semicolons; plain language; intro level.
+- Provide a short hint per item.
+Return STRICT JSON array of 4 objects:
+[{{"stem":"short scenario ... _____ ...","answers":["word"],"hint":"short hint"}},{{"stem":"...","answers":["word"],"hint":"..."}},{{"stem":"...","answers":["word"],"hint":"..."}},{{"stem":"...","answers":["word"],"hint":"..."}}]"""
+    raw = _chat(client, sys, user, max_tokens=750, temperature=0.4, seed=new_seed()%1_000_000)
+    try:
+        items = json.loads(_extract_json_block(raw))
+    except Exception:
+        return None
+    out = []
+    low = (scope or "").lower()
+    for it in items if isinstance(items, list) else []:
+        stem = (it.get("stem") or "").strip()
+        ans  = [a for a in (it.get("answers",[]) or []) if isinstance(a,str) and a.strip()]
+        hint = (it.get("hint","") or "Use the exact term implied by the scenario.").strip()
+        if not stem or "____" not in stem:
+            continue
+        wc = len(re.findall(r"[A-Za-z0-9']+", stem))
+        if not (11 <= wc <= 22):
+            continue
+        if not ans or not any(a.lower() in low for a in ans):
+            continue
+        out.append({"stem": stem, "answers":[ans[0]], "hint": hint})
+    if len(out) != 4:
+        return None
+    # session uniqueness
+    try:
+        seen = st.session_state.get("_seen_fitb", set())
+        dig = hashlib.sha1(json.dumps(out, sort_keys=True).encode("utf-8","ignore")).hexdigest()
+        if dig in seen:
+            return None
+        seen.add(dig); st.session_state["_seen_fitb"] = seen
+    except Exception:
+        pass
+    return out
+
+
+
 def gen_fitb_from_scope(scope: str, prompt: str):
     style = st.session_state.get("merged_style_profile", {})
-    for _ in range(3):
-        out = llm_generate_fitb_application_v2(scope, prompt, style)
-        if out:
-            return out
-    # Fallback to existing heuristic + topic fallback
+    # Try v2 (scenario-based) a few times
+    try:
+        if callable(globals().get("llm_generate_fitb_application_v2")):
+            for _ in range(3):
+                out = llm_generate_fitb_application_v2(scope, prompt, style)  # type: ignore[name-defined]
+                if out:
+                    return out
+    except Exception:
+        pass
+    # Try original v1, if present
+    try:
+        if callable(globals().get("llm_generate_fitb_application")):
+            for _ in range(2):
+                out = llm_generate_fitb_application(scope, prompt, style)  # type: ignore[name-defined]
+                if out:
+                    return out
+    except Exception:
+        pass
+    # Fallback to heuristic
     topic = classify_topic(prompt)
     rng = random.Random(new_seed())
     return build_fitb(topic, rng)
@@ -1408,7 +1478,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
             for (const [label, items] of Object.entries(bins)) {{
               if (items.includes(term)) {{ got = label; break; }}
             }}
-            if (got.trim().toLowerCase() === (want||"").trim().toLowerCase()) correct += 1;
+            if ((got||'').trim().toLowerCase() === (want||'').trim().toLowerCase()) correct += 1;
           }}
           const score = document.getElementById('score');
           if (total === 0) {{
@@ -1470,56 +1540,3 @@ if "fitb" in st.session_state:
 
 # Optional exam renderer if you keep exam_q
 render_exam()
-
-
-# --- patched scenario-style FITB generator (LLM) ---
-def llm_generate_fitb_application_v2(scope: str, prompt: str, style: Dict[str,Any]) -> List[Dict[str,Any]] | None:
-    client = _openai_client()
-    if client is None or not scope.strip():
-        return None
-    sys = "You generate UNIQUE, application-focused FITB items grounded ONLY in the provided slide excerpts. Never reveal answers."
-    user = f"""Create 4 Fill-in-the-Blank items for introductory biology.
-
-STUDENT PROMPT: "{prompt}"
-SLIDE EXCERPTS (authoritative):
-\"\"\"
-{scope}
-\"\"\"
-
-Constraints (ALL):
-- Each item begins with a SHORT SCENARIO (mutation/inhibitor/condition/experiment).
-- Exactly ONE blank (_____). Answer is ONE WORD (or hyphenated) that appears in the excerpts.
-- 11–20 words; no commas/semicolons; plain language; intro level.
-- Provide a short hint per item.
-Return STRICT JSON array of 4 objects:
-[{{"stem":"short scenario ... _____ ...","answers":["word"],"hint":"short hint"}},{{"stem":"...","answers":["word"],"hint":"..."}},{{"stem":"...","answers":["word"],"hint":"..."}},{{"stem":"...","answers":["word"],"hint":"..."}}]"""
-    raw = _chat(client, sys, user, max_tokens=750, temperature=0.4, seed=new_seed()%1_000_000)
-    try:
-        items = json.loads(_extract_json_block(raw))
-    except Exception:
-        return None
-    out = []
-    low = (scope or "").lower()
-    for it in items if isinstance(items, list) else []:
-        stem = (it.get("stem") or "").strip()
-        ans  = [a for a in (it.get("answers",[]) or []) if isinstance(a,str) and a.strip()]
-        hint = (it.get("hint","") or "Use the exact term implied by the scenario.").strip()
-        if not stem or "____" not in stem:
-            continue
-        wc = len(re.findall(r"[A-Za-z0-9']+", stem))
-        if not (11 <= wc <= 22):
-            continue
-        if not ans or not any(a.lower() in low for a in ans):
-            continue
-        out.append({"stem": stem, "answers":[ans[0]], "hint": hint})
-    if len(out) != 4:
-        return None
-    try:
-        seen = st.session_state.get("_seen_fitb", set())
-        dig = hashlib.sha1(json.dumps(out, sort_keys=True).encode("utf-8","ignore")).hexdigest()
-        if dig in seen:
-            return None
-        seen.add(dig); st.session_state["_seen_fitb"] = seen
-    except Exception:
-        pass
-    return out
