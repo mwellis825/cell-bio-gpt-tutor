@@ -18,7 +18,7 @@ GITHUB_BRANCH = "main"
 SLIDES_DIR_GH = "slides"
 EXAMS_DIR_GH  = "exams"
 
-# ---------------- Utilities ----------------
+# ---------- Utils ----------
 def _strip_code_fences(s: str) -> str:
     s = (s or "").strip()
     if s.startswith("```"):
@@ -43,7 +43,7 @@ def _extract_json_block(s: str) -> str:
 def new_seed() -> int:
     return int(time.time()*1000) ^ random.randint(0, 1_000_000)
 
-# ---------------- GitHub fetchers ----------------
+# ---------- GitHub ----------
 def _gh_list(user: str, repo: str, path: str, branch: str) -> List[Dict[str, Any]]:
     url = f"https://api.github.com/repos/{user}/{repo}/contents/{path}?ref={branch}"
     r = requests.get(url, timeout=20)
@@ -60,12 +60,12 @@ def _read_pdf_bytes(pdf_bytes: bytes) -> str:
     try:
         import pypdf  # type: ignore
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        return "\n".join([(p.extract_text() or "") for p in reader.pages])
+        return "\\n".join([(p.extract_text() or "") for p in reader.pages])
     except Exception:
         try:
             import PyPDF2  # type: ignore
             reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-            return "\n".join([(p.extract_text() or "") for p in reader.pages])
+            return "\\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
 
@@ -94,7 +94,7 @@ def load_corpus_from_github(user: str, repo: str, path: str, branch: str) -> Lis
             corpus.append(txt)
     return corpus
 
-# ---------------- Retrieval ----------------
+# ---------- Retrieval ----------
 STOP = {"the","and","for","that","with","this","from","into","are","was","were","has","have","had","can","will","would","could","should",
 "a","an","of","in","on","to","by","as","at","or","be","is","it","its","their","our","your","if","when","then","than","but",
 "we","you","they","which","these","those","there","here","such","may","might","also","very","much","many","most","more","less"}
@@ -103,8 +103,8 @@ def _tokens_nostop(s: str) -> List[str]:
     return [t for t in re.findall(r"[A-Za-z0-9']+", (s or "").lower()) if t not in STOP and len(t) > 2]
 
 def _split_sentences(text: str) -> List[str]:
-    parts = re.split(r"(?<=[\.\!\?])\s+|\n+", text or "")
-    return [re.sub(r"\s+"," ",p).strip() for p in parts if p and len(p.strip()) > 30]
+    parts = re.split(r"(?<=[\\.!?])\\s+|\\n+", text or "")
+    return [re.sub(r"\\s+"," ",p).strip() for p in parts if p and len(p.strip()) > 30]
 
 def _relevance(sent: str, q_tokens: List[str]) -> int:
     bag = {}
@@ -136,9 +136,9 @@ def collect_prompt_matched(corpus: List[str], prompt: str, top_docs=6, max_sents
 
 def build_scope(corpus: List[str], prompt: str, limit_chars: int = 6000) -> str:
     sents = collect_prompt_matched(corpus, prompt, top_docs=6, max_sents=1200)
-    return "\n".join(sents)[:limit_chars]
+    return "\\n".join(sents)[:limit_chars]
 
-# ---------------- Topic fallback ----------------
+# ---------- Topic fallback ----------
 def classify_topic(prompt: str) -> str:
     p = (prompt or "").lower()
     if "organelle" in p: return "organelle function"
@@ -154,7 +154,7 @@ def classify_topic(prompt: str) -> str:
     if "dna" in p: return "dna"
     return (p.split(",")[0].split(";")[0] or "this topic").strip()
 
-# ---------------- OpenAI client ----------------
+# ---------- OpenAI ----------
 def _openai_client():
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
@@ -172,7 +172,7 @@ def _chat(client, system, user, max_tokens=900, temperature=0.1, seed=42) -> str
         messages=[{"role":"system","content":system},{"role":"user","content":user}]
     ).choices[0].message.content or ""
 
-# ---------------- Intro constraints & helpers ----------------
+# ---------- Intro helpers ----------
 BANNED_VAGUE_LABELS = {
     "process","processes","function","functions","interaction","interactions","role","roles",
     "category","categories","type","types","concept","concepts","example","examples",
@@ -182,7 +182,7 @@ BANNED_VAGUE_LABELS = {
 def _slide_terms(scope: str, max_terms: int = 24) -> list:
     scope = scope or ""
     cands = set()
-    for m in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z0-9\-]+){0,3})\b", scope):
+    for m in re.findall(r"\\b([A-Z][a-z]+(?:\\s+[A-Z][a-z0-9\\-]+){0,3})\\b", scope):
         if len(m.split()) >= 2 and len(m) <= 60:
             cands.add(m.strip())
     BIO_HINTS = [
@@ -216,37 +216,36 @@ def _intro_level_ok(stem: str, answers: list) -> bool:
         if len(a.split()) > 2: return False
     return True
 
-# ---------------- Generators ----------------
+# ---------- Generators ----------
 def gen_dnd_from_scope(scope: str, prompt: str):
     client = _openai_client()
     if client is None or not scope.strip():
         return None
 
     anchor_terms = _slide_terms(scope, max_terms=24)
-    allowed_hint = "\n- Allowed label pool (choose 3–4 present in slides): " + ", ".join(anchor_terms[:16])
+    allowed_hint = "\\n- Allowed label pool (choose 3 present in slides): " + ", ".join(anchor_terms[:16])
 
     def _ask(seed_val: int, strict: bool):
         sys_prompt = "You create intro-level drag-and-drop activities grounded ONLY in the provided slide excerpts. Never reveal answers."
         user_prompt = (
-            "Create ONE classification drag-and-drop activity for first-year biology.\n\n"
-            "Slide excerpts:\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
-            "Student prompt: \"" + prompt + "\"\n\n"
-            "Design constraints (MUST follow ALL):\n"
-            "- BINS: choose 3–4 CONCRETE labels that appear in the excerpts (e.g., 'Nucleotide Excision Repair', 'Ionic bond').\n"
-            "- DO NOT use vague labels like 'process', 'function', 'interaction', 'type', 'role'.\n"
-            "- TERMS: write 6–8 short, clear statements (6–16 words) or definitions that fit exactly one bin; avoid jargon not in slides.\n"
-            "- Keep difficulty: Introductory (Bloom: Understand/Apply). Avoid trick wording.\n"
-            "- Provide one short hint per term (non-revealing).\n"
-            + allowed_hint + "\n"
-            + ("- Enforce: each BIN label must literally appear in the excerpts; reject abstract bins.\n" if strict else "")
-            + "\nReturn STRICT JSON (no markdown):\n"
-            "{\n"
-            "  \"title\": \"string\",\n"
-            "  \"bins\": [\"string\", ...],\n"
-            "  \"terms\": [\"string\", ...],\n"
-            "  \"mapping\": {\"TERM\":\"BIN\"},\n"
-            "  \"hints\": {\"TERM\":\"one short hint\"}\n"
-            "}\n"
+            "Create ONE classification drag-and-drop activity for first-year biology.\\n\\n"
+            "Slide excerpts:\\n\"\"\"\\n" + scope + "\\n\"\"\"\\n\\n"
+            "Student prompt: \\"" + prompt + "\\"\\n\\n"
+            "Design constraints (MUST follow ALL):\\n"
+            "- BINS: choose exactly 3 concrete labels that appear verbatim as slide headings or key terms in the excerpts.\\n"
+            "- TERMS: write exactly 6 short phrases (3–8 words) that clearly fit exactly one bin; avoid commas/semicolons and multi-clause wording.\\n"
+            "- Difficulty: Introductory (Bloom: Understand). Avoid trick wording.\\n"
+            "- Provide one short hint per term (non-revealing).\\n"
+            + allowed_hint + "\\n"
+            + ("- Enforce: each BIN label must literally appear in the excerpts; reject abstract bins.\\n" if strict else "")
+            + "\\nReturn STRICT JSON (no markdown):\\n"
+            "{\\n"
+            "  \\"title\\": \\"string\\",\\n"
+            "  \\"bins\\": [\\"string\\", ...],\\n"
+            "  \\"terms\\": [\\"string\\", ...],\\n"
+            "  \\"mapping\\": {\\"TERM\\":\\"BIN\\"},\\n"
+            "  \\"hints\\": {\\"TERM\\":\\"one short hint\\"}\\n"
+            "}\\n"
         )
         raw = _chat(client, sys_prompt, user_prompt, max_tokens=900, temperature=0.30 if strict else 0.33, seed=seed_val)
         return raw
@@ -262,8 +261,8 @@ def gen_dnd_from_scope(scope: str, prompt: str):
         mapping = data.get("mapping") or {}
         hints = data.get("hints") or {}
 
-        if not (isinstance(bins, list) and 3 <= len(bins) <= 4): continue
-        if not (isinstance(terms, list) and 6 <= len(terms) <= 8): continue
+        if not (isinstance(bins, list) and len(bins) == 3): continue
+        if not (isinstance(terms, list) and len(terms) == 6): continue
         if not (isinstance(mapping, dict) and all(t in mapping for t in terms)): continue
         if any(_is_vague_label(lbl) or not _label_in_scope(lbl, scope) for lbl in bins):
             continue
@@ -282,7 +281,7 @@ def gen_dnd_from_scope(scope: str, prompt: str):
         labels = bins
         draggables = terms
         answer = {t: mapping.get(t) for t in terms}
-        hint_map = {t: (hints.get(t) or "Re-read the slide phrase and match the defining idea.") for t in terms}
+        hint_map = {t: (hints.get(t) or "Re-read the relevant slide line.") for t in terms}
         return title, instr, labels, draggables, answer, hint_map
 
     return None
@@ -295,16 +294,16 @@ def gen_fitb_from_scope(scope: str, prompt: str):
     def _ask(seed_val: int):
         sys_prompt = "You create intro-level fill-in-the-blank items grounded ONLY in the provided slide excerpts. Never reveal answers."
         user_prompt = (
-            "From the slide excerpts, create 4 FITB items appropriate for an introductory biology course.\n\n"
-            "Slide excerpts:\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
-            "Student prompt: \"" + prompt + "\"\n\n"
-            "Design constraints (MUST follow ALL):\n"
-            "- Exactly 4 items; each is 8–20 words with one blank (use 5+ underscores: _____).\n"
-            "- Answers must be present in the excerpts and be 1–2 words.\n"
-            "- Language must be clear and concrete; avoid jargon not in slides.\n"
-            "- Provide one short, non-revealing hint per item.\n\n"
-            "Return STRICT JSON array (no markdown). Each item:\n"
-            "{\"stem\":\"A concise sentence with _____ one blank\",\"answers\":[\"answer\"],\"hint\":\"short hint\"}\n"
+            "From the slide excerpts, create 4 FITB items appropriate for an introductory biology course.\\n\\n"
+            "Slide excerpts:\\n\"\"\"\\n" + scope + "\\n\"\"\"\\n\\n"
+            "Student prompt: \\"" + prompt + "\\"\\n\\n"
+            "Design constraints (MUST follow ALL):\\n"
+            "- Exactly 4 items; each is 10–16 words with one blank (use 5+ underscores: _____).\\n"
+            "- Answers must be present in the excerpts and be a single word (or hyphenation).\\n"
+            "- Avoid commas/semicolons in stems; keep language simple and concrete.\\n"
+            "- Provide one short, non-revealing hint per item.\\n\\n"
+            "Return STRICT JSON array (no markdown). Each item:\\n"
+            "{\\"stem\\":\\"A concise sentence with _____ one blank\\",\\"answers\\":[\\"answer\\"],\\"hint\\":\\"short hint\\"}\\n"
         )
         raw = _chat(client, sys_prompt, user_prompt, max_tokens=700, temperature=0.28, seed=seed_val)
         return raw
@@ -322,14 +321,16 @@ def gen_fitb_from_scope(scope: str, prompt: str):
             stem = (it.get("stem","") or "").strip()
             ans  = [a for a in (it.get("answers",[]) or []) if isinstance(a,str) and a.strip()]
             hint = (it.get("hint","") or "Use the exact term from the slides.").strip()
-            if not stem or "____" not in stem: 
+            if not stem or "____" not in stem:
                 continue
-            if not ans or any(len(a.split())>2 for a in ans):
+            if not ans or any(len(a.split())>1 and "-" not in a for a in ans):
                 continue
             wc = len(re.findall(r"[A-Za-z0-9']+", stem))
-            if not (8 <= wc <= 20):
+            if not (10 <= wc <= 16):
                 continue
-            out.append({"stem": stem, "answers": ans[:3], "hint": hint})
+            if ("," in stem or ";" in stem):
+                continue
+            out.append({"stem": stem, "answers": ans[:2], "hint": hint})
 
         if len(out) == 4 and all(_intro_level_ok(i["stem"], i["answers"]) for i in out):
             best = out
@@ -337,7 +338,7 @@ def gen_fitb_from_scope(scope: str, prompt: str):
 
     return best
 
-# ---------------- Fallbacks ----------------
+# ---------- Fallbacks ----------
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
     options = {
@@ -346,7 +347,7 @@ def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,
         "transcription": (["Pol II","Spliceosome","Capping enzymes"], ["mRNA synthesis","Remove introns","Add 5' cap"], {"mRNA synthesis":"Pol II","Remove introns":"Spliceosome","Add 5' cap":"Capping enzymes"}),
         "chemical bonds": (["Covalent","Ionic","Hydrogen bond"], ["Electron sharing","Charge attraction","Polar interaction"], {"Electron sharing":"Covalent","Charge attraction":"Ionic","Polar interaction":"Hydrogen bond"}),
         "dna repair": (["BER","NER","MMR"], ["Base-specific removal","Bulky lesion removal","Mismatch correction"], {"Base-specific removal":"BER","Bulky lesion removal":"NER","Mismatch correction":"MMR"}),
-        "dna": (["DNA","Nucleotide","Phosphodiester bond"], ["Genetic polymer","Monomer","Backbone link"], {"Genetic polymer":"DNA","Monomer":"Nucleotide","Phosphodiester bond":"Backbone link"}),
+        "dna": (["DNA","Nucleotide","Phosphodiester bond"], ["Genetic polymer","Monomer","Backbone link"], {"Genetic polymer":"DNA","Monomer":"Nucleotide","Backbone link":"Phosphodiester bond"}),
     }
     labels, terms, mapping = options.get(topic, (["Category A","Category B"], ["Item 1","Item 2"], {"Item 1":"Category A","Item 2":"Category B"}))
     rng.shuffle(terms)
@@ -369,7 +370,7 @@ def build_fitb(topic: str, rng: random.Random) -> List[Dict[str,Any]]:
     rng.shuffle(items)
     return items[:4]
 
-# ---------------- Exam-style (optional) ----------------
+# ---------- Exam-style (unchanged optional) ----------
 @st.cache_data(show_spinner=False)
 def load_exam_corpus() -> List[str]:
     return load_corpus_from_github(GITHUB_USER, GITHUB_REPO, EXAMS_DIR_GH, GITHUB_BRANCH)
@@ -378,24 +379,23 @@ def extract_exam_style(exam_corpus: List[str]) -> Dict[str,Any] | None:
     client = _openai_client()
     if client is None or not exam_corpus:
         return None
-    sample = "\n\n".join(exam_corpus)[:12000]
+    sample = "\\n\\n".join(exam_corpus)[:12000]
     system = "You distill exam style. Return strict JSON only."
     user = (
-        "From the prior exams below, extract a compact style profile.\n\n"
-        "PRIOR EXAMS (snippets):\n\"\"\"" + sample + "\"\"\"\n\n"
-        "Return STRICT JSON:\n"
-        "{\n"
-        "  \"preferred_types\": [\"mcq\",\"short_answer\"],\n"
-        "  \"mcq_options\": 4,\n"
-        "  \"tone\": \"succinct|formal|clinical|conversational\",\n"
-        "  \"length\": \"short|medium|long\",\n"
-        "  \"constraints\": [\"single-best-answer\"],\n"
-        "  \"rationale_required\": true\n"
-        "}\n"
+        "From the prior exams below, extract a compact style profile.\\n\\n"
+        "PRIOR EXAMS (snippets):\\n\"\"\"" + sample + "\"\"\"\\n\\n"
+        "Return STRICT JSON:\\n"
+        "{\\n"
+        "  \\"preferred_types\\": [\\"mcq\\",\\"short_answer\\"],\\n"
+        "  \\"mcq_options\\": 4,\\n"
+        "  \\"tone\\": \\"succinct|formal|clinical|conversational\\",\\n"
+        "  \\"length\\": \\"short|medium|long\\",\\n"
+        "  \\"constraints\\": [\\"single-best-answer\\"],\\n"
+        "  \\"rationale_required\\": true\\n"
+        "}\\n"
     )
     try:
-        raw = _chat(client, system, user, max_tokens=400, temperature=0.0)
-        prof = json.loads(_extract_json_block(raw))
+        prof = json.loads(_extract_json_block(_chat(client, system, user, max_tokens=400, temperature=0.0)))
         prof.setdefault("preferred_types", ["mcq","short_answer"])
         prof.setdefault("mcq_options", 4)
         prof.setdefault("tone", "succinct")
@@ -416,24 +416,24 @@ def gen_exam_question(scope: str, style: Dict[str,Any], user_prompt: str) -> Dic
     system = "You write exam questions grounded ONLY in the provided slide excerpts. Return strict JSON only."
     style_json = json.dumps(style or {}, ensure_ascii=False)
     user = (
-        "SLIDE EXCERPTS (authoritative; cite page numbers if present):\n\"\"\"\n" + scope + "\n\"\"\"\n\n"
-        "STUDENT PROMPT: \"" + user_prompt + "\"\n\n"
-        "STYLE PROFILE:\n" + style_json + "\n\n"
-        "Create ONE exam-style question faithful to the slides.\n\n"
-        "Schema:\n"
-        "{\n"
-        "  \"type\": \"mcq\" | \"short_answer\",\n"
-        "  \"stem\": \"string (<= 70 words; tone per style)\",\n"
-        "  \"options\": [\"A\",\"B\",\"C\",\"D\"],      // MCQ only, " + str(mcq_n) + " options\n"
-        "  \"answer\": \"B\",                     // letter for MCQ; text for SA\n"
-        "  \"rationale\": \"why correct; <= 60 words\",\n"
-        "  \"bloom\": \"Remember|Understand|Apply|Analyze|Evaluate|Create\",\n"
-        "  \"difficulty\": 1,                   // 1-5\n"
-        "  \"slide_refs\": [int]\n"
-        "}\n\n"
-        "- Distractors must be plausible and present in scope.\n"
-        "- Cite 1–3 slide pages in \"slide_refs\".\n"
-        "- Prefer type: " + ("MCQ" if want_mcq else "short_answer") + " if it fits.\n"
+        "SLIDE EXCERPTS (authoritative; cite page numbers if present):\\n\"\"\"\\n" + scope + "\\n\"\"\"\\n\\n"
+        "STUDENT PROMPT: \\"" + user_prompt + "\\"\\n\\n"
+        "STYLE PROFILE:\\n" + style_json + "\\n\\n"
+        "Create ONE exam-style question faithful to the slides.\\n\\n"
+        "Schema:\\n"
+        "{\\n"
+        "  \\"type\\": \\"mcq\\" | \\"short_answer\\",\\n"
+        "  \\"stem\\": \\"string (<= 70 words; tone per style)\\",\\n"
+        "  \\"options\\": [\\"A\\",\\"B\\",\\"C\\",\\"D\\"],      // MCQ only, " + str(mcq_n) + " options\\n"
+        "  \\"answer\\": \\"B\\",                     // letter for MCQ; text for SA\\n"
+        "  \\"rationale\\": \\"why correct; <= 60 words\\",\\n"
+        "  \\"bloom\\": \\"Remember|Understand|Apply|Analyze|Evaluate|Create\\",\\n"
+        "  \\"difficulty\\": 1,                   // 1-5\\n"
+        "  \\"slide_refs\\": [int]\\n"
+        "}\\n\\n"
+        "- Distractors must be plausible and present in scope.\\n"
+        "- Cite 1–3 slide pages in \\"slide_refs\\".\\n"
+        "- Prefer type: " + ("MCQ" if want_mcq else "short_answer") + " if it fits.\\n"
     )
     try:
         q = json.loads(_extract_json_block(_chat(client, system, user, max_tokens=700, temperature=0.1)))
@@ -454,7 +454,7 @@ def gen_exam_question(scope: str, style: Dict[str,Any], user_prompt: str) -> Dic
     except Exception:
         return None
 
-# ---------------- UI ----------------
+# ---------- UI ----------
 prompt = st.text_input(
     "Enter a topic for review and press generate:",
     value="",
@@ -500,7 +500,7 @@ if st.button("Generate"):
     st.session_state.exam_q = exam_q
     st.session_state.exam_source = "LLM" if exam_q else "Unavailable"
 
-# ---------------- Render DnD ----------------
+# ---------- Render DnD ----------
 if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","dnd_instr"]):
     st.markdown("## Activity 1: Drag and Drop")
     st.caption(f"Source: {st.session_state.get('dnd_source','') or 'Fallback'}")
@@ -629,7 +629,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
             fb = hint_map.get(chosen_item, "Focus on the distinctive clue in this item.")
             st.info(fb)
 
-# ---------------- Render FITB ----------------
+# ---------- Render FITB ----------
 if "fitb" in st.session_state:
     st.markdown("---")
     st.markdown("## Activity 2: Fill in the Blank")
@@ -645,20 +645,23 @@ if "fitb" in st.session_state:
         col1, col2, col3 = st.columns([1,1,1])
         with col1:
             if st.button("Hint", key=f"hint_{idx}"):
-                st.info(item.get("hint","Focus on the exact term used in lecture."))
+                st.info(item.get("hint","Use the exact term from the slides."))
         with col2:
             if st.button("Check", key=f"check_{idx}"):
                 ok = False
                 ans_list = item.get("answers", [])
                 if isinstance(ans_list, list):
                     ok = _norm(u) in {_norm(a) for a in ans_list}
-                st.success("That’s right! 🎉") if ok else st.warning("Not quite. Try again or use the hint.")
+                if ok:
+                    st.success("That’s right! 🎉")
+                else:
+                    st.warning("Not quite. Try again or use the hint.")
         with col3:
             if st.button("Reveal", key=f"rev_{idx}"):
                 ans = item.get("answers", [])
                 st.info(", ".join(ans) if ans else "(no stored answer)")
 
-# ---------------- Exam-style (optional) ----------------
+# ---------- Exam (optional) ----------
 if st.session_state.get("exam_q"):
     st.markdown("---")
     st.markdown("## Exam-style Question")
