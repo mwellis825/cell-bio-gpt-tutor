@@ -704,6 +704,103 @@ def ensure_four_fitb(fitb_items, topic: str):
     return items[:4]
 
 
+
+
+def build_dnd_from_scope_fallback(scope: str, topic: str):
+    """
+    Build a meaningful DnD when LLM fails:
+    - Try to pick 2–3 bins from slide terms (headings/key phrases) that match topic nudges.
+    - Create 4 short terms mapped to those bins.
+    """
+    topic_l = (topic or "").lower()
+    # Candidate bins from slide terms
+    terms_in_scope = _slide_terms(scope, max_terms=30)
+    # Topic-specific bin seeds
+    seeds = {
+        "translation": {"Initiation": ["AUG start codon"], "Elongation": ["tRNA anticodon pairing"], "Termination": ["stop codon recognition"]},
+        "transcription": {"Initiation": ["promoter binding"], "Elongation": ["RNA chain growth"], "Termination": ["termination signal"]},
+        "dna repair": {"Base excision repair": ["glycosylase removes base"], "Nucleotide excision repair": ["thymine dimer excision"], "Mismatch repair": ["MutS recognition"]},
+        "dna replication": {"Leading strand": ["continuous synthesis"], "Lagging strand": ["Okazaki fragments"], "Origin": ["replication bubble"]},
+        "membrane transport": {"Channel": ["passive ion flow"], "Carrier": ["alternating access"], "Pump": ["ATP-dependent transport"]},
+        "chemical bonds": {"Covalent bond": ["electron sharing"], "Ionic bond": ["charge attraction"], "Hydrogen bond": ["polar interaction"]},
+        "organelle function": {"Nucleus": ["houses DNA"], "Mitochondrion": ["ATP production"], "Golgi": ["protein sorting"]},
+        "glycolysis": {"Hexokinase": ["first phosphorylation"], "PFK-1": ["commitment step"], "Pyruvate kinase": ["ATP at end"]},
+    }
+    # pick topic key
+    key = None
+    for k in seeds.keys():
+        if k in topic_l:
+            key = k; break
+    if key is None:
+        key = "organelle function" if "organelle" in topic_l else "chemical bonds"
+
+    # Prefer bins that literally occur in scope (case-insensitive)
+    bins = []
+    for b in seeds[key].keys():
+        if _label_in_scope(b, scope):
+            bins.append(b)
+    # If too few, add from scope terms that match seed words
+    if len(bins) < 2:
+        for t in terms_in_scope:
+            for b in seeds[key].keys():
+                if b.lower().split()[0] in t.lower() or t.lower() in b.lower():
+                    if b not in bins:
+                        bins.append(b)
+                        break
+    # If still too few, just take first two seed bins
+    if len(bins) < 2:
+        bins = list(seeds[key].keys())[:2]
+    # Cap to 3
+    bins = bins[:3]
+
+    # Build 4 terms balanced across bins
+    terms = []
+    mapping = {}
+    # Use seed phrases first
+    seed_pairs = []
+    for b in bins:
+        for phrase in seeds[key][b]:
+            seed_pairs.append((phrase, b))
+    # Add slide-derived short phrases that clearly indicate the bin
+    for t in terms_in_scope:
+        tl = t.lower()
+        for b in bins:
+            if b.lower() in tl and len(t.split()) <= 6:
+                seed_pairs.append((t, b))
+                break
+    # Deduplicate preserving order
+    seen = set()
+    clean_pairs = []
+    for phrase, b in seed_pairs:
+        if phrase.lower() in seen: 
+            continue
+        seen.add(phrase.lower())
+        clean_pairs.append((phrase, b))
+
+    # Fill exactly 4
+    i = 0
+    while len(terms) < 4 and i < len(clean_pairs):
+        phrase, b = clean_pairs[i]
+        # keep phrases short and without commas/semicolons
+        if 2 <= len(phrase.split()) <= 6 and ("," not in phrase and ";" not in phrase):
+            terms.append(phrase)
+            mapping[phrase] = b
+        i += 1
+
+    # If still short, synthesize minimal phrases
+    filler = ["core feature", "key clue", "hallmark step", "typical outcome"]
+    fi = 0
+    while len(terms) < 4 and fi < len(filler):
+        b = bins[len(terms) % len(bins)]
+        ph = f"{filler[fi]}"
+        terms.append(ph)
+        mapping[ph] = b
+        fi += 1
+
+    title = f"Match items for {topic.title()}"
+    instr = "Drag each item to the correct category."
+    hints = {t: "Use the exact slide phrase for this category." for t in terms}
+    return title, instr, bins, terms, mapping, hints
 # ---------- Fallbacks ----------
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
@@ -907,7 +1004,7 @@ if go:
 
     dnd = gen_dnd_from_scope(scope, prompt_val)
     if dnd is None:
-        title, instr, labels, terms, answer, hint_map = build_dnd_activity(topic)
+        title, instr, labels, terms, answer, hint_map = build_dnd_from_scope_fallback(scope, topic)
     else:
         title, instr, labels, terms, answer, hint_map = dnd
     st.session_state.dnd_title = title
