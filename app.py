@@ -666,6 +666,7 @@ Rules:
     raw = _llm_json(prompt)
     if not raw.strip():
         return ("", [], [], {}, {})
+    raw = _extract_json_block(raw)
     # Basic JSON parse & validation
     try:
         data = json.loads(raw)
@@ -692,6 +693,12 @@ Rules:
         draggables = terms
         answer = {t: mapping[t] for t in terms}  # NOTE: current app expects {term: BinLabel}
         hint_map = hints
+        # enforce grounding to prompt keywords
+        kws = set(expand_prompt_keywords(topic))
+        combined = " ".join([title] + labels + draggables + list(mapping.keys()) + list(mapping.values()) + list(hints.values())).lower()
+        hit = any(k in combined for k in kws if len(k) > 3)
+        if not hit:
+            return ("", [], [], {}, {})
         return instr, labels, draggables, answer, hint_map
     except Exception:
         return ("", [], [], {}, {})
@@ -721,6 +728,7 @@ Rules:
     raw = _llm_json(prompt, max_tokens=800, temperature=0.1)
     if not raw.strip():
         return []
+    raw = _extract_json_block(raw)
     try:
         items = json.loads(raw)
         out = []
@@ -748,7 +756,11 @@ if st.button("Generate"):
     if "corpus" not in st.session_state:
         st.session_state.corpus = load_corpus_from_github(SLIDES_GH_USER, SLIDES_GH_REPO, SLIDES_DIR_PATH, SLIDES_GH_BRANCH)
 
-    topic = classify_topic(prompt) or "this topic"
+    topic = classify_topic(prompt) or \"this topic\"
+    # Disambiguate 'bonds' prompts based on slide scope
+    _scope_for_disambig = build_scope_from_corpus(st.session_state.corpus or [], prompt, limit_chars=6000)
+    if re.search(r\"\bbond(s)?\b\", (prompt or \"\").lower()):
+        topic = disambiguate_bonds(_scope_for_disambig)
     st.session_state.topic = topic
 
     # -------- NEW: Build a scope from slides and try LLM-grounded activities --------
@@ -773,12 +785,55 @@ if st.button("Generate"):
     if not fitb_items:
         fitb_items = build_fitb(topic, rng)  # fallback preserved
 
-    st.session_state.fitb = fitb_items
-    st.success("Generated fresh activities.")
+    
+        # Diagnostics: build keyword hits
+        kw = expand_prompt_keywords(prompt)
+        scope_hits = sum(scope.lower().count(k) for k in kw)
+
+        # Try LLM-based DnD first
+        instr, labels, terms, answer, hint_map = llm_generate_dnd(scope, topic)
+        used_llm_dnd = bool(labels and terms and answer)
+        fallback_reason_dnd = ""
+        if not used_llm_dnd:
+            fallback_reason_dnd = "LLM JSON invalid/ungrounded or empty; used heuristic DnD."
+            instr, labels, terms, answer, hint_map = build_dnd_activity(topic)
+
+        # Save to session_state
+        st.session_state.dnd_instr = instr
+        st.session_state.drag_labels = labels
+        st.session_state.drag_bank   = terms
+        st.session_state.drag_answer = answer
+        st.session_state.dnd_hints   = hint_map
+        st.session_state.used_llm_dnd = used_llm_dnd
+        st.session_state.fallback_reason_dnd = fallback_reason_dnd
+
+        # FITB via LLM first
+        rng = random.Random(new_seed())
+        fitb_items = llm_generate_fitb(scope, topic)
+        # Filter boilerplate stems
+        def _boiler(s): return "immediate output would" in s.lower() or "near-term output would" in s.lower()
+        fitb_items = [it for it in fitb_items if not _boiler(it.get("stem",""))]
+        used_llm_fitb = len(fitb_items) > 0
+        fallback_reason_fitb = ""
+        if not used_llm_fitb:
+            fallback_reason_fitb = "LLM returned no usable FITB (or boilerplate); used heuristic FITB."
+            fitb_items = build_fitb(topic, rng)
+
+        st.session_state.fitb = fitb_items
+        st.session_state.used_llm_fitb = used_llm_fitb
+        st.session_state.fallback_reason_fitb = fallback_reason_fitb
+
+        st.success("Generated fresh activities.")
+        with st.expander("Diagnostics"):
+            st.write(f"Scope chars: {len(scope)} | keyword hits in scope: {scope_hits}")
+            st.write("DnD:", "LLM" if used_llm_dnd else "Fallback", fallback_reason_dnd)
+            st.write("FITB:", "LLM" if used_llm_fitb else "Fallback", fallback_reason_fitb)
+
 
 # -------- Activity 1: Drag-and-Drop (unchanged rendering/UI) --------
 if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","dnd_instr","dnd_hints"]):
     st.markdown("## Activity 1: Drag and Drop")
+    st.caption("Source: " + ("LLM" if st.session_state.get("used_llm_dnd") else "Fallback"))
     topic = st.session_state.get("topic","this topic")
     labels = st.session_state.drag_labels
     terms  = st.session_state.drag_bank
@@ -915,6 +970,7 @@ if "fitb" in st.session_state:
     st.markdown("---")
     topic_name = st.session_state.get("topic","this topic")
     st.markdown("## Activity 2: Fill in the Blank")
+    st.caption("Source: " + ("LLM" if st.session_state.get("used_llm_fitb") else "Fallback"))
     st.markdown(f"Use your knowledge of **{topic_name}** to answer the following.")
 
     rng = random.Random(new_seed())
@@ -962,3 +1018,70 @@ if "fitb" in st.session_state:
                         "frameshift":"frameshift",
                     }.get(item["label"], item["label"])
                     st.info(pretty)
+
+# ------------------ Utilities: JSON sanitize & prompt expansion ------------------
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+def _extract_json_block(s: str) -> str:
+    s = _strip_code_fences(s)
+    # Try array first
+    a_start = s.find("[")
+    a_end   = s.rfind("]")
+    o_start = s.find("{")
+    o_end   = s.rfind("}")
+    cand = ""
+    if a_start != -1 and a_end != -1 and a_end > a_start:
+        cand = s[a_start:a_end+1]
+        try:
+            json.loads(cand); return cand
+        except Exception: pass
+    if o_start != -1 and o_end != -1 and o_end > o_start:
+        cand = s[o_start:o_end+1]
+        try:
+            json.loads(cand); return cand
+        except Exception: pass
+    return s  # last resort
+
+BOND_KEYWORDS = {
+    "chemical": ["covalent", "ionic", "hydrogen bond", "van der waals", "noncovalent", "polar", "nonpolar", "bond energy", "electronegativity"],
+    "junctions": ["tight junction", "adherens", "desmosome", "hemidesmosome", "gap junction", "cell-cell adhesion", "cadherin", "integrin", "extracellular matrix"],
+    "cytoskeleton": ["microtubule", "actin", "intermediate filament", "cytoskeleton"]
+}
+
+def expand_prompt_keywords(p: str) -> list:
+    p = (p or "").lower()
+    base = re.findall(r"[a-z0-9']+", p)
+    expanded = set(base)
+    if "bond" in p or "bonds" in p:
+        for group in BOND_KEYWORDS.values():
+            expanded.update([w for w in " ".join(group).split() if len(w) > 2])
+    if "transport" in p:
+        expanded.update(["diffusion","channel","pump","carrier","symporter","antiporter","uniporter","gradient","atp"])
+    if "glycolysis" in p:
+        expanded.update(["pfk","pyruvate","nad","atp","enzyme","kinase"])
+    if "replication" in p:
+        expanded.update(["helicase","primase","polymerase","ligase","fork"])
+    if "transcription" in p:
+        expanded.update(["promoter","rna","pol","splice","cap","terminate"])
+    if "translation" in p:
+        expanded.update(["ribosome","a site","p site","release","trna","start codon","stop codon"])
+    return [w for w in expanded if len(w) > 2]
+
+def disambiguate_bonds(scope_text: str) -> str:
+    """Decide whether 'bonds' likely means chemical bonds or cell junctions based on scope occurrences."""
+    s = scope_text.lower()
+    chem_hits = sum(s.count(k) for k in BOND_KEYWORDS["chemical"])
+    junc_hits = sum(s.count(k) for k in BOND_KEYWORDS["junctions"])
+    cyto_hits = sum(s.count(k) for k in BOND_KEYWORDS["cytoskeleton"])
+    if max(chem_hits, junc_hits, cyto_hits) == 0:
+        return "bonds (unspecified)"
+    if chem_hits >= junc_hits and chem_hits >= cyto_hits:
+        return "chemical bonds"
+    if junc_hits >= chem_hits and junc_hits >= cyto_hits:
+        return "cell junctions"
+    return "cytoskeleton interactions"
