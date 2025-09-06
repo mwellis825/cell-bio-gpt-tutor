@@ -331,11 +331,131 @@ Give one short, encouraging feedback. If student is close (synonym/partial), say
     except Exception:
         return "Keep going — think of the exact term used on the slide."
 
+
+# ---------- Topic nudges & strict validators ----------
+TOPIC_NUDGES = {
+    "translation": {
+        "bins_hint": ["Initiation", "Elongation", "Termination"],
+        "terms_hint": ["AUG start codon", "peptidyl transferase activity", "stop codon recognition", "tRNA anticodon pairing"]
+    },
+    "transcription": {
+        "bins_hint": ["Initiation", "Elongation", "Termination"],
+        "terms_hint": ["promoter binding", "RNA synthesis", "polyadenylation signal", "termination signal"]
+    },
+    "dna repair": {
+        "bins_hint": ["Base excision repair", "Nucleotide excision repair", "Mismatch repair"],
+        "terms_hint": ["glycosylase removes base", "thymine dimer excision", "MutS recognition", "DNA ligase seals nick"]
+    },
+    "chemical bonds": {
+        "bins_hint": ["Covalent bond", "Ionic bond"],
+        "terms_hint": ["electron sharing", "charge attraction", "polar interaction", "hydrogen bond"]
+    },
+    "membrane transport": {
+        "bins_hint": ["Channel", "Carrier", "Pump"],
+        "terms_hint": ["passive ion flow", "alternating access", "ATP-dependent transport", "electrochemical gradient"]
+    }
+}
+
+FORBID_IN_LABEL = set("""where when how occurs occur occurred differing differs different than because although whereas mainly mostly very kind type types role roles process processes function functions interaction interactions example examples other misc miscellaneous""".split())
+
+def _bin_ok(lbl: str, scope: str) -> bool:
+    if not isinstance(lbl, str): return False
+    t = lbl.strip()
+    if not t or len(t.split()) > 4: return False
+    tl = t.lower()
+    if any(w in FORBID_IN_LABEL for w in re.findall(r"[a-z']+", tl)): return False
+    # Must appear in scope literally (case-insensitive) as word boundary
+    if t.lower() not in (scope or "").lower():
+        return False
+    # Heuristic: prefer capitalized multiword or proper bio term
+    return True
+
+def _term_ok(term: str) -> bool:
+    if not isinstance(term, str): return False
+    t = term.strip()
+    if not (3 <= len(t) <= 80): return False
+    if "," in t or ";" in t: return False
+    # Avoid vague starters
+    if re.match(r"^(where|when|how|why|which|that)\b", t.lower()):
+        return False
+    # Prefer short phrase 3-10 words
+    wc = len(re.findall(r"[A-Za-z0-9']+", t))
+    return 3 <= wc <= 12
 # ---------- Generators with triple-quoted f-strings ----------
+
 def gen_dnd_from_scope(scope: str, prompt: str):
     client = _openai_client()
     if client is None or not scope.strip():
         return None
+
+    topic = classify_topic(prompt)
+    nudges = TOPIC_NUDGES.get(topic, {})
+    anchor_terms = _slide_terms(scope, max_terms=24)
+    allowed_hint = ", ".join(anchor_terms[:16])
+    bins_hint = ", ".join(nudges.get("bins_hint", []))
+    terms_hint = ", ".join(nudges.get("terms_hint", []))
+
+    def _ask(seed_val: int, strict: bool):
+        sys_prompt = "You create slide-anchored drag-and-drop activities. Use only the excerpt content. Never reveal answers."
+        user_prompt = f"""Create ONE classification drag-and-drop activity for intro biology.
+
+Slide excerpts:
+\"\"\"
+{scope}
+\"\"\"
+
+Student prompt: "{prompt}"
+
+Design constraints (MUST follow ALL):
+- BINS: choose 2–3 concrete labels that appear verbatim in the excerpts (slide headings or key terms). Avoid abstract words.
+- TERMS: write exactly 4 short phrases (3–10 words) that each match exactly one bin. Avoid commas/semicolons.
+- Keep language plain and literal; no trick wording.
+- Provide one short hint per term (non-revealing).
+- Allowed label pool (may use): {allowed_hint}
+- Topic-specific nudge (optional): {bins_hint if bins_hint else "n/a"}; terms to consider: {terms_hint if terms_hint else "n/a"}
+{("- Enforce: every BIN label must literally occur in the excerpts." if strict else "")}
+
+Return STRICT JSON (no markdown):
+{{
+  "title": "string",
+  "bins": ["string", ...],           // 2 or 3 labels
+  "terms": ["string", "string", "string", "string"],  // 4 items
+  "mapping": {{"TERM":"BIN"}},
+  "hints": {{"TERM":"one short hint"}}
+}}"""
+        raw = _chat(client, sys_prompt, user_prompt, max_tokens=800, temperature=0.28 if strict else 0.32, seed=seed_val)
+        return raw
+
+    for attempt in range(2):
+        raw = _ask(seed_val=(new_seed()%1_000_000), strict=(attempt==1))
+        try:
+            data = json.loads(_extract_json_block(raw))
+        except Exception:
+            data = {}
+        bins  = data.get("bins") or []
+        terms = data.get("terms") or []
+        mapping = data.get("mapping") or {}
+        hints = data.get("hints") or {}
+
+        if not (isinstance(bins, list) and 2 <= len(bins) <= 3): continue
+        if not (isinstance(terms, list) and len(terms) == 4): continue
+        if not (isinstance(mapping, dict) and all(t in mapping for t in terms)): continue
+        # Validate bins and terms
+        if any(not _bin_ok(lbl, scope) for lbl in bins): continue
+        if any(not _term_ok(t) for t in terms): continue
+        # Ensure mapping uses only given bins
+        if any(mapping.get(t) not in bins for t in terms): continue
+
+        title = data.get("title") or "Match items to slide-based labels"
+        instr = "Drag each item to the correct category."
+        labels = bins
+        draggables = terms
+        answer = {t: mapping.get(t) for t in terms}
+        hint_map = {t: (hints.get(t) or "Re-read the exact slide phrase.") for t in terms}
+        return title, instr, labels, draggables, answer, hint_map
+
+    return None
+
 
     anchor_terms = _slide_terms(scope, max_terms=24)
     allowed_hint = ", ".join(anchor_terms[:16])
@@ -461,7 +581,24 @@ Return STRICT JSON array (no markdown). Each item:
             best = out
             break
 
+    
     return best
+
+def ensure_four_fitb(fitb_items, topic: str):
+    items = list(fitb_items or [])
+    if len(items) >= 4:
+        return items[:4]
+    need = 4 - len(items)
+    add_pool = build_fitb(topic, random.Random(new_seed()))
+    # Avoid duplicates by stem text
+    have = { (i.get("stem","")).strip().lower() for i in items }
+    for it in add_pool:
+        if (it.get("stem","")).strip().lower() not in have:
+            items.append(it)
+            have.add((it.get("stem","")).strip().lower())
+            if len(items) == 4: break
+    return items[:4]
+
 
 # ---------- Fallbacks ----------
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
@@ -481,19 +618,39 @@ def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,
     hints = {t: "Focus on the defining feature mentioned in class." for t in terms}
     return title, instr, labels, terms, mapping, hints
 
+
 def build_fitb(topic: str, rng: random.Random) -> List[Dict[str,Any]]:
     items = []
-    if "glycolysis" in topic:
+    t = (topic or "").lower()
+    if "glycolysis" in t:
         items.append({"stem":"The end product of glycolysis is _____ .","answers":["pyruvate"],"hint":"Three-carbon product."})
         items.append({"stem":"Glycolysis occurs in the _____ .","answers":["cytosol","cytoplasm"],"hint":"Not an organelle lumen."})
-    elif "transcription" in topic:
-        items.append({"stem":"Eukaryotic mRNA is made by _____ polymerase II.","answers":["rna"],"hint":"Pol II."})
-    elif "dna repair" in topic:
-        items.append({"stem":"Bulky adducts, like thymine dimers, are removed by _____ .","answers":["nucleotide-excision-repair","ner","nucleotide excision repair"],"hint":"The pathway excises an oligonucleotide."})
+        items.append({"stem":"The committed step of glycolysis is catalyzed by _____ .","answers":["pfk-1","pfk1","phosphofructokinase"],"hint":"Allosterically regulated enzyme."})
+        items.append({"stem":"ATP is generated by substrate-level phosphorylation at _____ kinase.","answers":["pyruvate","phosphoglycerate"],"hint":"Final steps."})
+    elif "transcription" in t:
+        items.append({"stem":"In eukaryotes, mRNA is synthesized by _____ polymerase II.","answers":["rna"],"hint":"Pol II."})
+        items.append({"stem":"Transcription starts at the _____ region of DNA.","answers":["promoter"],"hint":"TATA box may be here."})
+        items.append({"stem":"The introns are removed from pre-mRNA by the _____ .","answers":["spliceosome"],"hint":"snRNP complex."})
+        items.append({"stem":"A 7-methylguanosine cap is added to the _____ end.","answers":["5'","5-prime","5prime","5’"],"hint":"The end that emerges first."})
+    elif "translation" in t:
+        items.append({"stem":"Protein synthesis occurs on the _____ .","answers":["ribosome"],"hint":"Large and small subunits."})
+        items.append({"stem":"Translation begins at the start codon, typically _____ .","answers":["aug"],"hint":"Also codes for methionine."})
+        items.append({"stem":"The anticodon resides on the _____ molecule.","answers":["trna","t-rna"],"hint":"Adapter between codon and amino acid."})
+        items.append({"stem":"Peptide bond formation is catalyzed in the _____ center.","answers":["peptidyl-transferase","peptidyl transferase","peptidyltransferase"],"hint":"Activity of the large subunit rRNA."})
+    elif "dna repair" in t:
+        items.append({"stem":"Bulky adducts, like thymine dimers, are removed by _____ .","answers":["nucleotide-excision-repair","ner","nucleotide excision repair"],"hint":"Excises an oligonucleotide."})
+        items.append({"stem":"Cytosine deamination is corrected by _____ excision repair.","answers":["base"],"hint":"Removes damaged base then sugar-phosphate."})
+        items.append({"stem":"Replication errors are fixed by _____ repair.","answers":["mismatch"],"hint":"MutS recognizes distortion."})
+        items.append({"stem":"DNA ligase seals a remaining _____ in the backbone.","answers":["nick"],"hint":"Between adjacent nucleotides."})
     else:
-        items.append({"stem":f"{topic.title()} primarily involves the _____ .","answers":["key-term"],"hint":"Use the exact term used in lecture."})
+        # Generic but meaningful fallbacks
+        items.append({"stem":"DNA is composed of repeating _____ units called nucleotides.","answers":["monomer"],"hint":"Basic building block."})
+        items.append({"stem":"A gene is transcribed into _____ before translation.","answers":["mrna","messenger-rna","messenger rna"],"hint":"RNA type that carries coding sequence."})
+        items.append({"stem":"Proteins are synthesized from amino acids during _____ .","answers":["translation"],"hint":"Occurs on ribosomes."})
+        items.append({"stem":"The cell membrane is a lipid _____ with embedded proteins.","answers":["bilayer"],"hint":"Two leaflets."})
     rng.shuffle(items)
     return items[:4]
+
 
 # ---------- Exam (optional) ----------
 @st.cache_data(show_spinner=False)
@@ -652,7 +809,7 @@ if go:
     st.session_state.dnd_title = title
     st.session_state.dnd_instr = instr
     st.session_state.drag_labels = labels
-    st.session_state.drag_bank   = terms
+    st.session_state.drag_bank   = (terms[:4] if isinstance(terms, list) else terms)
     st.session_state.drag_answer = answer
     st.session_state.dnd_hints   = hint_map
     st.session_state.scope      = scope
@@ -662,7 +819,7 @@ if go:
     if fitb_items is None:
         rng = random.Random(new_seed())
         fitb_items = build_fitb(topic, random.Random(new_seed()))
-    st.session_state.fitb = fitb_items
+    st.session_state.fitb = ensure_four_fitb(fitb_items, st.session_state.get("topic",""))
 
     style = extract_exam_style(st.session_state.exam_corpus or [])
     st.session_state.exam_q = gen_exam_question(scope, style or {}, prompt_val) if style else None
