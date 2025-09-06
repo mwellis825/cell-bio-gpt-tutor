@@ -95,6 +95,43 @@ def load_corpus_from_github(user: str, repo: str, path: str, branch: str) -> Lis
     return corpus
 
 # ---------- Retrieval ----------
+# ---------- Topic profiles for grounding ----------
+TOPIC_PROFILES = {
+    "dna replication": {
+        "include": ["replication","replicative","polymerase","helicase","primase","origin","okazaki","lagging","leading","ligase","proofreading","replication fork","replication bubble","ssb","topoisomerase"],
+        "exclude": ["translation","transcription","membrane","transport","junction","cytoskeleton","glycolysis"]
+    },
+    "dna repair": {
+        "include": ["repair","excison","excision","mismatch","ber","ner","glycosylase","endonuclease","photolyase","homologous recombination","non-homologous end joining","nhej","hr"],
+        "exclude": ["translation","transcription","membrane","glycolysis"]
+    },
+    "translation": {
+        "include": ["translation","ribosome","trna","anticodon","codon","elongation","initiation","termination","start codon","stop codon","peptidyl transferase","eif","ef-tu","ef-g","shine-dalgarno"],
+        "exclude": ["replication","repair","membrane","glycolysis","junction"]
+    },
+    "transcription": {
+        "include": ["transcription","rna polymerase","promoter","enhancer","silencer","terminator","spliceosome","mrna","intron","exon","capping","polyadenylation"],
+        "exclude": ["replication","translation","membrane","glycolysis"]
+    },
+    "membrane transport": {
+        "include": ["membrane","channel","carrier","pump","transport","gradient","diffusion","osmosis","antiporter","symporter","uniporter","facilitated"],
+        "exclude": ["replication","translation","transcription","repair","glycolysis"]
+    },
+    "chemical bonds": {
+        "include": ["covalent","ionic","hydrogen","van der waals","phosphodiester","peptide","bond","interaction","electrostatic"],
+        "exclude": ["membrane transport","glycolysis","translation","transcription"]
+    }
+}
+
+def topic_key(prompt: str) -> str:
+    p = (prompt or "").lower()
+    for k in TOPIC_PROFILES.keys():
+        if k in p:
+            return k
+    # use classify_topic fallback
+    base = classify_topic(prompt).lower()
+    return base
+
 STOP = {"the","and","for","that","with","this","from","into","are","was","were","has","have","had","can","will","would","could","should",
 "a","an","of","in","on","to","by","as","at","or","be","is","it","its","their","our","your","if","when","then","than","but",
 "we","you","they","which","these","those","there","here","such","may","might","also","very","much","many","most","more","less"}
@@ -116,27 +153,60 @@ def _relevance(sent: str, q_tokens: List[str]) -> int:
         score += 2
     return score
 
+
+
 def collect_prompt_matched(corpus: List[str], prompt: str, top_docs=6, max_sents=1200) -> List[str]:
     q = _tokens_nostop(prompt)
     if not q:
         return []
+    key = topic_key(prompt)
+    prof = TOPIC_PROFILES.get(key, {"include": [], "exclude": []})
+    include = set(prof.get("include", []))
+    exclude = set(prof.get("exclude", []))
+    def on_topic(sent: str) -> bool:
+        sl = sent.lower()
+        if exclude and any(x in sl for x in exclude):
+            return False
+        if include and not any(x in sl for x in include):
+            return False
+        return any(t in sl for t in q)
+
     doc_scores = []
     for doc in corpus:
-        sents = _split_sentences(doc)
-        sc = sum(_relevance(s, q) for s in sents[:max_sents])
-        if sc > 0:
-            doc_scores.append((sc, sents))
+        sents = _split_sentences(doc)[:max_sents]
+        filt = [s for s in sents if on_topic(s)]
+        sc = sum(_relevance(s, q) for s in filt)
+        if sc > 0 and filt:
+            doc_scores.append((sc, filt))
     doc_scores.sort(reverse=True, key=lambda x: x[0])
+
     matched = []
     for _, sents in doc_scores[:top_docs]:
-        for s in sents:
-            if _relevance(s, q) > 0:
-                matched.append(s)
+        matched.extend(sents)
+
+    if len(matched) < 20 and include:
+        for doc in corpus:
+            sents = _split_sentences(doc)[:max_sents]
+            for s in sents:
+                sl = s.lower()
+                if any(x in sl for x in include) and any(t in sl for t in q):
+                    matched.append(s)
+                    if len(matched) >= 120: break
+            if len(matched) >= 120: break
+
     return matched[:200]
+
 
 def build_scope(corpus: List[str], prompt: str, limit_chars: int = 6000) -> str:
     sents = collect_prompt_matched(corpus, prompt, top_docs=6, max_sents=1200)
-    return "\n".join(sents)[:limit_chars]
+    seen = set()
+    dedup = []
+    for s in sents:
+        k = s.strip().lower()
+        if k not in seen:
+            seen.add(k)
+            dedup.append(s)
+    return "\n".join(dedup)[:limit_chars]
 
 # ---------- Topic fallback ----------
 def classify_topic(prompt: str) -> str:
@@ -381,6 +451,25 @@ def _term_ok(term: str) -> bool:
     # Prefer short phrase 3-10 words
     wc = len(re.findall(r"[A-Za-z0-9']+", t))
     return 3 <= wc <= 12
+
+# ---------- Uniqueness guards ----------
+def activity_digest(obj: dict) -> str:
+    try:
+        payload = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        payload = str(obj)
+    return hashlib.sha1(payload.encode("utf-8","ignore")).hexdigest()
+
+def is_duplicate(tag: str, obj: dict) -> bool:
+    key = f"seen_{tag}"
+    dig = activity_digest(obj)
+    seen = st.session_state.get(key, [])
+    if dig in seen:
+        return True
+    seen = (seen + [dig])[-25:]
+    st.session_state[key] = seen
+    return False
+
 # ---------- Generators with triple-quoted f-strings ----------
 
 def gen_dnd_from_scope(scope: str, prompt: str):
@@ -452,7 +541,18 @@ Return STRICT JSON (no markdown):
         draggables = terms
         answer = {t: mapping.get(t) for t in terms}
         hint_map = {t: (hints.get(t) or "Re-read the exact slide phrase.") for t in terms}
+        
+        payload = {"title": title, "bins": labels, "terms": draggables, "mapping": answer}
+        if is_duplicate("dnd", payload) and attempt == 0:
+            continue
+        
+        payload = {"title": title, "bins": labels, "terms": draggables, "mapping": answer}
+        if is_duplicate("dnd", payload):
+            # Nudge for variety by shuffling terms order
+            random.Random(new_seed()).shuffle(draggables)
         return title, instr, labels, draggables, answer, hint_map
+
+
 
     return None
 
@@ -578,8 +678,11 @@ Return STRICT JSON array (no markdown). Each item:
             out.append({"stem": stem, "answers": ans[:2], "hint": hint})
 
         if len(out) == 4 and all(_intro_level_ok(i["stem"], i["answers"]) for i in out):
-            best = out
-            break
+            if not is_duplicate("fitb", {"items": out}) or attempt == 1:
+                best = out
+                break
+            else:
+                continue
 
     
     return best
