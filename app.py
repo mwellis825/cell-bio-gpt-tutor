@@ -1,6 +1,61 @@
 
 import os, re, json, pathlib, random, time, sys, io, unicodedata, requests
 import streamlit as st
+
+# ------------------ Utilities: JSON sanitize & prompt expansion ------------------
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+def _extract_json_block(s: str) -> str:
+    s = _strip_code_fences(s)
+    # Try array first
+    a_start = s.find("[")
+    a_end   = s.rfind("]")
+    o_start = s.find("{")
+    o_end   = s.rfind("}")
+    cand = ""
+    if a_start != -1 and a_end != -1 and a_end > a_start:
+        cand = s[a_start:a_end+1]
+        try:
+            json.loads(cand); return cand
+        except Exception: pass
+    if o_start != -1 and o_end != -1 and o_end > o_start:
+        cand = s[o_start:o_end+1]
+        try:
+            json.loads(cand); return cand
+        except Exception: pass
+    return s  # last resort
+
+BOND_KEYWORDS = {
+    "chemical": ["covalent", "ionic", "hydrogen bond", "van der waals", "noncovalent", "polar", "nonpolar", "bond energy", "electronegativity"],
+    "junctions": ["tight junction", "adherens", "desmosome", "hemidesmosome", "gap junction", "cell-cell adhesion", "cadherin", "integrin", "extracellular matrix"],
+    "cytoskeleton": ["microtubule", "actin", "intermediate filament", "cytoskeleton"]
+}
+
+def expand_prompt_keywords(p: str) -> list:
+    p = (p or "").lower()
+    base = re.findall(r"[a-z0-9']+", p)
+    expanded = set(base)
+    if "bond" in p or "bonds" in p:
+        for group in BOND_KEYWORDS.values():
+            expanded.update([w for w in " ".join(group).split() if len(w) > 2])
+    if "transport" in p:
+        expanded.update(["diffusion","channel","pump","carrier","symporter","antiporter","uniporter","gradient","atp"])
+    if "glycolysis" in p:
+        expanded.update(["pfk","pyruvate","nad","atp","enzyme","kinase"])
+    if "replication" in p:
+        expanded.update(["helicase","primase","polymerase","ligase","fork"])
+    if "transcription" in p:
+        expanded.update(["promoter","rna","pol","splice","cap","terminate"])
+    if "translation" in p:
+        expanded.update(["ribosome","a site","p site","release","trna","start codon","stop codon"])
+    return [w for w in expanded if len(w) > 2]
+
+
 from typing import List, Tuple, Dict, Any
 
 # ------------------ Page & Globals (unchanged UX) ------------------
@@ -1018,59 +1073,6 @@ if "fitb" in st.session_state:
                         "frameshift":"frameshift",
                     }.get(item["label"], item["label"])
                     st.info(pretty)
-
-# ------------------ Utilities: JSON sanitize & prompt expansion ------------------
-def _strip_code_fences(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    return s.strip()
-
-def _extract_json_block(s: str) -> str:
-    s = _strip_code_fences(s)
-    # Try array first
-    a_start = s.find("[")
-    a_end   = s.rfind("]")
-    o_start = s.find("{")
-    o_end   = s.rfind("}")
-    cand = ""
-    if a_start != -1 and a_end != -1 and a_end > a_start:
-        cand = s[a_start:a_end+1]
-        try:
-            json.loads(cand); return cand
-        except Exception: pass
-    if o_start != -1 and o_end != -1 and o_end > o_start:
-        cand = s[o_start:o_end+1]
-        try:
-            json.loads(cand); return cand
-        except Exception: pass
-    return s  # last resort
-
-BOND_KEYWORDS = {
-    "chemical": ["covalent", "ionic", "hydrogen bond", "van der waals", "noncovalent", "polar", "nonpolar", "bond energy", "electronegativity"],
-    "junctions": ["tight junction", "adherens", "desmosome", "hemidesmosome", "gap junction", "cell-cell adhesion", "cadherin", "integrin", "extracellular matrix"],
-    "cytoskeleton": ["microtubule", "actin", "intermediate filament", "cytoskeleton"]
-}
-
-def expand_prompt_keywords(p: str) -> list:
-    p = (p or "").lower()
-    base = re.findall(r"[a-z0-9']+", p)
-    expanded = set(base)
-    if "bond" in p or "bonds" in p:
-        for group in BOND_KEYWORDS.values():
-            expanded.update([w for w in " ".join(group).split() if len(w) > 2])
-    if "transport" in p:
-        expanded.update(["diffusion","channel","pump","carrier","symporter","antiporter","uniporter","gradient","atp"])
-    if "glycolysis" in p:
-        expanded.update(["pfk","pyruvate","nad","atp","enzyme","kinase"])
-    if "replication" in p:
-        expanded.update(["helicase","primase","polymerase","ligase","fork"])
-    if "transcription" in p:
-        expanded.update(["promoter","rna","pol","splice","cap","terminate"])
-    if "translation" in p:
-        expanded.update(["ribosome","a site","p site","release","trna","start codon","stop codon"])
-    return [w for w in expanded if len(w) > 2]
 
 def disambiguate_bonds(scope_text: str) -> str:
     """Decide whether 'bonds' likely means chemical bonds or cell junctions based on scope occurrences."""
