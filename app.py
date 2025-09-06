@@ -516,108 +516,31 @@ def _mine_style_cues(txt: str) -> Dict[str, Any]:
         "fitb_clues": sorted(list(set(fitb_clues)))[:20],
     }
 
-def load_style_profiles() -> Dict[str, Any]:
-    if "local_style_profile" in st.session_state:
-        return st.session_state["local_style_profile"]
-    paths = [
-        "/mnt/data/Biol366 F24 Exam #1 (Ch 1-6).pdf",
-        "/mnt/data/Exam #2 (Ch 7-10).pdf",
-        "/mnt/data/SP25 Group Activity 3 KEY.pdf",
-        "/mnt/data/SP25 Group Activity 4 KEY.pdf",
-        "/mnt/data/Exam #3 (Ch 11-16) Biol366 SP25.pdf",
-        "/mnt/data/Exam #4 (Ch 16-20) BIOL366 SP25.pdf",
-        "/mnt/data/F24 Group Activity 2 -- KEY.pdf",
-    ]
-    big_txt = ""
-    found_any = False
-    for p in paths:
-        if Path(p).exists():
-            found_any = True
-            big_txt += _extract_pdf_text(p) + "\n"
-    profile = {
-        "verbs": ["analyze","interpret","predict","evaluate","justify","determine"],
-        "scenario_markers": ["patient","cell line","experiment","assay","inhibitor","mutation","image","graph"],
-        "comparators": ["increase","decrease","higher","lower","upregulate","downregulate"],
-        "fitb_clues": ["because","leads to","results in","due to"],
-        "found_any": found_any,
-    }
-    if big_txt.strip():
-        cues = _mine_style_cues(big_txt)
-        for k in ("verbs","scenario_markers","comparators","fitb_clues"):
-            if cues.get(k):
-                profile[k] = cues[k]
-    st.session_state["local_style_profile"] = profile
-    return profile
 
-# ---------- Remote exam/group-activity style ingestion (GitHub) ----------
-ACTIVITIES_DIR_GH = "activities"     # put group activities here in your GitHub repo
-ALT_ACTIVITIES_DIR_GH = "group_activities"  # optional alternative dir name
-
-def _gh_list_paths(user: str, repo: str, paths: list[str], branch: str) -> list[dict]:
-    out = []
-    for p in paths:
-        try:
-            out.extend(_gh_list(user, repo, p, branch) or [])
-        except Exception:
-            continue
-    return out
-
-def load_remote_exam_styles() -> Dict[str, Any]:
-    # Collect text from /exams and /activities (or /group_activities) in the GitHub repo
-    gh_texts = []
-    items = _gh_list_paths(GITHUB_USER, GITHUB_REPO, [EXAMS_DIR_GH, ACTIVITIES_DIR_GH, ALT_ACTIVITIES_DIR_GH], GITHUB_BRANCH)
-    for it in items:
-        if it.get("type") != "file":
-            continue
-        name = (it.get("name") or "").lower()
-        url = it.get("download_url")
-        if not url:
-            continue
-        if name.endswith(".pdf"):
-            try:
-                txt = _read_pdf_bytes(_gh_fetch_raw(url))
-                if txt and len(txt.strip()) > 20:
-                    gh_texts.append(txt)
-            except Exception:
-                pass
-        elif name.endswith((".txt",".md",".html",".htm")):
-            try:
-                txt = (_gh_fetch_raw(url)).decode("utf-8","ignore")
-                if txt and len(txt.strip()) > 20:
-                    gh_texts.append(txt)
-            except Exception:
-                pass
-
-    merged = "\n\n".join(gh_texts)[:120000]
-    prof = {
-        "verbs": ["analyze","interpret","predict","evaluate","justify","determine"],
-        "scenario_markers": ["patient","cell line","experiment","assay","inhibitor","mutation","image","graph"],
-        "comparators": ["increase","decrease","higher","lower","upregulate","downregulate"],
-        "fitb_clues": ["because","leads to","results in","due to"],
-        "found_any": bool(merged.strip()),
-        "source": "github"
-    }
-    if merged.strip():
-        cues = _mine_style_cues(merged)
-        for k in ("verbs","scenario_markers","comparators","fitb_clues"):
-            if cues.get(k):
-                prof[k] = cues[k]
-    return prof
-
-# ---------- Unified style profile (local + GitHub) ----------
 def load_style_profiles() -> Dict[str, Any]:
     if "merged_style_profile" in st.session_state:
         return st.session_state["merged_style_profile"]
-    local_p = load_style_profiles()
-    remote_p = load_remote_exam_styles()
+    # Correct: call the local and remote loaders (not this function)
+    try:
+        local_p = load_local_exam_styles()
+    except Exception:
+        local_p = {}
+    try:
+        remote_p = load_remote_exam_styles()
+    except Exception:
+        remote_p = {}
     merged = {}
     for k in ("verbs","scenario_markers","comparators","fitb_clues"):
         vals = set((local_p or {}).get(k, []) + (remote_p or {}).get(k, []))
         merged[k] = sorted(list(vals))[:30]
     merged["found_any"] = bool((local_p or {}).get("found_any") or (remote_p or {}).get("found_any"))
-    merged["sources"] = [s for s in ["local" if (local_p or {}).get("found_any") else None, (remote_p.get("source") if remote_p.get("found_any") else None)] if s]
+    merged["sources"] = [s for s in [
+        "local" if (local_p or {}).get("found_any") else None,
+        "github" if (remote_p or {}).get("found_any") else None
+    ] if s]
     st.session_state["merged_style_profile"] = merged
     return merged
+
 # ---------- Generators with triple-quoted f-strings ----------
 
 def gen_dnd_from_scope(scope: str, prompt: str):
