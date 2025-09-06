@@ -757,9 +757,9 @@ if st.button("Generate"):
         st.session_state.corpus = load_corpus_from_github(SLIDES_GH_USER, SLIDES_GH_REPO, SLIDES_DIR_PATH, SLIDES_GH_BRANCH)
 
     topic = classify_topic(prompt) or "this topic"
-    # Disambiguate 'bonds' prompts based on slide scope
+    # Disambiguate "bonds" prompts based on slide scope
     _scope_for_disambig = build_scope_from_corpus(st.session_state.corpus or [], prompt, limit_chars=6000)
-    if re.search(r\"\bbond(s)?\b\", (prompt or \"\").lower()):
+    if re.search(r"\bbond(s)?\b", (prompt or "").lower()):
         topic = disambiguate_bonds(_scope_for_disambig)
     st.session_state.topic = topic
 
