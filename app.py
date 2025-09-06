@@ -120,8 +120,9 @@ TOPIC_PROFILES = {
         "exclude": ["replication","translation","transcription","repair","glycolysis"]
     },
     "chemical bonds": {
-        "include": ["covalent","ionic","hydrogen","van der waals","phosphodiester","peptide","bond","interaction","electrostatic"],
-        "exclude": ["membrane transport","glycolysis","translation","transcription"]
+        "Covalent bond": ["covalent","shared electron pair","electron sharing","peptide bond","disulfide bond","strong bond"],
+        "Ionic bond":    ["ionic","electron transfer","charge attraction","salt bridge","electrostatic attraction","cation-anion"],
+        "Hydrogen bond": ["hydrogen bond","partial charges","h-bond","between n-h and o","backbone hydrogen bonds"]
     }
 }
 
