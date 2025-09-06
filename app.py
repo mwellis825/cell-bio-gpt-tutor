@@ -276,6 +276,32 @@ def gen_dnd_from_scope(scope: str, prompt: str):
     return None
 
 
+
+def _count_blanks(stem: str) -> int:
+    """Count occurrences of blanks represented by 3+ underscores."""
+    return len(re.findall(r"_{3,}", stem or ""))
+
+def _is_boilerplate(stem: str) -> bool:
+    """Filter out generic, meta phrasing that isn't a learning statement."""
+    s = (stem or "").lower()
+    return ("immediate output would" in s) or ("near-term output would" in s)
+
+def _valid_fitb_items(items) -> bool:
+    """Validate a FITB set for variety and rigor."""
+    if not isinstance(items, list): return False
+    if not (4 <= len(items) <= 6): return False
+    for it in items:
+        stem = it.get("stem","")
+        ans  = it.get("answers",[])
+        hint = it.get("hint","")
+        if not isinstance(stem,str) or not isinstance(ans,list): return False
+        if _is_boilerplate(stem): return False
+        blanks = _count_blanks(stem)
+        if blanks < 1 or blanks > 2: return False
+        if not (1 <= len(ans) <= 5): return False
+        if not all(isinstance(a,str) and len(a.strip())>0 for a in ans): return False
+    return True
+
 def gen_fitb_from_scope(scope: str, prompt: str):
     client = _openai_client()
     if client is None or not scope.strip():
