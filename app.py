@@ -1,32 +1,38 @@
 
-import os, re, json, pathlib, random, time, sys
+import os, re, json, pathlib, random, time, sys, io, unicodedata, requests
 import streamlit as st
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Any
 
-# ------------------ Page & Globals ------------------
+# ------------------ Page & Globals (unchanged UX) ------------------
 st.set_page_config(page_title="Let's Practice Biology!", page_icon="🎓", layout="wide")
-SLIDES_DIR = os.path.join(os.getcwd(), "slides")
+st.title("Let's Practice Biology!")
+SLIDES_GH_USER   = "mwellis825"   # <-- set once here
+SLIDES_GH_REPO   = "cell-bio-gpt-tutor"         # <-- set once here
+SLIDES_GH_BRANCH = "main"                    # <-- set once here
+SLIDES_DIR_PATH  = "slides"                  # fixed folder in the repo
 
+# Helper for consistent randomness as before
 def new_seed() -> int:
     return int(time.time() * 1000) ^ random.randint(0, 1_000_000)
 
-# ------------------ LLM hint (optional) ------------------
+# ------------------ Optional LLM for hints (kept from current behavior) ------------------
 def _try_llm(prompt: str) -> str:
     api = os.environ.get("OPENAI_API_KEY")
     if not api:
         raise RuntimeError("No API key")
-    import openai  # type: ignore
-    openai.api_key = api
-    resp = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
+    from openai import OpenAI  # type: ignore
+    client = OpenAI(api_key=api)
+    resp = client.chat.completions.create(
+        model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
         messages=[
             {"role":"system","content":"You are a Socratic college-level cell biology tutor. Ask ONE concise guiding question (< 20 words) that nudges the student to the answer without revealing it."},
             {"role":"user","content":prompt},
         ],
         temperature=0.3,
         max_tokens=60,
+        seed=42,
     )
-    return resp["choices"][0]["message"]["content"].strip()
+    return resp.choices[0].message.content.strip()
 
 def llm_hint_for_fitb(stem: str, target: str, topic: str, fallback: str) -> str:
     try:
@@ -47,7 +53,7 @@ def llm_hint_for_dnd(item: str, target_label: str, labels: list, topic: str, fal
     except Exception:
         return fallback
 
-# ------------------ Simple text extraction from slides ------------------
+# ------------------ PDF/Text extraction (compatible with current app) ------------------
 PDF_BACKEND = None
 try:
     import PyPDF2  # type: ignore
@@ -59,63 +65,76 @@ except Exception:
     except Exception:
         PDF_BACKEND = None
 
-def read_pdf(path: str) -> str:
+def read_pdf_bytes(pdf_bytes: bytes) -> str:
     if PDF_BACKEND == "PyPDF2":
         try:
-            with open(path,"rb") as f:
-                reader = PyPDF2.PdfReader(f)  # type: ignore
-                return "\\n".join([(p.extract_text() or "") for p in reader.pages])
+            reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))  # type: ignore
+            return "\\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
     if PDF_BACKEND == "pypdf":
         try:
-            with open(path,"rb") as f:
-                reader = pypdf.PdfReader(f)  # type: ignore
-                return "\\n".join([(p.extract_text() or "") for p in reader.pages])
+            reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))  # type: ignore
+            return "\\n".join([(p.extract_text() or "") for p in reader.pages])
         except Exception:
             return ""
     return ""
 
-def read_text(path: str) -> str:
+def read_text_bytes(raw: bytes) -> str:
+    # Try utf-8, fallback latin-1
     for enc in ("utf-8","latin-1"):
         try:
-            with open(path,"r",encoding=enc) as f:
-                return f.read()
+            return raw.decode(enc)
         except Exception:
             continue
     return ""
 
-def load_corpus(slides_dir: str):
-    texts = []
-    if not os.path.isdir(slides_dir): return texts
-    base = pathlib.Path(slides_dir)
-    for p in base.rglob("*"):
-        if not p.is_file(): continue
-        ext = p.suffix.lower()
-        if ext == ".pdf":
-            t = read_pdf(str(p))
-        elif ext in {".txt",".md",".mdx",".html",".htm"}:
-            t = read_text(str(p))
-        else:
-            t = ""
-        if t and len(t.strip()) > 20:
-            texts.append(t)
-    return texts
+# ------------------ GitHub fetchers (new, replaces local /slides reading) ------------------
+def gh_list_slides(user: str, repo: str, path: str, branch: str) -> List[Dict[str, Any]]:
+    """
+    Return a list of files in /slides via GitHub Contents API.
+    """
+    url = f"https://api.github.com/repos/{user}/{repo}/contents/{path}?ref={branch}"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    return r.json() if isinstance(r.json(), list) else []
 
-# ------------------ Topic recognition ------------------
-def classify_topic(prompt: str) -> str:
-    p = (prompt or "").lower()
-    if "organelle" in p or "organelles" in p: return "organelle function"
-    if "replicat" in p: return "dna replication"
-    if "transcription" in p: return "transcription"
-    if "translation" in p: return "translation"
-    if "glycolysis" in p: return "glycolysis"
-    if "membrane" in p or "transport" in p: return "membrane transport"
-    if "protein sorting" in p or "signal sequence" in p or "er signal" in p: return "protein sorting"
-    if "cell cycle" in p or "mitosis" in p: return "cell cycle"
-    return (p.split(",")[0].split(";")[0] or "this topic").strip()
+def gh_fetch_raw(url: str) -> bytes:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.content
 
-# ------------------ FITB helpers ------------------
+@st.cache_data(show_spinner=False)
+def load_corpus_from_github(user: str, repo: str, path: str, branch: str):
+    corpus = []
+    try:
+        items = gh_list_slides(user, repo, path, branch)
+    except Exception as e:
+        st.error(f"Could not list slides from GitHub: {e}")
+        return corpus
+
+    for it in items:
+        if it.get("type") != "file":
+            continue
+        name = (it.get("name") or "").lower()
+        raw_url = it.get("download_url")
+        if not raw_url:
+            # try to build raw URL
+            raw_url = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}/{it.get('name')}"
+        try:
+            if name.endswith(".pdf"):
+                txt = read_pdf_bytes(gh_fetch_raw(raw_url))
+            elif name.endswith((".txt",".md",".mdx",".html",".htm")):
+                txt = read_text_bytes(gh_fetch_raw(raw_url))
+            else:
+                txt = ""
+        except Exception:
+            txt = ""
+        if txt and len(txt.strip()) > 20:
+            corpus.append(txt)
+    return corpus
+
+# ------------------ Simple retrieval & sentence matching (kept but strengthened) ------------------
 STOP = {"the","and","for","that","with","this","from","into","are","was","were","has","have","had","can","will","would","could","should",
         "a","an","of","in","on","to","by","as","at","or","be","is","it","its","their","our","your","if","when","then","than","but",
         "we","you","they","which","these","those","there","here","such","may","might","also","very","much","many","most","more","less"}
@@ -157,9 +176,22 @@ def collect_prompt_matched(corpus, prompt: str, top_docs=6, max_sents=800):
         for s in sents:
             if relevance(s, q) > 0:
                 matched.append(s)
-    return matched
+    return matched[:200]
 
-# Acceptance categories and synonyms
+# ------------------ Topic recognition (unchanged) ------------------
+def classify_topic(prompt: str) -> str:
+    p = (prompt or "").lower()
+    if "organelle" in p or "organelles" in p: return "organelle function"
+    if "replicat" in p: return "dna replication"
+    if "transcription" in p: return "transcription"
+    if "translation" in p: return "translation"
+    if "glycolysis" in p: return "glycolysis"
+    if "membrane" in p or "transport" in p: return "membrane transport"
+    if "protein sorting" in p or "signal sequence" in p or "er signal" in p: return "protein sorting"
+    if "cell cycle" in p or "mitosis" in p: return "cell cycle"
+    return (p.split(",")[0].split(";")[0] or "this topic").strip()
+
+# ------------------ Acceptance logic (unchanged) ------------------
 UP = {"increase","increases","increased","up","higher","stabilizes","stabilize","stabilized","faster","more","↑","improves","greater","accumulate","accumulates","builds up","build up"}
 DOWN = {"decrease","decreases","decreased","down","lower","destabilizes","destabilize","destabilized","slower","less","↓","reduces","reduced","loss"}
 NOCH = {"no change","unchanged","same","neutral","nc","~"}
@@ -189,7 +221,6 @@ def matches_label(user: str, key: str) -> bool:
     if key == "frameshift": return any(x in u for x in FRAME)
     return False
 
-# Specific-answer acceptance with synonyms + targeted hints
 SYNONYMS = {
     "endoplasmic reticulum": {"er","endoplasmic reticulum","rough er","smooth er"},
     "rough endoplasmic reticulum": {"rough er","rer","rough endoplasmic reticulum"},
@@ -242,8 +273,7 @@ SPECIFIC_HINTS = {
 }
 
 def normalize_answer(a: str) -> str:
-    a = norm_text(a)
-    return a
+    a = norm_text(a); return a
 
 def matches_specific(user: str, answers: List[str]) -> bool:
     u = normalize_answer(user)
@@ -260,7 +290,6 @@ def specific_hint_for_answer(ans: str) -> str:
     a = ans.lower()
     if a in SPECIFIC_HINTS:
         return SPECIFIC_HINTS[a]
-    # heuristic fallbacks
     if "matrix" in a and "mitochond" in a:
         return "Innermost mitochondrial space enclosed by the inner membrane."
     if "endoplasmic reticulum" in a or a.endswith(" er"):
@@ -271,7 +300,7 @@ def specific_hint_for_answer(ans: str) -> str:
         return "Double membrane with pores; DNA location."
     return "Use the most specific biological term for the location or component."
 
-# FITB stems (mix of reasoning + specific recall)
+# ------------------ Existing FITB generation (fallback preserved) ------------------
 def extract_focus(stem: str) -> str:
     s = stem.lower()
     m = re.search(r"if ([^,]+?) (is|cannot|can't|does not|doesn't|fails|fail)", s)
@@ -401,7 +430,7 @@ def build_fitb(topic: str, rng: random.Random) -> List[Dict]:
     rng.shuffle(items)
     return items[:4]
 
-# ------------------ DnD generators ------------------
+# ------------------ DnD activity generators (fallback preserved) ------------------
 def organelle_pairs(rng: random.Random) -> Tuple[str, list, list, dict, dict]:
     bank = [
         ("Nucleus","DNA is housed; transcription occurs"),
@@ -473,7 +502,6 @@ def order_pairs(topic: str) -> Tuple[str, list, list, dict, dict]:
     return title, labels, terms, answer, hint_map
 
 def glycolysis_pairs(rng: random.Random) -> Tuple[str, list, list, dict, dict]:
-    """Glycolysis-specific matching: enzyme/component → function (unambiguous)."""
     pairs = [
         ("Hexokinase","Phosphorylates glucose in the first step"),
         ("Phosphofructokinase‑1 (PFK‑1)","Commits pathway by converting F6P to F1,6BP"),
@@ -580,8 +608,133 @@ def build_dnd_activity(topic: str) -> Tuple[str, list, list, dict, dict]:
             return protein_function_pairs(topic)
     return protein_function_pairs(topic)
 
-# ------------------ UI ------------------
-st.title("Let's Practice Biology!")
+# ------------------ New: LLM activity generation grounded in slides ------------------
+LLM_SYS = "You generate concise interactive activities grounded ONLY in the provided slide excerpts. Never reveal answers. Use simple student-friendly language."
+
+def _llm_json(prompt: str, max_tokens=900, temperature=0.1) -> str:
+    api = os.environ.get("OPENAI_API_KEY")
+    if not api:
+        return ""
+    from openai import OpenAI  # type: ignore
+    client = OpenAI(api_key=api)
+    resp = client.chat.completions.create(
+        model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
+        messages=[{"role":"system","content":LLM_SYS},{"role":"user","content":prompt}],
+        temperature=temperature,
+        max_tokens=max_tokens,
+        seed=42,
+    )
+    return resp.choices[0].message.content or ""
+
+def build_scope_from_corpus(corpus: List[str], prompt: str, limit_chars: int = 4000) -> str:
+    sents = collect_prompt_matched(corpus, prompt, top_docs=6, max_sents=1200)
+    scope = "\\n".join(sents)[:limit_chars]
+    return scope
+
+def llm_generate_dnd(scope: str, topic: str) -> Tuple[str, list, list, dict, dict]:
+    """
+    Ask the LLM to produce bins (labels), draggables (terms), a mapping, and short hints — all derived from scope.
+    """
+    if not scope.strip():
+        return ("", [], [], {}, {})
+    schema = {
+        "title": "string",
+        "bins": ["string"],                # labels shown as bins
+        "terms": ["string"],               # draggable items
+        "mapping": {"term->bin": "dict"},  # keys: terms, values: bin label
+        "hints": {"term->hint": "dict"}    # one short hint per term, non-revealing
+    }
+    prompt = f"""Create ONE drag-and-drop activity based ONLY on the slide excerpts below.
+
+Slide excerpts:
+\"\"\"
+{scope}
+\"\"\"
+
+Topic: {topic}
+
+Rules:
+- Return STRICT JSON only (no markdown), with keys: title, bins, terms, mapping, hints.
+- bins: 2-4 concise bin labels.
+- terms: 2-4 draggable items, each must match one of the bins via mapping.
+- mapping: object where each key is a term and each value is a bin label from bins.
+- hints: object where each key is a term and the value is ONE helpful hint that does NOT reveal the bin.
+- Use only concepts present in the excerpts.
+- Keep the language student-friendly.
+- Do NOT include answers in hints.
+"""
+    raw = _llm_json(prompt)
+    if not raw.strip():
+        return ("", [], [], {}, {})
+    # Basic JSON parse & validation
+    try:
+        data = json.loads(raw)
+        title = data.get("title") or "Match the concepts to the correct category."
+        bins = data.get("bins") or []
+        terms = data.get("terms") or []
+        mapping = data.get("mapping") or {}
+        hints = data.get("hints") or {}
+        # minimal sanity
+        if not (2 <= len(bins) <= 4 and 2 <= len(terms) <= 4):
+            return ("", [], [], {}, {})
+        # Ensure mapping and hints entries
+        if any(t not in mapping for t in terms):
+            return ("", [], [], {}, {})
+        for t in terms:
+            if mapping[t] not in bins:
+                return ("", [], [], {}, {})
+        for t in terms:
+            if not isinstance(hints.get(t,""), str) or len(hints.get(t,"").strip()) < 3:
+                hints[t] = "Consider the defining feature that separates this from other categories."
+        # Convert to UI structures used by current app
+        instr = "Match each **item** to its **category**."
+        labels = bins
+        draggables = terms
+        answer = {t: mapping[t] for t in terms}  # NOTE: current app expects {term: BinLabel}
+        hint_map = hints
+        return instr, labels, draggables, answer, hint_map
+    except Exception:
+        return ("", [], [], {}, {})
+
+def llm_generate_fitb(scope: str, topic: str) -> List[Dict]:
+    """
+    Ask the LLM to produce up to 4 FITB items grounded only in scope.
+    """
+    if not scope.strip():
+        return []
+    prompt = f"""Create up to 4 fill-in-the-blank items based ONLY on the slide excerpts below.
+
+Slide excerpts:
+\"\"\"
+{scope}
+\"\"\"
+
+Topic: {topic}
+
+Rules:
+- Return STRICT JSON array only.
+- Each item is an object with: "stem" (string, with one blank as ______), "answers" (1-4 short accepted answers), "hint" (ONE short guiding hint).
+- Keep stems concise and assess key ideas explicitly present in the excerpts.
+- Do NOT reveal the answer in the hint.
+- Prefer specific terms actually present in the excerpts.
+"""
+    raw = _llm_json(prompt, max_tokens=800, temperature=0.1)
+    if not raw.strip():
+        return []
+    try:
+        items = json.loads(raw)
+        out = []
+        for it in items[:4]:
+            stem = it.get("stem","").strip()
+            ans  = it.get("answers",[]) or []
+            hint = it.get("hint","").strip() or "Focus on the specific term used in the slides."
+            if stem and "______" in stem and 1 <= len(ans) <= 4:
+                out.append({"stem":stem, "answers":ans, "hint":hint})
+        return out
+    except Exception:
+        return []
+
+# ------------------ UI Input (unchanged) ------------------
 prompt = st.text_input(
     "Enter a topic for review and press generate:",
     value="",
@@ -589,27 +742,41 @@ prompt = st.text_input(
     label_visibility="visible",
 )
 
+# ------------------ Generate button (mechanics preserved) ------------------
 if st.button("Generate"):
+    # Load corpus once from GitHub
     if "corpus" not in st.session_state:
-        st.session_state.corpus = load_corpus(SLIDES_DIR)
+        st.session_state.corpus = load_corpus_from_github(SLIDES_GH_USER, SLIDES_GH_REPO, SLIDES_DIR_PATH, SLIDES_GH_BRANCH)
+
     topic = classify_topic(prompt) or "this topic"
     st.session_state.topic = topic
 
-    # Build Drag-and-Drop first (Activity 1)
-    instr, labels, terms, answer, hint_map = build_dnd_activity(topic)
+    # -------- NEW: Build a scope from slides and try LLM-grounded activities --------
+    scope = build_scope_from_corpus(st.session_state.corpus or [], prompt, limit_chars=5000)
+
+    # Try LLM-based DnD first
+    instr, labels, terms, answer, hint_map = llm_generate_dnd(scope, topic)
+    if not labels or not terms or not answer:
+        # Fallback to previous heuristic generator (keeps current behavior)
+        instr, labels, terms, answer, hint_map = build_dnd_activity(topic)
+
+    # Save to session_state (same keys as current app)
     st.session_state.dnd_instr = instr
     st.session_state.drag_labels = labels
     st.session_state.drag_bank   = terms
     st.session_state.drag_answer = answer
     st.session_state.dnd_hints   = hint_map
 
-    # Build FITB (Activity 2) with mixed formats
+    # FITB via LLM first
     rng = random.Random(new_seed())
-    st.session_state.fitb = build_fitb(topic, rng)
+    fitb_items = llm_generate_fitb(scope, topic)
+    if not fitb_items:
+        fitb_items = build_fitb(topic, rng)  # fallback preserved
 
+    st.session_state.fitb = fitb_items
     st.success("Generated fresh activities.")
 
-# -------- Activity 1: Drag-and-Drop --------
+# -------- Activity 1: Drag-and-Drop (unchanged rendering/UI) --------
 if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","dnd_instr","dnd_hints"]):
     st.markdown("## Activity 1: Drag and Drop")
     topic = st.session_state.get("topic","this topic")
@@ -743,7 +910,7 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
             fb = hint_map.get(chosen_item, "Focus on the most distinctive clue in this item.")
             st.info(llm_hint_for_dnd(chosen_item, target_bin, labels, topic, fb))
 
-# -------- Activity 2: FITB --------
+# -------- Activity 2: FITB (unchanged rendering/UI) --------
 if "fitb" in st.session_state:
     st.markdown("---")
     topic_name = st.session_state.get("topic","this topic")
