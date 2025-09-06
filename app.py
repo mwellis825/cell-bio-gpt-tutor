@@ -864,37 +864,37 @@ def _fitb_has_scenario(stem: str) -> bool:
     low = (stem or "").lower()
     return any(tok in low for tok in SCENARIO_TOKENS)
 
+
 def llm_generate_fitb_application(scope: str, prompt: str, style: Dict[str,Any]) -> List[Dict[str,Any]] | None:
     client = _openai_client()
     if client is None or not scope.strip():
         return None
     nonce = _nonce()
-    verbs = ", ".join((style or {}).get("verbs", [])[:6]) or "interpret, predict, justify"
-    scen = ", ".join((style or {}).get("scenario_markers", [])[:8]) or "experiment, inhibitor, mutation, assay"
     sys = "You generate UNIQUE, application-focused FITB items strictly grounded in the provided slide excerpts. Never reveal answers."
-    user = f"""Create 4 fill-in-the-blank items that require application (not recall) for an introductory biology course.
-
-Topic (student prompt): "{prompt}"
-Novelty nonce: {nonce}
-
-Slide excerpts (authoritative facts — cite page/line numbers if present):
-\"\"\"
-{scope}
-\"\"\"
-
-Constraints (must follow ALL):
-- Each item starts with a SHORT SCENARIO (e.g., condition, mutation, inhibitor, experiment). Keep total 12–22 words.
-- Exactly ONE blank (_____). Answer must be ONE WORD (or hyphenated) that appears in the excerpts.
-- Avoid definitional phrasings (e.g., "is called", "is defined as").
-- Use plain, concrete language; no ambiguous phrasing; intro level only.
-- Provide a short, supportive hint grounded in the scenario.
-- Provide slide_refs for each item (list of small integers).
-
-Return STRICT JSON array of 4 objects:
-[
-  { "stem": "short scenario ... _____ ...", "answers": ["word"], "hint": "short hint", "slide_refs": [2] },
-  ...
-]"""
+    header = (
+        f"Create 4 fill-in-the-blank items that require application (not recall) for an introductory biology course.\n\n"
+        f"Topic (student prompt): \"{prompt}\"\n"
+        f"Novelty nonce: {nonce}\n\n"
+        "Slide excerpts (authoritative facts — cite page/line numbers if present):\n"
+        + '\"\"\"' + "\n" + scope + "\n" + '\"\"\"' + "\n\n"
+    )
+    constraints = (
+        "Constraints (must follow ALL):\n"
+        "- Each item starts with a SHORT SCENARIO (e.g., condition, mutation, inhibitor, experiment). Keep total 12–22 words.\n"
+        "- Exactly ONE blank (_____). Answer must be ONE WORD (or hyphenated) that appears in the excerpts.\n"
+        "- Avoid definitional phrasings (e.g., \"is called\", \"is defined as\").\n"
+        "- Use plain, concrete language; no ambiguous phrasing; intro level only.\n"
+        "- Provide a short, supportive hint grounded in the scenario.\n"
+        "- Provide slide_refs for each item (list of small integers).\n\n"
+        "Return STRICT JSON array of 4 objects:\n"
+        "[\n"
+        "  { \"stem\": \"short scenario ... _____ ...\", \"answers\": [\"word\"], \"hint\": \"short hint\", \"slide_refs\": [2] },\n"
+        "  { \"stem\": \"...\", \"answers\": [\"word\"], \"hint\": \"...\", \"slide_refs\": [3] },\n"
+        "  { \"stem\": \"...\", \"answers\": [\"word\"], \"hint\": \"...\", \"slide_refs\": [1] },\n"
+        "  { \"stem\": \"...\", \"answers\": [\"word\"], \"hint\": \"...\", \"slide_refs\": [2] }\n"
+        "]"
+    )
+    user = header + constraints
     raw = _chat(client, sys, user, max_tokens=900, temperature=0.55, seed=new_seed()%1_000_000)
     try:
         items = json.loads(_extract_json_block(raw))
@@ -915,16 +915,13 @@ Return STRICT JSON array of 4 objects:
             return None
         if not _fitb_has_scenario(stem):
             return None
-        # answer present in scope
         a0 = (ans[0] if isinstance(ans[0], str) else "").strip()
         if not a0 or a0.lower() not in low_scope:
             return None
         out.append({"stem": stem, "answers": [a0], "hint": it.get("hint",""), "slide_refs": it.get("slide_refs", [])})
-    # Uniqueness
     if not _remember("fitb", {"items": out}):
         return None
     return out
-
 
 def gen_fitb_from_scope(scope: str, prompt: str):
     style = st.session_state.get("merged_style_profile", {})
