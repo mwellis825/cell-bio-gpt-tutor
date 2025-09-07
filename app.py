@@ -88,7 +88,7 @@ def load_corpus_from_github(user: str, repo: str, path: str, branch: str) -> Lis
                 txt = _read_pdf_bytes(_gh_fetch_raw(raw_url))
             elif name.endswith((".txt",".md",".html",".htm")):
                 txt = (_gh_fetch_raw(raw_url)).decode("utf-8","ignore")
-# (removed stray else)
+            else:
                 txt = ""
         except Exception:
             txt = ""
@@ -955,21 +955,6 @@ def ensure_four_fitb(fitb_items, topic: str):
 
 
 
-
-def build_dnd_from_scope_fallback(scope: str, topic: str):
-    """Smart fallback: never produce canned content. Try strict generator a few times; else return None."""
-    if 'llm_generate_dnd_strict' in globals():
-        for _attempt in range(6):
-            try:
-                out = llm_generate_dnd_strict(scope, topic)
-                if out:
-                    return out
-            except Exception:
-                continue
-    return None
-
-
-# ---------- Fallbacks ----------
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
     options = {
@@ -1027,7 +1012,7 @@ def build_fitb(topic: str, rng: random.Random) -> List[Dict[str,Any]]:
         items.append({"stem":"Ionic bonds result from _____ attraction between charges.","answers":["electrostatic"],"hint":"Opposite charges."})
         items.append({"stem":"DNA strands are held together by _____ bonds between bases.","answers":["hydrogen"],"hint":"Noncovalent interactions."})
         items.append({"stem":"The backbone of DNA is linked by _____ bonds.","answers":["phosphodiester"],"hint":"Between nucleotides."})
-# (removed stray else)
+    else:
         items.append({"stem":"Proteins are made from _____ linked together.","answers":["amino acids","amino-acids"],"hint":"Monomers of proteins."})
         items.append({"stem":"Genes are expressed first by making _____ from DNA.","answers":["mrna","messenger rna"],"hint":"Template for translation."})
         items.append({"stem":"A cell membrane is a lipid _____ with proteins.","answers":["bilayer"],"hint":"Two leaflets."})
@@ -1123,12 +1108,12 @@ def gen_exam_question(scope: str, style: Dict[str,Any], user_prompt: str) -> Dic
             opts = q.get("options", [])
             if not (isinstance(opts, list) and 3 <= len(opts) <= 5 and isinstance(q.get("answer",""), str)):
                 return None
-# (removed stray else)
+        else:
             if not isinstance(q.get("answer",""), str) or not q["answer"].strip():
                 return None
         if isinstance(q.get("slide_refs"), list):
             q["slide_refs"] = [int(x) for x in q["slide_refs"] if str(x).isdigit() or isinstance(x,int)]
-# (removed stray else)
+        else:
             q["slide_refs"] = []
         return q
     except Exception:
@@ -1148,19 +1133,19 @@ def render_exam():
                 correct = q.get("answer","")
                 if isinstance(correct, str) and choice and choice.strip().upper().startswith(correct.strip().upper()):
                     st.success("Correct ✅")
-# (removed stray else)
+                else:
                     st.error(f"Not quite. Correct answer: {correct}")
                 st.caption(f"Bloom: {q.get('bloom','?')} • Difficulty: {q.get('difficulty','?')} • Slides: {', '.join(str(x) for x in q.get('slide_refs',[]))}")
                 if q.get("rationale"):
                     st.info(q["rationale"])
-# (removed stray else)
+        else:
             user_sa = st.text_input("Your short answer:", key="exam_sa")
             if st.button("Check short answer"):
                 correct = q.get("answer","")
                 n = lambda s: re.sub(r"[^a-z0-9]+","", s.lower())
                 if n(user_sa) == n(correct):
                     st.success("Correct ✅")
-# (removed stray else)
+                else:
                     st.error(f"Expected: {correct}")
                 st.caption(f"Bloom: {q.get('bloom','?')} • Difficulty: {q.get('difficulty','?')} • Slides: {', '.join(str(x) for x in q.get('slide_refs',[]))}")
                 if q.get("rationale"):
@@ -1193,9 +1178,9 @@ if go:
         __res = build_dnd_from_scope_fallback(scope, topic)
         if __res:
             title, instr, labels, terms, answer, hint_map = __res
-# (removed stray else)
+        else:
             title = instr = labels = terms = answer = hint_map = None
-# (removed stray else)
+    else:
         title, instr, labels, terms, answer, hint_map = dnd
     st.session_state.dnd_title = title
     st.session_state.dnd_instr = instr
@@ -1372,7 +1357,7 @@ if "fitb" in st.session_state:
                 elif close:
                     st.warning("Almost there.")
                     st.info(feedback)
-# (removed stray else)
+                else:
                     st.warning("Not quite.")
                     st.info(feedback)
         with col3:
@@ -1432,4 +1417,19 @@ Return STRICT JSON ONLY:
         if len(r.split()) > 14 or len(r) < 4: return None
         if not q or q.lower() not in low_scope: return None
     return data
+
+
+
+
+def build_dnd_from_scope_fallback(scope: str, topic: str):
+    """Smart fallback: never produce canned content. Try strict generator a few times; else return None."""
+    if 'llm_generate_dnd_strict' in globals():
+        for _attempt in range(6):
+            try:
+                out = llm_generate_dnd_strict(scope, topic)
+                if out:
+                    return out
+            except Exception:
+                continue
+    return None
 
