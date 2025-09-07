@@ -1309,10 +1309,10 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
     st.markdown(f"**{st.session_state.get('dnd_title','Match items')}**")
     st.markdown(st.session_state.dnd_instr)
 
-    labels = st.session_state.drag_labels or []
-    terms  = st.session_state.drag_bank or []
-    answer = st.session_state.drag_answer or {}
-    hint_map = st.session_state.dnd_hints or {}
+    labels = st.session_state.drag_labels
+    terms  = st.session_state.drag_bank
+    answer = st.session_state.drag_answer
+    hint_map = st.session_state.dnd_hints
 
     items_html = "".join([f'<li class="card" draggable="true">{t}</li>' for t in terms])
     cols_count = (len(labels)+1)//2 if len(labels) > 2 else 2
@@ -1468,3 +1468,40 @@ if "fitb" in st.session_state:
 
 # Optional exam renderer if you keep exam_q
 render_exam()
+\n\n
+def build_dnd_from_scope(scope: str, topic: str):
+    """Generate ONE good DnD using the strict LLM path only.
+    - No template fallback.
+    - Rejects the known bad 'bonds' template.
+    - Ensures per-session uniqueness.
+    Returns 6-tuple (title,instr,labels,terms,answer,hint_map) or None.
+    """
+    try:
+        style = st.session_state.get("merged_style_profile", {})
+    except Exception:
+        style = {}
+    # Attempt a few times to avoid bad-first artifact
+    for _attempt in range(5):
+        try:
+            out = llm_generate_dnd_strict(scope, topic, style)
+        except Exception:
+            out = None
+        if not out:
+            continue
+        title, instr, labels, terms, answer, hint_map = out
+        # Reject exact old template (bins/draggables combo)
+        bad_bins = {'covalent bond','ionic bond','hydrogen bond'}
+        bad_terms = {'electron sharing','exchanging electrons','charge attraction','polar interaction'}
+        if set(t.lower() for t in terms) == bad_terms and set(b.lower() for b in labels) == bad_bins:
+            continue
+        # Uniqueness guard across session
+        payload = {"labels":labels,"terms":terms,"answer":answer}
+        dig = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8","ignore")).hexdigest()
+        seen = st.session_state.get("_seen_dnd_digests", set())
+        if dig in seen:
+            continue
+        seen.add(dig)
+        st.session_state["_seen_dnd_digests"] = seen
+        return out
+    return None
+\n
