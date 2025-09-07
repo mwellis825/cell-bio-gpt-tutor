@@ -955,6 +955,24 @@ def ensure_four_fitb(fitb_items, topic: str):
 
 
 
+
+def build_dnd_from_scope_fallback(scope: str, topic: str):
+    """Fallback that never emits canned content.
+    Tries strict LLM generator a few more times using the classified topic as the prompt.
+    Returns None if all attempts fail so the caller can handle gracefully.
+    """
+    try:
+        style = st.session_state.get("merged_style_profile", {})
+    except Exception:
+        style = {}
+    for _ in range(6):
+        try:
+            out = llm_generate_dnd_strict(scope, topic, style)
+            if out is not None:
+                return out
+        except Exception:
+            continue
+    return None
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
     options = {
@@ -1363,72 +1381,3 @@ if "fitb" in st.session_state:
 
 # Optional exam renderer if you keep exam_q
 render_exam()
-
-
-
-def dnd_self_consistency_check(scope: str, bins: List[str], terms: List[str], mapping: Dict[str,str]) -> Optional[Dict[str,Any]]:
-    """
-    Validate DnD activity using LLM with supporting slide quotes.
-    """
-    sys = "You are validating a classification task for an introductory biology course. Be strict and correct."
-    user = f"""Authoritative slides:
-"""
-{scope}
-"""
-
-Bins (must choose from these exactly): {json.dumps(bins, ensure_ascii=False)}
-Terms: {json.dumps(terms, ensure_ascii=False)}
-Proposed mapping: {json.dumps(mapping, ensure_ascii=False)}
-
-For EACH term:
-- Choose the SINGLE correct bin from the list (if none is uniquely correct, mark AMBIGUOUS).
-- Provide a <=12 word rationale, and paste a short supporting QUOTE from the slides that justifies the mapping.
-- The quote must appear verbatim in the slides above.
-
-Return STRICT JSON ONLY:
-{{
-  "ok": true|false,
-  "ambiguous_terms": ["t?"],
-  "corrected_mapping": {{"term":"Bin", ...}},
-  "reasons": {{"term":"short rationale", ...}},
-  "supports": {{"term":"verbatim quote from slides", ...}}
-}}"""
-    data = chat_json(sys, user, temperature=0.15, seed=int(time.time())%1_000_000)
-    if not isinstance(data, dict):
-        return None
-    if data.get("ok") is False:
-        return None
-    if data.get("ambiguous_terms"):
-        return None
-    corr = data.get("corrected_mapping", {})
-    reasons = data.get("reasons", {})
-    supports = data.get("supports", {})
-    if set(corr.keys()) != set(terms):
-        return None
-    if not all(v in bins for v in corr.values()):
-        return None
-    # every term needs a short reason and a support that appears verbatim in scope
-    low_scope = (scope or "").lower()
-    for t in terms:
-        q = (supports.get(t,"") or "").strip()
-        r = (reasons.get(t,"") or "").strip()
-        if len(r.split()) > 14 or len(r) < 4:
-            return None
-        if not q or q.lower() not in low_scope:
-            return None
-    return data
-
-
-
-def build_dnd_from_scope_fallback(scope: str, topic: str):
-    """Smart fallback: never produce canned content. Try strict generator a few times; else return None."""
-    if 'llm_generate_dnd_strict' in globals():
-        for _attempt in range(6):
-            try:
-                out = llm_generate_dnd_strict(scope, topic)
-                if out:
-                    return out
-            except Exception:
-                continue
-    return None
-
