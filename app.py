@@ -638,25 +638,31 @@ Return STRICT JSON with fields:
     for row in amb:
         if not (isinstance(row, list) and len(row) == len(bins) and sum(1 for x in row if x is True) == 1):
             return None
+    # Ambiguity lexical check using bin keywords
+    if not isinstance(bin_kw, dict) or not all(b in bin_kw and isinstance(bin_kw[b], list) and bin_kw[b] for b in bins):
+        return None
 
-# Topic-specific axioms (intro bio correctness)
+# --- Intro Bio Axiom Guardrails (never mark these wrong) ---
 topic_l = (classify_topic(prompt) or "").lower()
 if "translation" in topic_l:
     for t in terms:
         tl = (t or "").lower(); dest = (mapping.get(t,"") or "").lower()
-        if ("stop codon" in tl or "release factor" in tl) and "termin" not in dest: return None
-        if ("start codon" in tl or "aug" in tl) and "init" not in dest: return None
-        if any(k in tl for k in ["peptidyl transferase","translocation","ef-g","ef g","ef-tu","ef tu"]) and "elong" not in dest: return None
+        if ("stop codon" in tl or "release factor" in tl) and "termin" not in dest:
+            return None
+        if ("start codon" in tl or "aug" in tl) and "init" not in dest:
+            return None
+        if any(k in tl for k in ["peptidyl transferase","translocation","ef-g","ef g","ef-tu","ef tu"]) and "elong" not in dest:
+            return None
 if "chemical bond" in topic_l or "bond" in topic_l:
     for t in terms:
         tl = (t or "").lower(); dest = (mapping.get(t,"") or "").lower()
-        if any(k in tl for k in ["shared electron","electron sharing","peptide bond","disulfide"]) and "covalent" not in dest: return None
-        if any(k in tl for k in ["electron transfer","cation","anion","salt bridge","electrostatic"]) and "ionic" not in dest: return None
-        if any(k in tl for k in ["hydrogen bond","partial charge","n-h","o-h","backbone hydrogen"]) and "hydrogen" not in dest: return None
-
-    # Ambiguity lexical check using bin keywords
-    if not isinstance(bin_kw, dict) or not all(b in bin_kw and isinstance(bin_kw[b], list) and bin_kw[b] for b in bins):
-        return None
+        if any(k in tl for k in ["shared electron","electron sharing","peptide bond","disulfide"]) and "covalent" not in dest:
+            return None
+        if any(k in tl for k in ["electron transfer","cation","anion","salt bridge","electrostatic"]) and "ionic" not in dest:
+            return None
+        if any(k in tl for k in ["hydrogen bond","partial charge","n-h","o-h","backbone hydrogen"]) and "hydrogen" not in dest:
+            return None
+# --- End Axioms ---
     # Each term must contain at least one token from its bin, and zero tokens from others
     low_scope = (scope or "").lower()
     for t in terms:
@@ -977,84 +983,45 @@ def build_dnd_from_scope_fallback(scope: str, topic: str):
     - 2–3 bins chosen from a vetted topic seed list, preferring those present in scope.
     - Exactly 4 meaningful terms built from topic seeds and phrases found in scope.
     - NO generic placeholders are ever used.
-    - Mapping follows intro-bio axioms (cannot be wrong).
     """
     topic_l = (topic or "").lower()
+    # Vetted seeds (intro level) with safe, concrete terms
     seeds = {
         "translation": {
             "bins": ["Initiation", "Elongation", "Termination"],
-            "terms": [
-                ("AUG start codon","Initiation"),
-                ("tRNA anticodon pairing","Elongation"),
-                ("peptide bond formation","Elongation"),
-                ("stop codon recognition","Termination")
-            ]
+            "terms": ["AUG start codon", "tRNA anticodon pairing", "peptide bond formation", "stop codon recognition"]
         },
         "transcription": {
             "bins": ["Initiation", "Elongation", "Termination"],
-            "terms": [
-                ("promoter binding","Initiation"),
-                ("RNA chain growth","Elongation"),
-                ("polyadenylation signal","Termination"),
-                ("termination signal","Termination")
-            ]
+            "terms": ["promoter binding", "RNA chain growth", "spliceosome assembly", "polyadenylation signal"]
         },
         "dna repair": {
             "bins": ["Base excision repair", "Nucleotide excision repair", "Mismatch repair"],
-            "terms": [
-                ("glycosylase removes base","Base excision repair"),
-                ("thymine dimer excision","Nucleotide excision repair"),
-                ("MutS mismatch recognition","Mismatch repair"),
-                ("DNA ligase seals nick","Base excision repair")
-            ]
+            "terms": ["glycosylase removes base", "thymine dimer excision", "MutS mismatch recognition", "DNA ligase seals nick"]
         },
         "dna replication": {
             "bins": ["Leading strand", "Lagging strand", "Origin"],
-            "terms": [
-                ("continuous synthesis","Leading strand"),
-                ("Okazaki fragments","Lagging strand"),
-                ("RNA primers by primase","Lagging strand"),
-                ("replication bubble","Origin")
-            ]
+            "terms": ["continuous synthesis", "Okazaki fragments", "RNA primers by primase", "replication bubble"]
         },
         "membrane transport": {
             "bins": ["Channel", "Carrier", "Pump"],
-            "terms": [
-                ("passive ion flow","Channel"),
-                ("alternating access","Carrier"),
-                ("ATP-driven transport","Pump"),
-                ("electrochemical gradient","Channel")
-            ]
+            "terms": ["passive ion flow", "alternating access", "ATP-driven transport", "electrochemical gradient"]
         },
         "chemical bonds": {
             "bins": ["Covalent bond", "Ionic bond", "Hydrogen bond"],
-            "terms": [
-                ("electron sharing","Covalent bond"),
-                ("charge attraction","Ionic bond"),
-                ("hydrogen bond donor-acceptor","Hydrogen bond"),
-                ("partial charges","Hydrogen bond")
-            ]
+            "terms": ["electron sharing", "charge attraction", "polar interaction", "partial charges"]
         },
         "organelle function": {
             "bins": ["Nucleus", "Mitochondrion", "Golgi"],
-            "terms": [
-                ("houses DNA","Nucleus"),
-                ("ATP production","Mitochondrion"),
-                ("protein modification","Golgi"),
-                ("vesicle trafficking","Golgi")
-            ]
+            "terms": ["houses DNA", "ATP production", "protein modification", "vesicle trafficking"]
         },
         "glycolysis": {
             "bins": ["Energy investment", "Cleavage", "Energy payoff"],
-            "terms": [
-                ("hexokinase phosphorylation","Energy investment"),
-                ("fructose-1,6-bisphosphate splitting","Cleavage"),
-                ("ATP generation","Energy payoff"),
-                ("pyruvate formation","Energy payoff")
-            ]
+            "terms": ["hexokinase phosphorylation", "fructose-1,6-bisphosphate splitting", "ATP generation", "pyruvate formation"]
         }
     }
 
+    # choose key
     key = None
     for k in seeds.keys():
         if k in topic_l:
@@ -1062,30 +1029,56 @@ def build_dnd_from_scope_fallback(scope: str, topic: str):
     if key is None:
         key = "organelle function"
 
-    bins = seeds[key]["bins"][:3]
-    # Prefer bins that literally appear in scope
-    present = [b for b in bins if _label_in_scope(b, scope)]
-    if len(present) >= 2:
-        bins = present[:3]
+    # Prefer bins that are literally present in scope; else use seeds
+    bins_seed = seeds[key]["bins"]
+    bins = [b for b in bins_seed if _label_in_scope(b, scope)]
+    if len(bins) < 2:
+        bins = bins_seed[:3]
+    bins = bins[:3]
 
-    # Choose 4 terms; if scope contains a more specific phrasing for a seed term, prefer it
-    scope_terms = _slide_terms(scope, max_terms=60)
-    chosen = []
+    # Build 4 concrete terms: prefer those that appear in scope, otherwise safe seeds
+    candidate_terms = []
+    # From scope: short phrases containing seed keywords
+    scope_terms = _slide_terms(scope, max_terms=40)
+    for t in scope_terms:
+        tl = t.lower()
+        for kw in [w.lower() for w in seeds[key]["terms"]]:
+            if any(tok in tl for tok in kw.split()[:2]) and 2 <= len(t.split()) <= 6 and ("," not in t and ";" not in t):
+                candidate_terms.append(t)
+                break
+
+    # Add seed terms themselves
+    candidate_terms += seeds[key]["terms"]
+
+    # Dedup and pick 4
+    used = set()
+    terms = []
+    for t in candidate_terms:
+        tt = t.strip()
+        if not tt or tt.lower() in used:
+            continue
+        # Avoid vague starters
+        if re.match(r"^(where|when|how|why|which|that)", tt.lower()):
+            continue
+        # keep short and concrete
+        if not (2 <= len(tt.split()) <= 6):
+            continue
+        if "," in tt or ";" in tt:
+            continue
+        terms.append(tt)
+        used.add(tt.lower())
+        if len(terms) == 4:
+            break
+
+    # Map terms evenly across bins
     mapping = {}
-    for term, bin_lbl in seeds[key]["terms"]:
-        # find scope variant
-        best = None
-        for s in scope_terms:
-            if all(tok in s.lower() for tok in term.lower().split()[:2]):
-                best = s; break
-        t_use = best or term
-        if t_use not in mapping and len(chosen) < 4:
-            chosen.append(t_use); mapping[t_use] = bin_lbl
+    for i, t in enumerate(terms):
+        b = bins[i % len(bins)]
+        mapping[t] = b
 
-    terms = chosen[:4]
-    hints = {t: "Use the slide phrase that fits this category." for t in terms}
     title = f"Match items for {topic.title()}"
     instr = "Drag each item to the correct category."
+    hints = {t: "Use the slide phrase that fits this category." for t in terms}
     return title, instr, bins, terms, mapping, hints
 
 # ---------- Fallbacks ----------
@@ -1284,73 +1277,6 @@ def render_exam():
                 st.caption(f"Bloom: {q.get('bloom','?')} • Difficulty: {q.get('difficulty','?')} • Slides: {', '.join(str(x) for x in q.get('slide_refs',[]))}")
                 if q.get("rationale"):
                     st.info(q["rationale"])
-
-
-
-
-def evaluate_dnd(choices: Dict[str,str], mapping: Dict[str,str]) -> Tuple[int,int,List[str]]:
-    """
-    Mark as correct when:
-      • chosen bin == gold bin, OR
-      • chosen bin is at least as plausible as any other bin based on scope-derived cues (ties count as correct),
-    but NEVER override core intro-bio axioms (e.g., stop codon -> Termination, electron sharing -> Covalent).
-    """
-    total = len(mapping); wrong = []
-    bins = sorted(set(list(mapping.values()) + list(set(choices.values()))))
-    # Build a lightweight topic guess
-    topic = classify_topic(st.session_state.get("prompt_used","") or "")
-    scope = st.session_state.get("scope","") or ""
-    # Scope-derived keyword index
-    idx = keyword_index_from_scope(bins, scope) if 'keyword_index_from_scope' in globals() else {b:set() for b in bins}
-
-    # Domain axioms for intro biology
-    axioms = []
-    t = (topic or "").lower()
-    if "translation" in t:
-        axioms.extend([
-            (r"\b(stop codon|release factor)\b", r"\btermin", "Stop codon recognition/Release factor must map to Termination"),
-            (r"\b(start codon|AUG)\b", r"\binit", "Start codon (AUG) must map to Initiation"),
-            (r"\b(peptidyl transferase|translocation|ef[-\s]?g|ef[-\s]?tu)\b", r"\belong", "These elongation features must map to Elongation"),
-        ])
-    if "chemical bond" in t or "bond" in t:
-        axioms.extend([
-            (r"\b(shared electron|electron sharing|peptide bond|disulfide)\b", r"\bcovalent", "Shared electrons/peptide/disulfide -> Covalent"),
-            (r"\b(electron transfer|cation|anion|salt bridge|electrostatic attraction)\b", r"\bionic", "Electron transfer/ions/electrostatic -> Ionic"),
-            (r"\b(hydrogen bond|partial charge|partial charges|N[-\s]?H|O[-\s]?H|backbone hydrogen)\b", r"\bhydrogen", "H-bond features -> Hydrogen bond"),
-        ])
-
-    def canon(s: str) -> str:
-        return re.sub(r"\s+"," ", (s or "").strip().lower())
-
-    def violates_axiom(term: str, chosen_bin: str) -> bool:
-        tl = canon(term); bl = canon(chosen_bin)
-        for pat_term, pat_bin, _ in axioms:
-            if re.search(pat_term, tl) and not re.search(pat_bin, bl):
-                return True
-        return False
-
-    def score(term: str, b: str) -> int:
-        tl = canon(term)
-        return sum(1 for k in idx.get(b,[]) if k in tl)
-
-    for t, chosen in choices.items():
-        gold = mapping.get(t, "")
-        # If the student's choice breaks a hard axiom, it's wrong.
-        if violates_axiom(t, chosen):
-            wrong.append(t); continue
-        # Exact bin match
-        if canon(chosen) == canon(gold):
-            continue
-        # Plausibility scoring from scope cues
-        s_chosen = score(t, chosen)
-        s_gold   = score(t, gold)
-        others   = [score(t, b) for b in bins if b not in {chosen, gold}]
-        best_other = max(others) if others else 0
-        if s_chosen > 0 and s_chosen >= s_gold and s_chosen >= best_other:
-            continue
-        wrong.append(t)
-
-    return (total - len(wrong)), total, wrong
 
 
 # ---------- Main UI flow ----------
