@@ -1309,10 +1309,10 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
     st.markdown(f"**{st.session_state.get('dnd_title','Match items')}**")
     st.markdown(st.session_state.dnd_instr)
 
-    labels = st.session_state.drag_labels or []
-    terms  = st.session_state.drag_bank or []
-    answer = st.session_state.drag_answer or {}
-    hint_map = st.session_state.dnd_hints or {}
+    labels = st.session_state.drag_labels
+    terms  = st.session_state.drag_bank
+    answer = st.session_state.drag_answer
+    hint_map = st.session_state.dnd_hints
 
     items_html = "".join([f'<li class="card" draggable="true">{t}</li>' for t in terms])
     cols_count = (len(labels)+1)//2 if len(labels) > 2 else 2
@@ -1471,39 +1471,168 @@ render_exam()
 
 
 
-def build_dnd_from_scope(scope: str, topic: str):
-    """Generate ONE good DnD using the strict LLM path only.
-    - No template fallback.
-    - Rejects the known bad 'bonds' template.
-    - Ensures per-session uniqueness.
-    Returns 6-tuple (title,instr,labels,terms,answer,hint_map) or None.
+# === Intro Bio: Chemical bond canonicalization & validation ===
+CHEM_BOND_DECISIVE = {
+    "covalent": {
+        "shared electron", "shared electron pair", "shared pair",
+        "peptide bond", "disulfide", "covalent"
+    },
+    "ionic": {
+        "electron transfer", "electrostatic attraction",
+        "cation", "anion", "salt bridge", "ionic"
+    },
+    "hydrogen": {
+        "hydrogen bond", "h-bond", "n-h", "o-h",
+        "donor", "acceptor", "backbone hydrogen"
+    }
+}
+CHEM_BOND_BANNED = {
+    "charge attraction", "polar interaction", "polarity", "attraction", "interaction"
+}
+CHEM_BOND_SYNONYMS = {
+    "exchanging electrons": "electron transfer",
+    "electron sharing": "shared electron pair",
+    "charge attraction": "electrostatic attraction"
+}
+
+def _bond_bin_key(s: str) -> str:
+    s = (s or "").lower()
+    if "covalent" in s: return "covalent"
+    if "ionic" in s: return "ionic"
+    if "hydrogen" in s: return "hydrogen"
+    return ""
+
+def _contains_any(hay: str, keys: set[str]) -> bool:
+    h = (hay or "").lower()
+    return any(k in h for k in keys)
+
+def validate_and_normalize_bonds(bins: list[str], terms: list[str], mapping: dict[str,str]):
+    # Normalize bin labels to canonical three
+    bkeys = [_bond_bin_key(b) for b in bins]
+    if set(bkeys) != {"covalent","ionic","hydrogen"}:
+        if "covalent" not in bkeys or "ionic" not in bkeys or "hydrogen" not in bkeys:
+            return None
+    canon_bins = []
+    seen = set()
+    for b in bins:
+        k = _bond_bin_key(b)
+        if k == "covalent":
+            label = "Covalent bond"
+        elif k == "ionic":
+            label = "Ionic bond"
+        elif k == "hydrogen":
+            label = "Hydrogen bond"
+        else:
+            label = b
+        if label in seen:
+            return None
+        seen.add(label)
+        canon_bins.append(label)
+
+    # Normalize term text via synonyms, veto ambiguous phrases
+    norm_terms = []
+    term_map_old2new = {}
+    for t in terms:
+        t_clean = (t or "").strip()
+        tl = t_clean.lower()
+        for bad in CHEM_BOND_BANNED:
+            if bad in tl:
+                return None
+        for s_from, s_to in CHEM_BOND_SYNONYMS.items():
+            if s_from in tl:
+                t_clean = s_to
+                break
+        norm_terms.append(t_clean)
+        term_map_old2new[t] = t_clean
+
+    # Remap mapping keys if term text changed
+    new_mapping = {}
+    for old_t, b in mapping.items():
+        new_t = term_map_old2new.get(old_t, old_t)
+        new_mapping[new_t] = b
+
+    # Exclusivity check using decisive tokens (strict)
+    for t in norm_terms:
+        mapped_bin = new_mapping.get(t, "")
+        mk = _bond_bin_key(mapped_bin)
+        if mk == "":
+            return None
+        decisive_m = CHEM_BOND_DECISIVE[mk]
+        if not _contains_any(t, decisive_m):
+            return None
+        for other in {"covalent","ionic","hydrogen"} - {mk}:
+            if _contains_any(t, CHEM_BOND_DECISIVE[other]):
+                return None
+
+    # Return normalized sets with canonical bin labels
+    bin_alias = {b:canon for b, canon in zip(bins, canon_bins)}
+    for t in list(new_mapping.keys()):
+        b = new_mapping[t]
+        if b in bin_alias:
+            new_mapping[t] = bin_alias[b]
+
+    return canon_bins, norm_terms, new_mapping
+
+
+
+def evaluate_dnd(choices: Dict[str,str], mapping: Dict[str,str]) -> Tuple[int,int,List[str]]:
     """
-    try:
-        style = st.session_state.get("merged_style_profile", {})
-    except Exception:
-        style = {}
-    # Attempt a few times to avoid bad-first artifact
-    for _attempt in range(5):
-        try:
-            out = llm_generate_dnd_strict(scope, topic, style)
-        except Exception:
-            out = None
-        if not out:
+    Scoring policy:
+    - Exact bin match -> correct.
+    - Otherwise, if chosen bin is at least as plausible by scope/bin keywords as any other (ties OK) -> correct.
+    - BUT Intro Bio axioms for chemical bonds never pass incorrect pairings.
+    Also normalizes synonyms (e.g., "exchanging electrons" -> "electron transfer").
+    """
+    total = len(mapping); wrong = []
+
+    def norm_term(t: str) -> str:
+        tl = (t or "").lower()
+        for s_from, s_to in CHEM_BOND_SYNONYMS.items():
+            if s_from in tl:
+                return s_to
+        return t
+
+    nmap = {norm_term(t): b for t,b in mapping.items()}
+    nchoices = {norm_term(t): c for t,c in choices.items()}
+
+    prompt_val = st.session_state.get("prompt_used", "") or st.session_state.get("prompt", "") or ""
+    topic = classify_topic(prompt_val) if 'classify_topic' in globals() else ""
+    topic_l = (topic or "").lower()
+
+    bins = sorted(set(list(nmap.values()) + list(set(nchoices.values()))))
+
+    scope = st.session_state.get("scope","") if 'scope' in st.session_state else ""
+    idx = keyword_index_from_scope(bins, scope) if 'keyword_index_from_scope' in globals() else {b:set() for b in bins}
+
+    def score(term: str, b: str) -> int:
+        tl = (term or "").lower()
+        return sum(1 for k in idx.get(b,[]) if k in tl)
+
+    for t, chosen in nchoices.items():
+        gold = nmap.get(t, "")
+
+        # Hard axioms for bonds
+        if "bond" in topic_l:
+            mk = _bond_bin_key(chosen)
+            tl = (t or "").lower()
+            if mk == "covalent":
+                if not any(k in tl for k in CHEM_BOND_DECISIVE["covalent"]): wrong.append(t); continue
+            elif mk == "ionic":
+                if not any(k in tl for k in CHEM_BOND_DECISIVE["ionic"]): wrong.append(t); continue
+            elif mk == "hydrogen":
+                if not any(k in tl for k in CHEM_BOND_DECISIVE["hydrogen"]): wrong.append(t); continue
+
+        if (chosen or "").strip().lower() == (gold or "").strip().lower():
             continue
-        title, instr, labels, terms, answer, hint_map = out
-        # Reject exact old template (bins/draggables combo)
-        bad_bins = {'covalent bond','ionic bond','hydrogen bond'}
-        bad_terms = {'electron sharing','exchanging electrons','charge attraction','polar interaction'}
-        if set(t.lower() for t in terms) == bad_terms and set(b.lower() for b in labels) == bad_bins:
+
+        s_chosen = score(t, chosen)
+        s_gold   = score(t, gold)
+        s_others = [score(t, b) for b in bins if b not in {chosen, gold}]
+        best_other = max(s_others) if s_others else 0
+
+        if s_chosen > 0 and s_chosen >= s_gold and s_chosen >= best_other:
             continue
-        # Uniqueness guard across session
-        payload = {"labels":labels,"terms":terms,"answer":answer}
-        dig = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8","ignore")).hexdigest()
-        seen = st.session_state.get("_seen_dnd_digests", set())
-        if dig in seen:
-            continue
-        seen.add(dig)
-        st.session_state["_seen_dnd_digests"] = seen
-        return out
-    return None
+        wrong.append(t)
+
+    return (total - len(wrong)), total, wrong
 
