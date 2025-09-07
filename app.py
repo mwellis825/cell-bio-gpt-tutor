@@ -1309,10 +1309,10 @@ if all(k in st.session_state for k in ["drag_labels","drag_bank","drag_answer","
     st.markdown(f"**{st.session_state.get('dnd_title','Match items')}**")
     st.markdown(st.session_state.dnd_instr)
 
-    labels = st.session_state.drag_labels
-    terms  = st.session_state.drag_bank
-    answer = st.session_state.drag_answer
-    hint_map = st.session_state.dnd_hints
+    labels = st.session_state.drag_labels or []
+    terms  = st.session_state.drag_bank or []
+    answer = st.session_state.drag_answer or {}
+    hint_map = st.session_state.dnd_hints or {}
 
     items_html = "".join([f'<li class="card" draggable="true">{t}</li>' for t in terms])
     cols_count = (len(labels)+1)//2 if len(labels) > 2 else 2
@@ -1468,7 +1468,9 @@ if "fitb" in st.session_state:
 
 # Optional exam renderer if you keep exam_q
 render_exam()
-\n\n
+
+
+
 def build_dnd_from_scope(scope: str, topic: str):
     """Generate ONE good DnD using the strict LLM path only.
     - No template fallback.
@@ -1504,4 +1506,4 @@ def build_dnd_from_scope(scope: str, topic: str):
         st.session_state["_seen_dnd_digests"] = seen
         return out
     return None
-\n
+
