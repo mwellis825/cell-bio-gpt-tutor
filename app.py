@@ -955,111 +955,6 @@ def ensure_four_fitb(fitb_items, topic: str):
 
 
 
-def build_dnd_from_scope_fallback(scope: str, topic: str):
-    """
-    Strict, topic-aware fallback for DnD:
-    - 2–3 bins chosen from a vetted topic seed list, preferring those present in scope.
-    - Exactly 4 meaningful terms built from topic seeds and phrases found in scope.
-    - NO generic placeholders are ever used.
-    """
-    topic_l = (topic or "").lower()
-    # Vetted seeds (intro level) with safe, concrete terms
-    seeds = {
-        "translation": {
-            "bins": ["Initiation", "Elongation", "Termination"],
-            "terms": ["AUG start codon", "tRNA anticodon pairing", "peptide bond formation", "stop codon recognition"]
-        },
-        "transcription": {
-            "bins": ["Initiation", "Elongation", "Termination"],
-            "terms": ["promoter binding", "RNA chain growth", "spliceosome assembly", "polyadenylation signal"]
-        },
-        "dna repair": {
-            "bins": ["Base excision repair", "Nucleotide excision repair", "Mismatch repair"],
-            "terms": ["glycosylase removes base", "thymine dimer excision", "MutS mismatch recognition", "DNA ligase seals nick"]
-        },
-        "dna replication": {
-            "bins": ["Leading strand", "Lagging strand", "Origin"],
-            "terms": ["continuous synthesis", "Okazaki fragments", "RNA primers by primase", "replication bubble"]
-        },
-        "membrane transport": {
-            "bins": ["Channel", "Carrier", "Pump"],
-            "terms": ["passive ion flow", "alternating access", "ATP-driven transport", "electrochemical gradient"]
-        },
-        "chemical bonds": {
-            "bins": ["Covalent bond", "Ionic bond", "Hydrogen bond"],
-            "terms": ["electron sharing", "charge attraction", "polar interaction", "partial charges"]
-        },
-        "organelle function": {
-            "bins": ["Nucleus", "Mitochondrion", "Golgi"],
-            "terms": ["houses DNA", "ATP production", "protein modification", "vesicle trafficking"]
-        },
-        "glycolysis": {
-            "bins": ["Energy investment", "Cleavage", "Energy payoff"],
-            "terms": ["hexokinase phosphorylation", "fructose-1,6-bisphosphate splitting", "ATP generation", "pyruvate formation"]
-        }
-    }
-
-    # choose key
-    key = None
-    for k in seeds.keys():
-        if k in topic_l:
-            key = k; break
-    if key is None:
-        key = "organelle function"
-
-    # Prefer bins that are literally present in scope; else use seeds
-    bins_seed = seeds[key]["bins"]
-    bins = [b for b in bins_seed if _label_in_scope(b, scope)]
-    if len(bins) < 2:
-        bins = bins_seed[:3]
-    bins = bins[:3]
-
-    # Build 4 concrete terms: prefer those that appear in scope, otherwise safe seeds
-    candidate_terms = []
-    # From scope: short phrases containing seed keywords
-    scope_terms = _slide_terms(scope, max_terms=40)
-    for t in scope_terms:
-        tl = t.lower()
-        for kw in [w.lower() for w in seeds[key]["terms"]]:
-            if any(tok in tl for tok in kw.split()[:2]) and 2 <= len(t.split()) <= 6 and ("," not in t and ";" not in t):
-                candidate_terms.append(t)
-                break
-
-    # Add seed terms themselves
-    candidate_terms += seeds[key]["terms"]
-
-    # Dedup and pick 4
-    used = set()
-    terms = []
-    for t in candidate_terms:
-        tt = t.strip()
-        if not tt or tt.lower() in used:
-            continue
-        # Avoid vague starters
-        if re.match(r"^(where|when|how|why|which|that)", tt.lower()):
-            continue
-        # keep short and concrete
-        if not (2 <= len(tt.split()) <= 6):
-            continue
-        if "," in tt or ";" in tt:
-            continue
-        terms.append(tt)
-        used.add(tt.lower())
-        if len(terms) == 4:
-            break
-
-    # Map terms evenly across bins
-    mapping = {}
-    for i, t in enumerate(terms):
-        b = bins[i % len(bins)]
-        mapping[t] = b
-
-    title = f"Match items for {topic.title()}"
-    instr = "Drag each item to the correct category."
-    hints = {t: "Use the slide phrase that fits this category." for t in terms}
-    return title, instr, bins, terms, mapping, hints
-
-# ---------- Fallbacks ----------
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
     options = {
@@ -1473,10 +1368,7 @@ render_exam()
 
 def dnd_self_consistency_check(scope: str, bins: List[str], terms: List[str], mapping: Dict[str,str]) -> Optional[Dict[str,Any]]:
     """
-    LLM audit with proof:
-      - For each term, produce exactly one bin choice.
-      - Provide a short rationale AND a supporting quote from slides that contains the bin label or a clear synonym and the discriminating cue.
-      - If any term is ambiguous or lacks support, return None.
+    Validate DnD activity using LLM with supporting slide quotes.
     """
     sys = "You are validating a classification task for an introductory biology course. Be strict and correct."
     user = f"""Authoritative slides:
@@ -1525,4 +1417,18 @@ Return STRICT JSON ONLY:
         if not q or q.lower() not in low_scope:
             return None
     return data
+
+
+
+def build_dnd_from_scope_fallback(scope: str, topic: str):
+    """Smart fallback: never produce canned content. Try strict generator a few times; else return None."""
+    if 'llm_generate_dnd_strict' in globals():
+        for _attempt in range(6):
+            try:
+                out = llm_generate_dnd_strict(scope, topic)
+                if out:
+                    return out
+            except Exception:
+                continue
+    return None
 
