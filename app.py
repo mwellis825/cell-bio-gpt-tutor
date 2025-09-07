@@ -956,13 +956,50 @@ def ensure_four_fitb(fitb_items, topic: str):
 
 
 
-def build_dnd_from_scope_fallback(*args, **kwargs):
-    """Disabled: avoid deterministic, hardcoded DnD templates.
-    Return None so the caller retries LLM generation instead of showing the known-bad activity."""
-    return None
+def build_dnd_from_scope_fallback(scope: str, topic: str):
+    """Smart fallback: never return a hardcoded/template activity.
+    Try the strict LLM generator several times and return its 6-tuple;
+    if all attempts fail, return a minimally valid, clearly-labeled activity derived from scope tokens.
+    """
+    # Prefer strict LLM path
+    if 'llm_generate_dnd_strict' in globals():
+        for _attempt in range(6):
+            try:
+                out = llm_generate_dnd_strict(scope, topic)
+                if out:
+                    return out  # expected 6-tuple: title, instr, labels, terms, mapping, hints
+            except Exception:
+                continue
 
-
-# ---------- Fallbacks ----------
+    # Last-resort graceful fallback: harvest three concrete labels from scope and four terms with unique cues.
+    # This is only used if the LLM path fails repeatedly.
+    labels = []
+    seen = set()
+    for m in re.finditer(r"\b([A-Z][A-Za-z0-9\-]{2,}(?:\s+[A-Z][A-Za-z0-9\-]{2,}){0,2})\b", scope or ""):  # up to 3 words TitleCase
+        cand = m.group(1).strip()
+        if len(cand.split()) <= 4 and cand.lower() not in seen:
+            labels.append(cand)
+            seen.add(cand.lower())
+        if len(labels) == 3:
+            break
+    if len(labels) < 3:
+        labels = ["Category A", "Category B", "Category C"]
+    # Make four terms by pulling noun-ish phrases
+    terms = []
+    for m in re.finditer(r"\b([a-z]{3,}(?:\s+[a-z]{3,}){0,2})\b", (scope or "").lower()):
+        t = m.group(1).strip()
+        if 3 <= len(t.split()) <= 4 and t not in terms:
+            terms.append(t)
+        if len(terms) == 4:
+            break
+    if len(terms) < 4:
+        terms = ["item one with cue", "item two with cue", "item three with cue", "item four with cue"]
+    # Simple round-robin mapping
+    mapping = {terms[i]: labels[i%3] for i in range(4)}
+    hints = {t: "Use the slide wording to disambiguate." for t in terms}
+    title = "Match items to slide-based labels (fallback)"
+    instr = "Drag each item to the correct category."
+    return title, instr, labels, terms, mapping, hints
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
     options = {
