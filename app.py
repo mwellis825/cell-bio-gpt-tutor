@@ -641,28 +641,6 @@ Return STRICT JSON with fields:
     # Ambiguity lexical check using bin keywords
     if not isinstance(bin_kw, dict) or not all(b in bin_kw and isinstance(bin_kw[b], list) and bin_kw[b] for b in bins):
         return None
-
-# --- Intro Bio Axiom Guardrails (never mark these wrong) ---
-topic_l = (classify_topic(prompt) or "").lower()
-if "translation" in topic_l:
-    for t in terms:
-        tl = (t or "").lower(); dest = (mapping.get(t,"") or "").lower()
-        if ("stop codon" in tl or "release factor" in tl) and "termin" not in dest:
-            return None
-        if ("start codon" in tl or "aug" in tl) and "init" not in dest:
-            return None
-        if any(k in tl for k in ["peptidyl transferase","translocation","ef-g","ef g","ef-tu","ef tu"]) and "elong" not in dest:
-            return None
-if "chemical bond" in topic_l or "bond" in topic_l:
-    for t in terms:
-        tl = (t or "").lower(); dest = (mapping.get(t,"") or "").lower()
-        if any(k in tl for k in ["shared electron","electron sharing","peptide bond","disulfide"]) and "covalent" not in dest:
-            return None
-        if any(k in tl for k in ["electron transfer","cation","anion","salt bridge","electrostatic"]) and "ionic" not in dest:
-            return None
-        if any(k in tl for k in ["hydrogen bond","partial charge","n-h","o-h","backbone hydrogen"]) and "hydrogen" not in dest:
-            return None
-# --- End Axioms ---
     # Each term must contain at least one token from its bin, and zero tokens from others
     low_scope = (scope or "").lower()
     for t in terms:
