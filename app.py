@@ -957,49 +957,19 @@ def ensure_four_fitb(fitb_items, topic: str):
 
 
 def build_dnd_from_scope_fallback(scope: str, topic: str):
-    """Smart fallback: never return a hardcoded/template activity.
-    Try the strict LLM generator several times and return its 6-tuple;
-    if all attempts fail, return a minimally valid, clearly-labeled activity derived from scope tokens.
-    """
-    # Prefer strict LLM path
+    """Smart fallback: never produce canned content. Try strict generator a few times; else return None."""
     if 'llm_generate_dnd_strict' in globals():
         for _attempt in range(6):
             try:
                 out = llm_generate_dnd_strict(scope, topic)
                 if out:
-                    return out  # expected 6-tuple: title, instr, labels, terms, mapping, hints
+                    return out
             except Exception:
                 continue
+    return None
 
-    # Last-resort graceful fallback: harvest three concrete labels from scope and four terms with unique cues.
-    # This is only used if the LLM path fails repeatedly.
-    labels = []
-    seen = set()
-    for m in re.finditer(r"\b([A-Z][A-Za-z0-9\-]{2,}(?:\s+[A-Z][A-Za-z0-9\-]{2,}){0,2})\b", scope or ""):  # up to 3 words TitleCase
-        cand = m.group(1).strip()
-        if len(cand.split()) <= 4 and cand.lower() not in seen:
-            labels.append(cand)
-            seen.add(cand.lower())
-        if len(labels) == 3:
-            break
-    if len(labels) < 3:
-        labels = ["Category A", "Category B", "Category C"]
-    # Make four terms by pulling noun-ish phrases
-    terms = []
-    for m in re.finditer(r"\b([a-z]{3,}(?:\s+[a-z]{3,}){0,2})\b", (scope or "").lower()):
-        t = m.group(1).strip()
-        if 3 <= len(t.split()) <= 4 and t not in terms:
-            terms.append(t)
-        if len(terms) == 4:
-            break
-    if len(terms) < 4:
-        terms = ["item one with cue", "item two with cue", "item three with cue", "item four with cue"]
-    # Simple round-robin mapping
-    mapping = {terms[i]: labels[i%3] for i in range(4)}
-    hints = {t: "Use the slide wording to disambiguate." for t in terms}
-    title = "Match items to slide-based labels (fallback)"
-    instr = "Drag each item to the correct category."
-    return title, instr, labels, terms, mapping, hints
+
+# ---------- Fallbacks ----------
 def build_dnd_activity(topic: str) -> Tuple[str, List[str], List[str], Dict[str,str], Dict[str,str]]:
     rng = random.Random(new_seed())
     options = {
@@ -1220,7 +1190,11 @@ if go:
 
     dnd = gen_dnd_from_scope(scope, prompt_val)
     if dnd is None:
-        title, instr, labels, terms, answer, hint_map = build_dnd_from_scope_fallback(scope, topic)
+        res = build_dnd_from_scope_fallback(scope, topic)
+    if res:
+        title, instr, labels, terms, answer, hint_map = res
+    else:
+        title = instr = None
     else:
         title, instr, labels, terms, answer, hint_map = dnd
     st.session_state.dnd_title = title
@@ -1408,3 +1382,54 @@ if "fitb" in st.session_state:
 
 # Optional exam renderer if you keep exam_q
 render_exam()
+
+
+
+def dnd_self_consistency_check(scope: str, bins: List[str], terms: List[str], mapping: Dict[str,str]) -> Optional[Dict[str,Any]]:
+    """
+    LLM audit with proof:
+      - For each term, produce exactly one bin choice.
+      - Provide a short rationale AND a supporting quote from slides that contains the bin label or a clear synonym and the discriminating cue.
+      - If any term is ambiguous or lacks support, return None.
+    """
+    sys = "You are validating a classification task for an introductory biology course. Be strict and correct."
+    user = f"""Authoritative slides:
+"""
+{scope}
+"""
+
+Bins (must choose from these exactly): {json.dumps(bins, ensure_ascii=False)}
+Terms: {json.dumps(terms, ensure_ascii=False)}
+Proposed mapping: {json.dumps(mapping, ensure_ascii=False)}
+
+For EACH term:
+- Choose the SINGLE correct bin from the list (if none is uniquely correct, mark AMBIGUOUS).
+- Provide a <=12 word rationale, and paste a short supporting QUOTE from the slides that justifies the mapping.
+- The quote must appear verbatim in the slides above.
+
+Return STRICT JSON ONLY:
+{{
+  "ok": true|false,
+  "ambiguous_terms": ["t?"],
+  "corrected_mapping": {{"term":"Bin", ...}},
+  "reasons": {{"term":"short rationale", ...}},
+  "supports": {{"term":"verbatim quote from slides", ...}}
+}}"""
+    data = chat_json(sys, user, temperature=0.15, seed=int(time.time())%1_000_000)
+    if not isinstance(data, dict): return None
+    if data.get("ok") is False: return None
+    if data.get("ambiguous_terms"): return None
+    corr = data.get("corrected_mapping", {})
+    reasons = data.get("reasons", {})
+    supports = data.get("supports", {})
+    if set(corr.keys()) != set(terms): return None
+    if not all(v in bins for v in corr.values()): return None
+    # every term needs a short reason and a support that appears verbatim in scope
+    low_scope = (scope or "").lower()
+    for t in terms:
+        q = (supports.get(t,"") or "").strip()
+        r = (reasons.get(t,"") or "").strip()
+        if len(r.split()) > 14 or len(r) < 4: return None
+        if not q or q.lower() not in low_scope: return None
+    return data
+
