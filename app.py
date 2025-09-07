@@ -965,7 +965,7 @@ def build_dnd_from_scope_fallback(scope: str, topic: str):
         style = st.session_state.get("merged_style_profile", {})
     except Exception:
         style = {}
-    for _ in range(6):
+    for _ in range(4):  # keep it snappy
         try:
             out = llm_generate_dnd_strict(scope, topic, style)
             if out is not None:
@@ -1193,7 +1193,11 @@ if go:
 
     dnd = gen_dnd_from_scope(scope, prompt_val)
     if dnd is None:
-        title, instr, labels, terms, answer, hint_map = build_dnd_from_scope_fallback(scope, topic)
+        __res = build_dnd_from_scope_fallback(scope, topic)
+        if __res:
+            title, instr, labels, terms, answer, hint_map = __res
+        else:
+            title = instr = labels = terms = answer = hint_map = None
     else:
         title, instr, labels, terms, answer, hint_map = dnd
     st.session_state.dnd_title = title
